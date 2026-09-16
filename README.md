@@ -1,0 +1,166 @@
+# pi-fusion
+
+Persistent Lead/Sidekick (Devin Fusion pattern) for [pi](https://github.com/earendil-works/pi).
+
+Two models work together: your **lead** plans and reviews, and a cheaper persistent
+**sidekick** implements — each with its own session, like
+[Cognition's Devin Fusion](https://cognition.ai/blog/devin-fusion).
+
+Lineage (ideas ported, not forked):
+- [pi-devin-fusion](https://github.com/khanhdeptraivaicachuong/pi-devin-fusion): pi extension idioms (consent gate, tool allowlist, bounded tool loop)
+- [opencode-agent](https://github.com/rink3y/opencode-agent): `wrk_`/`trn_` persistent worker protocol (spawn / followup / status / close / merge)
+- [Kylejeong2/fusion](https://github.com/Kylejeong2/fusion): reference implementation of the Fusion pattern (routing at compaction boundary, handoff framing)
+- [llm-fusion](https://github.com/przemekzur/llm-fusion): verify-then-escalate + cheap/frontier/fusion cost comparison
+
+## What v0 does
+
+```
+Lead (your model, planner/reviewer)
+  |-- fusion_spawn "precise spec"  -> wrk_abc, trn_1 (new persistent session)
+  |-- fusion_followup wrk_abc "..." -> trn_2, SAME session history
+  |-- fusion_spawn worktree=parser ... -> wrk_def (isolated checkout pi-fusion/parser)
+  |-- fusion_followup wrk_def ...   -> same worktree
+  |-- fusion_merge wrk_def          -> commit + merge branch into project
+  |-- fusion_status wrk_abc | trn_1
+  |-- fusion_close wrk_abc [remove]  -> retire; remove=true deletes checkout+branch
+  +-- /fusion-status (list workers)
+```
+
+- Sidekick keeps **independent persistent history** per worker (`WorkerRuntime`), never merged into the lead transcript — only its final text returns.
+- Follow-ups append to the same history with bumped `generation` (`<fusion_handoff generation="N">`), mirroring fusion-ref's coordinator.
+- Independent compaction per worker (`maxHistoryMessages`, default 40; keeps first + last N-1) with routing reconsidered at that boundary.
+- Mutating tools (bash/edit/write) require trusted project + consent, and mutating runs are serialized — same fail-closed posture as pi-devin-fusion.
+- Session journal: worker snapshots are appended as `fusion-worker` custom entries and restored on `session_start` (best-effort durable across `/resume`).
+
+## Worktrees (v0.2)
+
+Write work goes to an isolated checkout so parallel workers never share a directory:
+
+```
+spawn worktree=parser -> ~/.pi/agent/fusion-worktrees/<proj>/parser (branch pi-fusion/parser)
+merge wrk_...          -> add -A + commit in worktree, refuse dirty project checkout,
+                           merge branch into the project branch. Worker stays alive.
+close wrk_... remove=true -> delete checkout + branch.
+```
+
+Rules enforced: name must match `[a-zA-Z0-9-_]`; merge only idle workers; merge requires
+the project to be on the same branch as at spawn; `/var`-style symlinks are canonicalized
+with realpath so the executor can never escape the worktree.
+
+## Escalation (v0.3)
+
+```json
+{
+  "executor": "opencode-go/deepseek-v4-flash",
+  "fallbackExecutors": ["opencode-go/deepseek-v4-pro"],
+  "maxEscalations": 1
+}
+```
+
+Effective ladder = `[executor, ...fallbacks]` (unavailable entries skipped with
+a warning, duplicates collapsed, capped at `1 + maxEscalations`). Rung is
+`min(consecutive_failures, ladder_top)`: one rung up per provider failure,
+auto-de-escalation on the next success. Evaluated every turn on purpose — a
+failing cheap model burns more than a cache miss, so waiting for a compaction
+boundary (fusion-ref's rule) is the wrong trade here.
+
+Escalation is visible in the result header (`(escalated rung N)`), in
+`details` (`rung`, `escalated`, `ladder`), and in `fusion_status`
+(`consecutive_failures`). `fusion_interrupt` stops a runaway turn without
+recording a failure, so interrupting never causes false escalation.
+
+## Modes (v0.4)
+
+```
+/fusion              -> toggle available <-> forced
+/fusion on           -> forced: every prompt goes through plan/delegate/review
+/fusion available    -> lead decides per task (default)
+/fusion off          -> all fusion_* tools mechanically blocked
+/fusion <prompt>     -> one-off forced send without changing mode
+```
+
+Forced mode hooks `input`: normal prompts are rewritten with the planner
+prefix before the lead sees them (commands and already-forced prompts pass
+through). Mode persists in the session journal (`fusion-mode` entry) and shows
+in the footer (`Fusion forced • executor ...`).
+
+## Executor picker (v0.5)
+
+```
+/fusion-model                  -> interactive picker (TUI) or current display (print)
+/fusion-model <provider/id>    -> set session override (beats fusion.json)
+/fusion-model auto             -> ignore the configured executor for this session
+/fusion-model clear            -> drop the override, back to fusion.json
+```
+
+Resolution order: `/fusion-model` override > `fusion.json` > auto (first
+non-lead authed text model). Override lives in the session journal
+(`fusion-executor` entry); `/fusion-status` shows the effective executor.
+
+## Lead discipline (v0.7)
+
+Two layers, following what others found (opencode-fusion's systemic Main edit
+ban beats prompt-only rules, which our bench showed the lead ignores):
+
+1. Stronger planner prompt: cost discipline, never re-read/re-implement
+   delegated work, corrections via followup.
+2. `leadMutations: "allow" | "delegate"` (default allow). `"delegate"`
+   mechanically blocks lead bash/edit/write at the tool_call hook — reads and
+   fusion_* stay open. Bench result: the block guarantees delegation but the
+   lead burns retry loops fighting it (suggest+enforce was the priciest arm);
+   telling it upfront (forced+enforce) halves the flailing. So: default allow,
+   enforce only where the guarantee matters. See `bench/results/manual-003.md`.
+
+## Cost harness (v0.6, `bench/`)
+
+Same task x 3 modes (`cheap` / `frontier` / `fusion`), comparing cost,
+success, and lead context load. Lead cost comes from `--mode json` stdout;
+sidekick cost comes from `fusion-cost` journal entries the extension writes
+per executor turn (see `bench/results/`).
+
+```bash
+node bench/run.mjs --tasks fix-offbyone,add-export --modes cheap,frontier,fusion --reps 1
+```
+
+Environment quirk: spawning `pi` from node hangs silently (0 bytes, idle),
+while python-subprocess or direct shell works — so the runner goes through
+`bench/spawn.py`. The runner also backs up/restores `trust.json` +
+`fusion.json` and seeds per-run trust + a mutating bench config.
+
+## What v0 does NOT do (deliberate)
+
+- No daemon/SQLite (opencode-agent has it; pi extension keeps in-memory + session journal).
+- No multi-model escalation lists (routing policy is wired in, but config exposes a single `executor`; lists come in v1).
+- No forced mode (`/devin on` style input transform) — lead decides via `promptGuidelines`.
+
+## Install
+
+```bash
+pi install git:github.com/oakkim/pi-fusion
+# or clone for hacking
+# git clone https://github.com/oakkim/pi-fusion
+# pi install ./pi-fusion        # from a local checkout
+# pi -e ./pi-fusion/src/index.ts # ephemeral, no install
+```
+
+## Config (`.pi/fusion.json`, trusted projects only)
+
+```json
+{
+  "executor": "openai/gpt-4.1-mini",
+  "executorTools": "all",
+  "maxToolCalls": 16,
+  "maxExecutorOutputTokens": 4096,
+  "temperature": 0.2,
+  "executorToolsConsent": false,
+  "maxHistoryMessages": 40
+}
+```
+
+`executorTools`: `"none" | "readonly" | "all" | ["read","grep","find","ls","bash","edit","write"]`.
+
+## Check
+
+```bash
+cd pi-fusion && npm install --omit=dev 2>/dev/null; npx tsc --noEmit
+```

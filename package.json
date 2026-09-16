@@ -1,0 +1,54 @@
+{
+  "name": "pi-fusion",
+  "version": "0.7.0",
+  "description": "Persistent Lead/Sidekick with isolated git worktrees (Devin Fusion pattern) for pi.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "license": "MIT",
+  "author": "KimDaeyong",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oakkim/pi-fusion.git"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "src/*.ts",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --import jiti/register src/selftest.ts",
+    "build": "echo 'pi-fusion is loaded directly by pi via jiti; no build step required'"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "fusion",
+    "sidekick",
+    "planner",
+    "executor"
+  ],
+  "dependencies": {},
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "jiti": "^2.4.0",
+    "typescript": "^5.5.0"
+  }
+}

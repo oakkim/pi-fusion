@@ -1,0 +1,1 @@
+The pagination is wrong: page 2 with 3 users per page returns only 2 users instead of 3. The code spans db.js, pager.js, and app.js. Find the bug, fix it, and run the tests yourself to confirm they pass. Report what was wrong in one sentence.

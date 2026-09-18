@@ -469,6 +469,7 @@ try {
   const registeredCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
   const registeredEvents = new Map<string, (event: any, ctx: any) => Promise<any>>();
   const journalEntries: string[] = [];
+  const journalPayloads: Array<{ type: string; data: any }> = [];
   const statusCalls: Array<{ key: string; text: string | undefined }> = [];
   const widgetCalls: Array<{ key: string; content: string[] | undefined; options?: { placement?: string } }> = [];
   const notifications: Array<{ text: string; level: string }> = [];
@@ -477,7 +478,10 @@ try {
     on: (event: string, handler: (event: any, ctx: any) => Promise<any>) => registeredEvents.set(event, handler),
     registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.set(tool.name, tool),
     registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => registeredCommands.set(name, command),
-    appendEntry: (type: string) => journalEntries.push(type),
+    appendEntry: (type: string, data: any) => {
+      journalEntries.push(type);
+      journalPayloads.push({ type, data });
+    },
   } as never);
 
   const executorModel = { provider: "test", id: "executor", input: ["text"] };
@@ -536,6 +540,7 @@ try {
 
   const initial = await spawn.execute("initial", { task: "start" }, undefined, undefined, context);
   const workerId = initial.details.worker_id as string;
+  const initialWorkerSnapshot = journalPayloads.filter(({ type }) => type === "fusion-worker").at(-1)!.data;
   const widgetsBeforeUnknown = widgetCalls.length;
   await watch.handler("wrk_missing", context);
   eq("watch rejects unknown worker", [notifications.at(-1)?.level, notifications.at(-1)?.text, widgetCalls.length], ["error", "Worker wrk_missing was not found.", widgetsBeforeUnknown]);
@@ -867,6 +872,40 @@ try {
     liveWidgetText.includes("assistant: watch finished"),
     liveWidgetText.includes("SECRET_REASONING"),
   ], ["ok", true, true, true, true, false]);
+
+  let resolveAbandonedTurn!: (message: unknown) => void;
+  let markAbandonedTurnStarted!: () => void;
+  const abandonedTurnStarted = new Promise<void>((resolve) => { markAbandonedTurnStarted = resolve; });
+  completeImpl = async () => new Promise((resolve) => {
+    resolveAbandonedTurn = resolve;
+    markAbandonedTurnStarted();
+  });
+  const abandonedTurn = followup.execute("abandoned", { worker_id: workerId, message: "old branch turn" }, undefined, undefined, context);
+  await abandonedTurnStarted;
+  await registeredEvents.get("session_tree")!({}, {
+    ...context,
+    sessionManager: {
+      getBranch: () => [{ type: "custom", customType: "fusion-worker", data: initialWorkerSnapshot }],
+      getSessionId: () => undefined,
+    },
+  });
+  const restoredWidgetCalls = widgetCalls.length;
+  const restoredWidget = widgetCalls.at(-1)?.content?.join("\n");
+  resolveAbandonedTurn({
+    role: "assistant",
+    content: [{ type: "text", text: "ABANDONED_OUTPUT" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  const abandonedResult = await abandonedTurn;
+  await new Promise((resolve) => setImmediate(resolve));
+  eq("restored worker ignores abandoned same-id turn updates", [
+    abandonedResult.details.status,
+    restoredWidget?.includes("assistant: done"),
+    restoredWidget?.includes("ABANDONED_OUTPUT"),
+    widgetCalls.length,
+    widgetCalls.at(-1)?.content?.join("\n"),
+  ], ["interrupted", true, false, restoredWidgetCalls, restoredWidget]);
 
   availableModels.length = 0;
   const journalBeforeMissingExecutor = journalEntries.length;

@@ -91,6 +91,10 @@ export async function mergeWorktree(w: WorktreeInfo, label?: string): Promise<Me
   if (!w.projectBranch) {
     throw new Error("Cannot merge: project checkout is on a detached HEAD. Check out a branch first.");
   }
+  const worktreeBranch = await git(w.path, ["branch", "--show-current"]).catch(() => "");
+  if (worktreeBranch !== w.branch) {
+    throw new Error(`Worktree is on ${JSON.stringify(worktreeBranch || "detached")}, expected ${JSON.stringify(w.branch)}.`);
+  }
   // 1. Commit worktree changes (with fallback identity so it always works).
   await git(w.path, ["add", "-A"]);
   const dirty = await git(w.path, ["status", "--porcelain"]);
@@ -110,7 +114,13 @@ export async function mergeWorktree(w: WorktreeInfo, label?: string): Promise<Me
   if (current !== w.projectBranch) {
     throw new Error(`Project is on ${JSON.stringify(current || "detached")}, expected ${JSON.stringify(w.projectBranch)}. Check out ${w.projectBranch} first.`);
   }
-  const mergeOutput = await git(w.projectRoot, ["merge", "--no-edit", w.branch]);
+  let mergeOutput: string;
+  try {
+    mergeOutput = await git(w.projectRoot, ["merge", "--no-edit", w.branch]);
+  } catch (err) {
+    await git(w.projectRoot, ["merge", "--abort"]).catch(() => undefined);
+    throw err;
+  }
   return { committed, mergeOutput };
 }
 

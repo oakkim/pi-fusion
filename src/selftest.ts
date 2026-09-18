@@ -178,6 +178,29 @@ try {
   await removeWorktree(wt);
   const branches = (await sh("git", ["branch", "--list", "pi-fusion/fix1"], { cwd: repo })).stdout.trim();
   eq("branch removed", branches, "");
+
+  const detached = await createWorktree(repo, "detached");
+  writeFileSync(_join(detached.path, "detached.txt"), "must-not-commit\n");
+  await tgit(detached.path, ["checkout", "--detach"]);
+  let detachedErr = "";
+  try { await mergeWorktree(detached, "test"); } catch (e) { detachedErr = (e as Error).message; }
+  const detachedStatus = (await sh("git", ["status", "--porcelain"], { cwd: detached.path })).stdout.trim();
+  eq("detached worktree rejected before staging", [detachedErr.includes("expected"), detachedStatus], [true, "?? detached.txt"]);
+  await removeWorktree(detached);
+
+  writeFileSync(_join(repo, "conflict.txt"), "base\n");
+  await tgit(repo, ["add", "conflict.txt"]);
+  await tgit(repo, ["commit", "-m", "conflict base"]);
+  const conflict = await createWorktree(repo, "conflict");
+  writeFileSync(_join(conflict.path, "conflict.txt"), "sidekick\n");
+  writeFileSync(_join(repo, "conflict.txt"), "project\n");
+  await tgit(repo, ["commit", "-am", "project conflict"]);
+  let conflictErr = "";
+  try { await mergeWorktree(conflict, "test"); } catch (e) { conflictErr = (e as Error).message; }
+  const mergeHead = await sh("git", ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { cwd: repo }).then(() => true, () => false);
+  const conflictStatus = (await sh("git", ["status", "--porcelain"], { cwd: repo })).stdout.trim();
+  eq("conflicting merge aborted", [conflictErr.includes("git merge"), mergeHead, conflictStatus, readFileSync(_join(repo, "conflict.txt"), "utf8")], [true, false, "", "project\n"]);
+  await removeWorktree(conflict);
 } finally {
   rmSync(repo, { recursive: true, force: true });
 }

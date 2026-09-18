@@ -111,6 +111,7 @@ export async function runExecutorTurn(
     let forceFinalize = false;
 
     for (const tc of calls) {
+      signal?.throwIfAborted();
       if (forceFinalize || used >= maxToolCalls) {
         const syn = syntheticResult(tc, forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted");
         messages.push(syn);
@@ -145,6 +146,7 @@ async function runComplete(
   context: { systemPrompt: string; messages: Message[]; tools?: Tool[] },
   options: CompleteOptions,
 ): Promise<AssistantMessage> {
+  options.signal?.throwIfAborted();
   const resp = await registry.complete(model, context, options);
   if (resp.stopReason === "error" || resp.stopReason === "aborted") {
     throw new Error(resp.errorMessage ?? `Model stopped with reason: ${resp.stopReason}`);

@@ -56,10 +56,23 @@ const InterruptParams = Type.Object({
 
 /** Serialize mutating executor runs to avoid clobbered writes (port of pi-devin-fusion). */
 let mutationQueue: Promise<unknown> = Promise.resolve();
-function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function runSerialized<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   const run = mutationQueue.then(fn, fn);
   mutationQueue = run.then(() => undefined, () => undefined);
-  return run;
+  return raceWithAbort(run, signal);
 }
 
 function userMsg(text: string): Message {
@@ -226,10 +239,25 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     workerId: string,
     turnId: string,
+    hostSignal?: AbortSignal,
     onUpdate?: (partial: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void,
   ): Promise<{ text: string; details: Record<string, unknown> }> {
     const worker = runtime.getWorker(workerId)!;
     const turn = runtime.getTurn(turnId)!;
+    const controller = new AbortController();
+    runtime.trackController(turnId, controller);
+    const signal = hostSignal ? AbortSignal.any([controller.signal, hostSignal]) : controller.signal;
+    const interruptedResult = () => {
+      if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
+      runtime.untrackController(turnId);
+      persist(ctx, workerId);
+      return {
+        text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
+        details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
+      };
+    };
+    if (signal.aborted) return interruptedResult();
+
     const cfg = effectiveConfig(ctx);
     const warnings: string[] = [];
     const ladder = resolveLadder(ctx.modelRegistry, ctx.model, cfg.executor, cfg.fallbackExecutors, cfg.maxEscalations, warnings);
@@ -246,20 +274,15 @@ export default function (pi: ExtensionAPI) {
 
     const execCwd = worker.worktree ? execDirOf(worker.worktree) : ctx.cwd;
     const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
-    const controller = new AbortController();
-    runtime.trackController(turnId, controller);
-    const signal = controller.signal;
-    // Wire lead-side cancellation through.
-    const abort = (_s: unknown) => controller.abort();
-    void abort;
 
     onUpdate?.({
       content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
       details: { phase: "executing", workerId, turnId },
     });
 
-    const exec = () =>
-      runExecutorTurn(
+    const exec = () => {
+      signal.throwIfAborted();
+      return runExecutorTurn(
         ctx.modelRegistry,
         executor,
         SIDEKICK_SYSTEM_PROMPT,
@@ -271,10 +294,12 @@ export default function (pi: ExtensionAPI) {
         clampMaxToolCalls(cfg.maxToolCalls),
         ctx,
       );
+    };
 
     try {
       const mutating = isMutatingSelection(cfg.executorTools);
-      const result = mutating ? await runSerialized(exec) : await exec();
+      const result = mutating ? await runSerialized(exec, signal) : await exec();
+      signal.throwIfAborted();
       const output = getTextContent(result.message);
       if (!runtime.finishTurn(turnId, output, result.added)) {
         const status = worker.status === "closed"
@@ -330,13 +355,8 @@ export default function (pi: ExtensionAPI) {
       // Settled by fusion_interrupt while awaiting: keep it interrupted,
       // don't record a failure (no false escalation).
       const cur = runtime.getTurn(turnId);
-      if (cur?.status === "interrupted") {
-        runtime.untrackController(turnId);
-        persist(ctx, workerId);
-        return {
-          text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
-          details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
-        };
+      if (cur?.status === "interrupted" || signal.aborted) {
+        return interruptedResult();
       }
       const message = err instanceof Error ? err.message : String(err);
       runtime.failTurn(turnId, message);
@@ -368,9 +388,11 @@ export default function (pi: ExtensionAPI) {
 
     ],
     parameters: SpawnParams,
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      signal?.throwIfAborted();
       const cfg = effectiveConfig(ctx);
-      const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
+      const consent = await raceWithAbort(ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted()), signal);
+      signal?.throwIfAborted();
       if (!consent.ok) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: consent.error }, null, 2) }], details: { status: "error", error: consent.error } };
       }
@@ -391,11 +413,15 @@ export default function (pi: ExtensionAPI) {
           const message = err instanceof Error ? err.message : String(err);
           return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: message }, null, 2) }], details: { status: "error", error: message } };
         }
+        if (signal?.aborted) {
+          await removeWorktree(worktree);
+          signal.throwIfAborted();
+        }
       }
       const taskText = handoffTaskText(1, params.task, contextText, params.label);
       const { worker, turn } = runtime.spawn({ label: params.label, executorModelId: modelDisplay(executor), firstMessage: userMsg(taskText), worktree });
       persist(ctx, worker.id);
-      const out = await runTurn(ctx, worker.id, turn.id, onUpdate);
+      const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
       return { content: [{ type: "text", text: out.text }], details: out.details };
     },
   });
@@ -413,9 +439,11 @@ export default function (pi: ExtensionAPI) {
       "Provider failures auto-escalate the worker one rung up the fallback ladder (and de-escalate on success) — retry via followup before giving up on a worker.",
     ],
     parameters: FollowupParams,
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      signal?.throwIfAborted();
       const cfg = effectiveConfig(ctx);
-      const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
+      const consent = await raceWithAbort(ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted()), signal);
+      signal?.throwIfAborted();
       if (!consent.ok) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: consent.error }, null, 2) }], details: { status: "error", error: consent.error } };
       }
@@ -438,7 +466,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: message }, null, 2) }], details: { status: "error", error: message } };
       }
       persist(ctx, worker.id);
-      const out = await runTurn(ctx, worker.id, turn.id, onUpdate);
+      const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
       return { content: [{ type: "text", text: out.text }], details: out.details };
     },
   });

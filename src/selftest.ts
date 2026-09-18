@@ -4,6 +4,7 @@ import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext } from "../src/utils.ts";
+import fusionExtension from "../src/index.ts";
 
 let pass = 0;
 let fail = 0;
@@ -138,7 +139,7 @@ eq("empty ctx", buildRecentContext([], 4), undefined);
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { chmodSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
@@ -371,6 +372,408 @@ eq("registry complete dispatch", [
   "x-opencode-session": "session-test",
   "x-opencode-client": "pi",
 }, [{ type: "text", text: "registry ok" }]]);
+
+const toolAbort = new AbortController();
+let secondToolRuns = 0;
+let toolAbortEscaped = false;
+try {
+  await runExecutorTurn(
+    {
+      complete: async () => ({
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "first", name: "first", arguments: {} },
+          { type: "toolCall", id: "second", name: "second", arguments: {} },
+        ],
+        stopReason: "toolUse",
+        timestamp: Date.now(),
+      }),
+    } as never,
+    registryModel as never,
+    "system",
+    [{ role: "user", content: "task", timestamp: 0 }] as never,
+    128,
+    0.2,
+    toolAbort.signal,
+    [
+      {
+        name: "first", description: "first", parameters: {},
+        execute: async () => {
+          toolAbort.abort();
+          return { content: [{ type: "text", text: "done" }], isError: false };
+        },
+      },
+      {
+        name: "second", description: "second", parameters: {},
+        execute: async () => {
+          secondToolRuns++;
+          return { content: [{ type: "text", text: "must not run" }], isError: false };
+        },
+      },
+    ] as never,
+    2,
+    { sessionManager: { getSessionId: () => undefined } } as never,
+  );
+} catch {
+  toolAbortEscaped = true;
+}
+eq("abort stops later tool calls", [toolAbort.signal.aborted, toolAbortEscaped, secondToolRuns], [true, true, 0]);
+
+const lastToolAbort = new AbortController();
+let modelRequestsAfterAbort = 0;
+let lastToolAbortEscaped = false;
+try {
+  await runExecutorTurn(
+    {
+      complete: async () => {
+        modelRequestsAfterAbort++;
+        return {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "only", name: "only", arguments: {} }],
+          stopReason: "toolUse",
+          timestamp: Date.now(),
+        };
+      },
+    } as never,
+    registryModel as never,
+    "system",
+    [{ role: "user", content: "task", timestamp: 0 }] as never,
+    128,
+    0.2,
+    lastToolAbort.signal,
+    [{
+      name: "only", description: "only", parameters: {},
+      execute: async () => {
+        lastToolAbort.abort();
+        return { content: [{ type: "text", text: "done" }], isError: false };
+      },
+    }] as never,
+    2,
+    { sessionManager: { getSessionId: () => undefined } } as never,
+  );
+} catch {
+  lastToolAbortEscaped = true;
+}
+eq("abort after last tool skips next model request", [lastToolAbortEscaped, modelRequestsAfterAbort], [true, 1]);
+
+// --- 8d. registered tools propagate host cancellation through runTurn ---
+const fusionDir = mkdtempSync(_join(tmpdir(), "fusion-cancel-"));
+try {
+  mkdirSync(_join(fusionDir, ".pi"));
+  writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: "none" }));
+  writeFileSync(_join(fusionDir, "README.md"), "fixture\n");
+  await sh("git", ["init", "-b", "main", fusionDir]);
+  await tgit(fusionDir, ["add", "-A"]);
+  await tgit(fusionDir, ["commit", "-m", "init"]);
+  const registered = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const journalEntries: string[] = [];
+  fusionExtension({
+    on: () => {},
+    registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.set(tool.name, tool),
+    registerCommand: () => {},
+    appendEntry: (type: string) => journalEntries.push(type),
+  } as never);
+
+  const executorModel = { provider: "test", id: "executor", input: ["text"] };
+  const availableModels = [executorModel];
+  let confirmCalls = 0;
+  let confirmImpl: () => Promise<boolean> = async () => true;
+  let completeImpl: (_model: unknown, _context: unknown, options: { signal?: AbortSignal }) => Promise<any> = async () => ({
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  const context = {
+    cwd: fusionDir,
+    hasUI: true,
+    ui: { confirm: () => { confirmCalls++; return confirmImpl(); } },
+    isProjectTrusted: () => true,
+    model: undefined,
+    modelRegistry: {
+      getAll: () => [executorModel],
+      getAvailable: () => availableModels,
+      hasConfiguredAuth: () => true,
+      complete: (model: unknown, completeContext: unknown, options: { signal?: AbortSignal }) => completeImpl(model, completeContext, options),
+    },
+    sessionManager: { getBranch: () => [], getSessionId: () => undefined },
+  };
+  const spawn = registered.get("fusion_spawn")!;
+  const followup = registered.get("fusion_followup")!;
+  const status = registered.get("fusion_status")!;
+  const readStatus = async (id: string) => {
+    const result = await status.execute("status", { id }, undefined, undefined, context);
+    return JSON.parse(result.content[0].text);
+  };
+  const settlesPromptly = async (promise: Promise<unknown>) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const settled = await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 100); }),
+    ]);
+    clearTimeout(timer!);
+    return settled;
+  };
+
+  const initial = await spawn.execute("initial", { task: "start" }, undefined, undefined, context);
+  const workerId = initial.details.worker_id as string;
+  let executorSignal: AbortSignal | undefined;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  completeImpl = async (_model, _completeContext, options) => {
+    executorSignal = options.signal;
+    return new Promise((_resolve, reject) => {
+      if (!executorSignal) {
+        markStarted();
+        reject(new Error("executor signal missing"));
+        return;
+      }
+      executorSignal.addEventListener("abort", () => reject(executorSignal?.reason), { once: true });
+      markStarted();
+    });
+  };
+  const hostController = new AbortController();
+  const pendingSpawn = spawn.execute("deferred", { task: "wait" }, hostController.signal, undefined, context);
+  await started;
+  hostController.abort();
+  const deferred = await pendingSpawn;
+  const deferredTurnId = deferred.details.turn_id as string;
+  const deferredWorkerId = deferred.details.worker_id as string;
+  const deferredTurn = await readStatus(deferredTurnId);
+  const deferredWorker = await readStatus(deferredWorkerId);
+  eq("deferred host abort interrupts running turn", [
+    deferred.details.status,
+    deferredTurn.status,
+    deferredWorker.active_turn,
+    deferredWorker.consecutive_failures,
+    executorSignal?.aborted,
+  ], ["interrupted", "interrupted", null, 0, true]);
+
+  const worktreeSuffix = Date.now().toString(36);
+  const preWorktree = `pre-cancel-${worktreeSuffix}`;
+  const journalBeforeWorktrees = journalEntries.length;
+  let preWorktreeRejected = false;
+  try {
+    await spawn.execute(
+      "pre-worktree",
+      { task: "must not start", worktree: preWorktree },
+      AbortSignal.abort(),
+      undefined,
+      context,
+    );
+  } catch {
+    preWorktreeRejected = true;
+  }
+  const preBranch = (await sh("git", ["branch", "--list", `pi-fusion/${preWorktree}`], { cwd: fusionDir })).stdout.trim();
+  eq("pre-aborted spawn creates no worktree", [preWorktreeRejected, preBranch, journalEntries.length], [true, "", journalBeforeWorktrees]);
+
+  const duringWorktree = `during-cancel-${worktreeSuffix}`;
+  const hookStarted = _join(fusionDir, "hook-started");
+  const hookRelease = _join(fusionDir, "hook-release");
+  const postCheckout = _join(fusionDir, ".git", "hooks", "post-checkout");
+  writeFileSync(postCheckout, `#!/bin/sh\ntouch ${JSON.stringify(hookStarted)}\nwhile [ ! -f ${JSON.stringify(hookRelease)} ]; do sleep 0.01; done\n`);
+  chmodSync(postCheckout, 0o755);
+  const worktreeController = new AbortController();
+  const pendingWorktree = spawn.execute(
+    "during-worktree",
+    { task: "must be cleaned", worktree: duringWorktree },
+    worktreeController.signal,
+    undefined,
+    context,
+  );
+  for (let i = 0; i < 1_000 && !existsSync(hookStarted); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const creationWasPending = existsSync(hookStarted);
+  worktreeController.abort();
+  writeFileSync(hookRelease, "continue\n");
+  let duringWorktreeRejected = false;
+  try {
+    await pendingWorktree;
+  } catch {
+    duringWorktreeRejected = true;
+  }
+  const duringBranch = (await sh("git", ["branch", "--list", `pi-fusion/${duringWorktree}`], { cwd: fusionDir })).stdout.trim();
+  const worktreeList = (await sh("git", ["worktree", "list", "--porcelain"], { cwd: fusionDir })).stdout;
+  eq("abort during worktree creation cleans checkout and branch", [
+    creationWasPending,
+    duringWorktreeRejected,
+    duringBranch,
+    worktreeList.includes(duringWorktree),
+    journalEntries.length,
+  ], [true, true, "", false, journalBeforeWorktrees]);
+
+  const failedCleanupWorktree = `cleanup-fail-${worktreeSuffix}`;
+  const lockStarted = _join(fusionDir, "lock-started");
+  const lockRelease = _join(fusionDir, "lock-release");
+  writeFileSync(postCheckout, `#!/bin/sh\nprintf test > "$(git rev-parse --git-path locked)"\ntouch ${JSON.stringify(lockStarted)}\nwhile [ ! -f ${JSON.stringify(lockRelease)} ]; do sleep 0.01; done\n`);
+  const failedCleanupController = new AbortController();
+  const pendingFailedCleanup = spawn.execute(
+    "cleanup-failure",
+    { task: "surface cleanup failure", worktree: failedCleanupWorktree },
+    failedCleanupController.signal,
+    undefined,
+    context,
+  );
+  for (let i = 0; i < 1_000 && !existsSync(lockStarted); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const lockWasCreated = existsSync(lockStarted);
+  failedCleanupController.abort();
+  writeFileSync(lockRelease, "continue\n");
+  let cleanupFailure = "";
+  try {
+    await pendingFailedCleanup;
+  } catch (err) {
+    cleanupFailure = err instanceof Error ? err.message : String(err);
+  }
+  const failedBranch = (await sh("git", ["branch", "--list", `pi-fusion/${failedCleanupWorktree}`], { cwd: fusionDir })).stdout.trim();
+  const failedWorktreeList = (await sh("git", ["worktree", "list", "--porcelain"], { cwd: fusionDir })).stdout;
+  const failedBlock = failedWorktreeList.split("\n\n").find((block) => block.includes(`branch refs/heads/pi-fusion/${failedCleanupWorktree}`));
+  const failedPath = failedBlock?.match(/^worktree (.+)$/m)?.[1];
+  if (failedPath) {
+    await sh("git", ["worktree", "unlock", failedPath], { cwd: fusionDir }).catch(() => undefined);
+    await sh("git", ["worktree", "remove", "--force", failedPath], { cwd: fusionDir }).catch(() => undefined);
+    await sh("git", ["branch", "-D", `pi-fusion/${failedCleanupWorktree}`], { cwd: fusionDir }).catch(() => undefined);
+  }
+  eq("cleanup failure is surfaced instead of hidden by abort", [
+    lockWasCreated,
+    cleanupFailure.includes("Could not remove worktree"),
+    failedBranch.length > 0,
+    failedWorktreeList.includes(failedCleanupWorktree),
+    journalEntries.length,
+  ], [true, true, true, true, journalBeforeWorktrees]);
+
+  writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: "all" }));
+  const beforeConsentTests = await readStatus(workerId);
+  const journalBeforeConsentTests = journalEntries.length;
+  let preFollowupAbort = "";
+  try {
+    await followup.execute(
+      "pre-consent",
+      { worker_id: workerId, message: "must not prompt" },
+      AbortSignal.abort(),
+      undefined,
+      context,
+    );
+  } catch (err) {
+    preFollowupAbort = err instanceof Error ? err.name : String(err);
+  }
+  const afterPreConsent = await readStatus(workerId);
+  eq("pre-aborted followup stops before consent and mutation", [
+    preFollowupAbort,
+    confirmCalls,
+    afterPreConsent.generation,
+    afterPreConsent.history_messages,
+    afterPreConsent.active_turn,
+    journalEntries.length,
+  ], [
+    "AbortError",
+    0,
+    beforeConsentTests.generation,
+    beforeConsentTests.history_messages,
+    beforeConsentTests.active_turn,
+    journalBeforeConsentTests,
+  ]);
+
+  let resolveConsent!: (value: boolean) => void;
+  let markDialogOpen!: () => void;
+  const dialogOpen = new Promise<void>((resolve) => { markDialogOpen = resolve; });
+  confirmImpl = () => new Promise<boolean>((resolve) => {
+    resolveConsent = resolve;
+    markDialogOpen();
+  });
+  const consentController = new AbortController();
+  const pendingConsent = followup.execute(
+    "during-consent",
+    { worker_id: workerId, message: "must not append" },
+    consentController.signal,
+    undefined,
+    context,
+  );
+  await dialogOpen;
+  consentController.abort();
+  const observedConsent = pendingConsent.then(
+    () => "completed",
+    (err) => err instanceof Error ? err.name : String(err),
+  );
+  const consentSettledPromptly = await settlesPromptly(observedConsent);
+  resolveConsent(false);
+  const duringConsentAbort = await observedConsent;
+  const afterDuringConsent = await readStatus(workerId);
+  eq("abort during consent wins over decline without mutation", [
+    consentSettledPromptly,
+    duringConsentAbort,
+    confirmCalls,
+    afterDuringConsent.generation,
+    afterDuringConsent.history_messages,
+    afterDuringConsent.active_turn,
+    journalEntries.length,
+  ], [
+    true,
+    "AbortError",
+    1,
+    beforeConsentTests.generation,
+    beforeConsentTests.history_messages,
+    beforeConsentTests.active_turn,
+    journalBeforeConsentTests,
+  ]);
+
+  confirmImpl = async () => true;
+  let finishFirst!: (message: unknown) => void;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let providerCallsWhileQueued = 0;
+  const completedMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+  completeImpl = async () => {
+    providerCallsWhileQueued++;
+    if (providerCallsWhileQueued > 1) return completedMessage;
+    return new Promise((resolve) => {
+      finishFirst = resolve;
+      markFirstStarted();
+    });
+  };
+  let firstFinished = false;
+  const firstMutating = spawn.execute("queue-first", { task: "hold queue" }, undefined, undefined, context)
+    .finally(() => { firstFinished = true; });
+  await firstStarted;
+
+  let markSecondQueued!: () => void;
+  const secondQueued = new Promise<void>((resolve) => { markSecondQueued = resolve; });
+  const queuedController = new AbortController();
+  const secondMutating = spawn.execute(
+    "queue-second",
+    { task: "cancel while queued" },
+    queuedController.signal,
+    () => markSecondQueued(),
+    context,
+  );
+  await secondQueued;
+  queuedController.abort();
+  const queuedSettledPromptly = await settlesPromptly(secondMutating);
+  if (!queuedSettledPromptly) finishFirst(completedMessage);
+  const queuedResult = await secondMutating;
+  const queuedTurn = await readStatus(queuedResult.details.turn_id as string);
+  const queuedWorker = await readStatus(queuedResult.details.worker_id as string);
+  eq("queued mutating abort settles before active run", [
+    queuedSettledPromptly,
+    firstFinished,
+    queuedResult.details.status,
+    queuedTurn.status,
+    queuedWorker.active_turn,
+    queuedWorker.consecutive_failures,
+    providerCallsWhileQueued,
+  ], [true, false, "interrupted", "interrupted", null, 0, 1]);
+  finishFirst(completedMessage);
+  await firstMutating;
+} finally {
+  rmSync(fusionDir, { recursive: true, force: true });
+}
 
 // --- 9. forced mode helpers ---
 import { forceFusionPrompt, fusionArgumentCompletions, isForcePrompt, modeLabel, normalizeMode, parseFusionCommand } from "../src/mode.ts";

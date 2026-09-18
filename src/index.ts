@@ -376,8 +376,10 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: SpawnParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      signal?.throwIfAborted();
       const cfg = effectiveConfig(ctx);
       const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
+      signal?.throwIfAborted();
       if (!consent.ok) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: consent.error }, null, 2) }], details: { status: "error", error: consent.error } };
       }
@@ -394,7 +396,12 @@ export default function (pi: ExtensionAPI) {
       if (params.worktree) {
         try {
           worktree = await createWorktree(ctx.cwd, params.worktree);
+          if (signal?.aborted) {
+            await removeWorktree(worktree);
+            signal.throwIfAborted();
+          }
         } catch (err) {
+          if (signal?.aborted) signal.throwIfAborted();
           const message = err instanceof Error ? err.message : String(err);
           return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: message }, null, 2) }], details: { status: "error", error: message } };
         }

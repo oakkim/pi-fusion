@@ -139,7 +139,7 @@ eq("empty ctx", buildRecentContext([], 4), undefined);
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
@@ -424,12 +424,17 @@ const fusionDir = mkdtempSync(_join(tmpdir(), "fusion-cancel-"));
 try {
   mkdirSync(_join(fusionDir, ".pi"));
   writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: "none" }));
+  writeFileSync(_join(fusionDir, "README.md"), "fixture\n");
+  await sh("git", ["init", "-b", "main", fusionDir]);
+  await tgit(fusionDir, ["add", "-A"]);
+  await tgit(fusionDir, ["commit", "-m", "init"]);
   const registered = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const journalEntries: string[] = [];
   fusionExtension({
     on: () => {},
     registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.set(tool.name, tool),
     registerCommand: () => {},
-    appendEntry: () => {},
+    appendEntry: (type: string) => journalEntries.push(type),
   } as never);
 
   const executorModel = { provider: "test", id: "executor", input: ["text"] };
@@ -513,6 +518,60 @@ try {
     deferredWorker.consecutive_failures,
     executorSignal?.aborted,
   ], ["interrupted", "interrupted", null, 0, true]);
+
+  const worktreeSuffix = Date.now().toString(36);
+  const preWorktree = `pre-cancel-${worktreeSuffix}`;
+  const journalBeforeWorktrees = journalEntries.length;
+  let preWorktreeRejected = false;
+  try {
+    await spawn.execute(
+      "pre-worktree",
+      { task: "must not start", worktree: preWorktree },
+      AbortSignal.abort(),
+      undefined,
+      context,
+    );
+  } catch {
+    preWorktreeRejected = true;
+  }
+  const preBranch = (await sh("git", ["branch", "--list", `pi-fusion/${preWorktree}`], { cwd: fusionDir })).stdout.trim();
+  eq("pre-aborted spawn creates no worktree", [preWorktreeRejected, preBranch, journalEntries.length], [true, "", journalBeforeWorktrees]);
+
+  const duringWorktree = `during-cancel-${worktreeSuffix}`;
+  const hookStarted = _join(fusionDir, "hook-started");
+  const hookRelease = _join(fusionDir, "hook-release");
+  const postCheckout = _join(fusionDir, ".git", "hooks", "post-checkout");
+  writeFileSync(postCheckout, `#!/bin/sh\ntouch ${JSON.stringify(hookStarted)}\nwhile [ ! -f ${JSON.stringify(hookRelease)} ]; do sleep 0.01; done\n`);
+  chmodSync(postCheckout, 0o755);
+  const worktreeController = new AbortController();
+  const pendingWorktree = spawn.execute(
+    "during-worktree",
+    { task: "must be cleaned", worktree: duringWorktree },
+    worktreeController.signal,
+    undefined,
+    context,
+  );
+  for (let i = 0; i < 1_000 && !existsSync(hookStarted); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const creationWasPending = existsSync(hookStarted);
+  worktreeController.abort();
+  writeFileSync(hookRelease, "continue\n");
+  let duringWorktreeRejected = false;
+  try {
+    await pendingWorktree;
+  } catch {
+    duringWorktreeRejected = true;
+  }
+  const duringBranch = (await sh("git", ["branch", "--list", `pi-fusion/${duringWorktree}`], { cwd: fusionDir })).stdout.trim();
+  const worktreeList = (await sh("git", ["worktree", "list", "--porcelain"], { cwd: fusionDir })).stdout;
+  eq("abort during worktree creation cleans checkout and branch", [
+    creationWasPending,
+    duringWorktreeRejected,
+    duringBranch,
+    worktreeList.includes(duringWorktree),
+    journalEntries.length,
+  ], [true, true, "", false, journalBeforeWorktrees]);
 } finally {
   rmSync(fusionDir, { recursive: true, force: true });
 }

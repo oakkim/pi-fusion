@@ -331,6 +331,9 @@ export default function (pi: ExtensionAPI) {
     if (ladder.length === 0) {
       const error = "no authed text executor model available";
       runtime.failTurn(turnId, error);
+      runtime.untrackController(turnId);
+      persist(ctx, workerId);
+      refreshWatch(ctx, workerId);
       return { text: JSON.stringify({ status: "error", error }, null, 2), details: { status: "error", error } };
     }
     // Escalation: one rung per consecutive failure, auto-de-escalates on success

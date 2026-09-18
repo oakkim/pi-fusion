@@ -518,6 +518,7 @@ try {
   const followup = registered.get("fusion_followup")!;
   const status = registered.get("fusion_status")!;
   const close = registered.get("fusion_close")!;
+  const interrupt = registered.get("fusion_interrupt")!;
   const watch = registeredCommands.get("fusion-watch")!;
   const readStatus = async (id: string) => {
     const result = await status.execute("status", { id }, undefined, undefined, context);
@@ -866,6 +867,22 @@ try {
     liveWidgetText.includes("assistant: watch finished"),
     liveWidgetText.includes("SECRET_REASONING"),
   ], ["ok", true, true, true, true, false]);
+
+  availableModels.length = 0;
+  const journalBeforeMissingExecutor = journalEntries.length;
+  const missingExecutor = await followup.execute("missing-executor", { worker_id: workerId, message: "executor unavailable" }, undefined, undefined, context);
+  const workerAfterMissingExecutor = await readStatus(workerId);
+  const interruptAfterMissingExecutor = await interrupt.execute("interrupt-failed", { worker_id: workerId }, undefined, undefined, context);
+  const interruptDetails = JSON.parse(interruptAfterMissingExecutor.content[0].text);
+  eq("missing executor settles watched worker and journals failure", [
+    missingExecutor.details.status,
+    widgetCalls.at(-1)?.content?.[0]?.includes("[idle]"),
+    workerAfterMissingExecutor.active_turn,
+    workerAfterMissingExecutor.consecutive_failures,
+    interruptDetails.interrupted_turn,
+    journalEntries.length - journalBeforeMissingExecutor,
+  ], ["error", true, null, 1, null, 2]);
+  availableModels.push(executorModel);
 
   await close.execute("close-watched", { worker_id: workerId }, undefined, undefined, context);
   eq("closing watched worker clears widget", [widgetCalls.at(-1)?.key, widgetCalls.at(-1)?.content], ["fusion-watch", undefined]);

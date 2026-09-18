@@ -873,6 +873,40 @@ try {
     liveWidgetText.includes("SECRET_REASONING"),
   ], ["ok", true, true, true, true, false]);
 
+  let resolveInterruptedProvider!: (message: unknown) => void;
+  let markInterruptedProviderStarted!: () => void;
+  const interruptedProviderStarted = new Promise<void>((resolve) => { markInterruptedProviderStarted = resolve; });
+  completeImpl = async () => new Promise((resolve) => {
+    resolveInterruptedProvider = resolve;
+    markInterruptedProviderStarted();
+  });
+  const pendingInterruptedTurn = followup.execute("watch-interrupt", { worker_id: workerId, message: "wait until interrupted" }, undefined, undefined, context);
+  await interruptedProviderStarted;
+  const journalBeforeWatchInterrupt = journalEntries.length;
+  const watchInterrupt = await interrupt.execute("watch-interrupt", { worker_id: workerId }, undefined, undefined, context);
+  const watchInterruptDetails = JSON.parse(watchInterrupt.content[0].text);
+  eq("interrupt immediately persists and renders watched worker idle", [
+    typeof watchInterruptDetails.interrupted_turn === "string",
+    widgetCalls.at(-1)?.content?.[0]?.includes("[idle]"),
+    journalEntries.length > journalBeforeWatchInterrupt,
+  ], [true, true, true]);
+  const interruptedTurnResult = await pendingInterruptedTurn;
+  const widgetCallsAfterInterrupt = widgetCalls.length;
+  const widgetAfterInterrupt = widgetCalls.at(-1)?.content?.join("\n");
+  resolveInterruptedProvider({
+    role: "assistant",
+    content: [{ type: "text", text: "ABANDONED_AFTER_INTERRUPT" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  eq("late provider output cannot overwrite interrupted worker watch", [
+    interruptedTurnResult.details.status,
+    widgetCalls.length,
+    widgetCalls.at(-1)?.content?.join("\n"),
+    widgetCalls.at(-1)?.content?.join("\n").includes("ABANDONED_AFTER_INTERRUPT"),
+  ], ["interrupted", widgetCallsAfterInterrupt, widgetAfterInterrupt, false]);
+
   let resolveAbandonedTurn!: (message: unknown) => void;
   let markAbandonedTurnStarted!: () => void;
   const abandonedTurnStarted = new Promise<void>((resolve) => { markAbandonedTurnStarted = resolve; });

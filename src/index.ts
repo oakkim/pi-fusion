@@ -319,7 +319,7 @@ export default function (pi: ExtensionAPI) {
       if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
       runtime.untrackController(turnId);
       persist(ctx, workerId);
-      refreshWatch(ctx, workerId, turnEpoch, liveMessages);
+      refreshWatch(ctx, workerId, turnEpoch);
       return {
         text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
         details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
@@ -367,6 +367,7 @@ export default function (pi: ExtensionAPI) {
         clampMaxToolCalls(cfg.maxToolCalls),
         ctx,
         (message) => {
+          if (runtime.getWorker(workerId)?.activeTurnId !== turnId) return;
           liveMessages.push(message);
           refreshWatch(ctx, workerId, turnEpoch, liveMessages);
         },
@@ -644,10 +645,14 @@ export default function (pi: ExtensionAPI) {
     label: "Fusion Interrupt",
     description: "Stop a worker's active turn but keep the worker open. No failure is recorded (no false escalation).",
     parameters: InterruptParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       const interruptedTurnId = runtime.interrupt(params.worker_id);
+      if (interruptedTurnId) {
+        persist(ctx, w.id);
+        refreshWatch(ctx, w.id, runtimeEpoch);
+      }
       return {
         content: [{ type: "text", text: JSON.stringify({ worker_id: w.id, status: w.status, interrupted_turn: interruptedTurnId ?? null }) }],
         details: { status: w.status },

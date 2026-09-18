@@ -120,7 +120,7 @@ eq("empty ctx", buildRecentContext([], 4), undefined);
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
@@ -201,6 +201,38 @@ try {
   eq("existing merge preserved", [pendingErr.includes("already has a merge"), pendingMergeHeadAfter, pendingStatus], [true, pendingMergeHead, "?? pending.txt"]);
   await tgit(repo, ["merge", "--abort"]);
   await removeWorktree(pending);
+
+  const race = await createWorktree(repo, "race");
+  await tgit(race.path, ["commit", "--allow-empty", "-m", "race side"]);
+  const base = (await sh("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
+  const tree = (await sh("git", ["rev-parse", "HEAD^{tree}"], { cwd: repo })).stdout.trim();
+  const competitor = (await sh("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", base, "-m", "competitor"], { cwd: repo })).stdout.trim();
+  await tgit(repo, ["branch", "competitor", competitor]);
+  await tgit(repo, ["commit", "--allow-empty", "-m", "race project"]);
+  const realGit = (await sh("sh", ["-c", "command -v git"])).stdout.trim();
+  const fakeBin = mkdtempSync(_join(tmpdir(), "fusion-git-"));
+  writeFileSync(_join(fakeBin, "git"), `#!/bin/sh
+if [ "$1" = merge ] && [ "$2" = --no-edit ] && [ "$3" = ${race.branch} ]; then
+  "$PI_FUSION_REAL_GIT" merge --no-ff --no-commit competitor || exit $?
+fi
+exec "$PI_FUSION_REAL_GIT" "$@"
+`);
+  chmodSync(_join(fakeBin, "git"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${oldPath}`;
+  process.env.PI_FUSION_REAL_GIT = realGit;
+  let raceErr = "";
+  try { await mergeWorktree(race, "test"); } catch (e) { raceErr = (e as Error).message; }
+  finally {
+    process.env.PATH = oldPath;
+    delete process.env.PI_FUSION_REAL_GIT;
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+  const raceMergeHead = (await sh("git", ["rev-parse", "MERGE_HEAD"], { cwd: repo })).stdout.trim();
+  eq("competing merge preserved", [raceErr.includes("git merge"), raceMergeHead], [true, competitor]);
+  await tgit(repo, ["merge", "--abort"]);
+  await removeWorktree(race);
+  await tgit(repo, ["branch", "-D", "competitor"]);
 
   writeFileSync(_join(repo, "conflict.txt"), "base\n");
   await tgit(repo, ["add", "conflict.txt"]);

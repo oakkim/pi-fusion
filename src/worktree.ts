@@ -118,11 +118,17 @@ export async function mergeWorktree(w: WorktreeInfo, label?: string): Promise<Me
   if (current !== w.projectBranch) {
     throw new Error(`Project is on ${JSON.stringify(current || "detached")}, expected ${JSON.stringify(w.projectBranch)}. Check out ${w.projectBranch} first.`);
   }
+  const startHead = await git(w.projectRoot, ["rev-parse", "HEAD"]);
+  const worktreeHead = await git(w.path, ["rev-parse", "HEAD"]);
   let mergeOutput: string;
   try {
     mergeOutput = await git(w.projectRoot, ["merge", "--no-edit", w.branch]);
   } catch (err) {
-    await git(w.projectRoot, ["merge", "--abort"]).catch(() => undefined);
+    const currentHead = await git(w.projectRoot, ["rev-parse", "HEAD"]).catch(() => "");
+    const mergeHead = await git(w.projectRoot, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "");
+    if (currentHead === startHead && mergeHead === worktreeHead) {
+      await git(w.projectRoot, ["merge", "--abort"]).catch(() => undefined);
+    }
     throw err;
   }
   return { committed, mergeOutput };

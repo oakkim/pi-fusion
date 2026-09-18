@@ -67,6 +67,24 @@ try { rt.followup(worker.id, { role: "user", content: "y", timestamp: 12 } as ne
 catch (e) { closedErr = (e as Error).message; }
 eq("closed rejected", closedErr.includes("closed"), true);
 
+// restore replaces the active branch state, including turns and controllers
+const rtRestore = new WorkerRuntime();
+const old = rtRestore.spawn({ label: "old", executorModelId: "m", firstMessage: u1 });
+const oldController = new AbortController();
+rtRestore.trackController(old.turn.id, oldController);
+rtRestore.restore([{
+  type: "custom",
+  customType: "fusion-worker",
+  data: {
+    worker: { ...old.worker, id: "wrk_restored", status: "closed", activeTurnId: old.turn.id },
+    turns: [{ ...old.turn, id: "trn_restored", workerId: "wrk_restored" }],
+  },
+}]);
+eq("restore aborts active controllers", oldController.signal.aborted, true);
+eq("restore removes old branch workers", rtRestore.getWorker(old.worker.id), undefined);
+eq("restore keeps closed worker", rtRestore.getWorker("wrk_restored")?.status, "closed");
+eq("restore keeps turn and interrupts running", rtRestore.getTurn("trn_restored")?.status, "interrupted");
+
 // --- 2. independent compaction ---
 const rt2 = new WorkerRuntime();
 const w2 = rt2.spawn({ label: undefined, executorModelId: "m", firstMessage: { role: "user", content: "t0", timestamp: 0 } as never }).worker;

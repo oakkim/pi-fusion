@@ -66,6 +66,10 @@ function userMsg(text: string): Message {
   return { role: "user", content: text, timestamp: Date.now() } as Message;
 }
 
+export function combineTurnSignals(internal: AbortSignal, host?: AbortSignal): AbortSignal {
+  return host ? AbortSignal.any([internal, host]) : internal;
+}
+
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
 
@@ -226,6 +230,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     workerId: string,
     turnId: string,
+    hostSignal?: AbortSignal,
     onUpdate?: (partial: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void,
   ): Promise<{ text: string; details: Record<string, unknown> }> {
     const worker = runtime.getWorker(workerId)!;
@@ -248,18 +253,16 @@ export default function (pi: ExtensionAPI) {
     const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
     const controller = new AbortController();
     runtime.trackController(turnId, controller);
-    const signal = controller.signal;
-    // Wire lead-side cancellation through.
-    const abort = (_s: unknown) => controller.abort();
-    void abort;
+    const signal = combineTurnSignals(controller.signal, hostSignal);
 
     onUpdate?.({
       content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
       details: { phase: "executing", workerId, turnId },
     });
 
-    const exec = () =>
-      runExecutorTurn(
+    const exec = () => {
+      signal.throwIfAborted();
+      return runExecutorTurn(
         ctx.modelRegistry,
         executor,
         SIDEKICK_SYSTEM_PROMPT,
@@ -271,10 +274,12 @@ export default function (pi: ExtensionAPI) {
         clampMaxToolCalls(cfg.maxToolCalls),
         ctx,
       );
+    };
 
     try {
       const mutating = isMutatingSelection(cfg.executorTools);
       const result = mutating ? await runSerialized(exec) : await exec();
+      signal.throwIfAborted();
       const output = getTextContent(result.message);
       if (!runtime.finishTurn(turnId, output, result.added)) {
         const status = worker.status === "closed"
@@ -330,7 +335,8 @@ export default function (pi: ExtensionAPI) {
       // Settled by fusion_interrupt while awaiting: keep it interrupted,
       // don't record a failure (no false escalation).
       const cur = runtime.getTurn(turnId);
-      if (cur?.status === "interrupted") {
+      if (cur?.status === "interrupted" || signal.aborted) {
+        if (cur?.status === "running") runtime.interrupt(workerId);
         runtime.untrackController(turnId);
         persist(ctx, workerId);
         return {
@@ -368,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 
     ],
     parameters: SpawnParams,
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const cfg = effectiveConfig(ctx);
       const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
       if (!consent.ok) {
@@ -395,7 +401,7 @@ export default function (pi: ExtensionAPI) {
       const taskText = handoffTaskText(1, params.task, contextText, params.label);
       const { worker, turn } = runtime.spawn({ label: params.label, executorModelId: modelDisplay(executor), firstMessage: userMsg(taskText), worktree });
       persist(ctx, worker.id);
-      const out = await runTurn(ctx, worker.id, turn.id, onUpdate);
+      const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
       return { content: [{ type: "text", text: out.text }], details: out.details };
     },
   });
@@ -413,7 +419,7 @@ export default function (pi: ExtensionAPI) {
       "Provider failures auto-escalate the worker one rung up the fallback ladder (and de-escalate on success) — retry via followup before giving up on a worker.",
     ],
     parameters: FollowupParams,
-    async execute(_toolCallId, params, _signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const cfg = effectiveConfig(ctx);
       const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
       if (!consent.ok) {
@@ -438,7 +444,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: message }, null, 2) }], details: { status: "error", error: message } };
       }
       persist(ctx, worker.id);
-      const out = await runTurn(ctx, worker.id, turn.id, onUpdate);
+      const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
       return { content: [{ type: "text", text: out.text }], details: out.details };
     },
   });

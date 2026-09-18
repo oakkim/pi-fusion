@@ -4,6 +4,7 @@ import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext } from "../src/utils.ts";
+import { combineTurnSignals } from "../src/index.ts";
 
 let pass = 0;
 let fail = 0;
@@ -135,6 +136,13 @@ const entries = [
 ];
 eq("recent ctx", buildRecentContext(entries, 4)?.includes("hello"), true);
 eq("empty ctx", buildRecentContext([], 4), undefined);
+
+const internalAbort = new AbortController();
+const hostAbort = new AbortController();
+const combinedInternal = combineTurnSignals(internalAbort.signal, hostAbort.signal);
+internalAbort.abort();
+const combinedHost = combineTurnSignals(new AbortController().signal, AbortSignal.abort());
+eq("turn signal aborts from either source", [combinedInternal.aborted, combinedHost.aborted], [true, true]);
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";

@@ -19,12 +19,15 @@ const execFileAsync = promisify(execFile);
 
 async function git(cwd: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("git", args, { cwd, timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+    const { stdout } = await execFileAsync("git", args, { cwd, env: { ...process.env, LC_ALL: "C" }, timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
     return stdout.trim();
   } catch (err) {
-    const e = err as { stderr?: unknown; message?: unknown };
+    const e = err as { stdout?: unknown; stderr?: unknown; message?: unknown };
     const detail = typeof e.stderr === "string" && e.stderr.trim() ? e.stderr.trim() : String(e.message ?? err);
-    throw new Error(`git ${args.join(" ")} failed: ${detail.split("\n")[0]}`);
+    throw Object.assign(new Error(`git ${args.join(" ")} failed: ${detail.split("\n")[0]}`), {
+      stdout: typeof e.stdout === "string" ? e.stdout : "",
+      stderr: typeof e.stderr === "string" ? e.stderr : "",
+    });
   }
 }
 
@@ -91,6 +94,14 @@ export async function mergeWorktree(w: WorktreeInfo, label?: string): Promise<Me
   if (!w.projectBranch) {
     throw new Error("Cannot merge: project checkout is on a detached HEAD. Check out a branch first.");
   }
+  const worktreeBranch = await git(w.path, ["branch", "--show-current"]).catch(() => "");
+  if (worktreeBranch !== w.branch) {
+    throw new Error(`Worktree is on ${JSON.stringify(worktreeBranch || "detached")}, expected ${JSON.stringify(w.branch)}.`);
+  }
+  const mergeInProgress = await git(w.projectRoot, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).then(() => true, () => false);
+  if (mergeInProgress) {
+    throw new Error("Project checkout already has a merge in progress; finish or abort it first.");
+  }
   // 1. Commit worktree changes (with fallback identity so it always works).
   await git(w.path, ["add", "-A"]);
   const dirty = await git(w.path, ["status", "--porcelain"]);
@@ -110,7 +121,23 @@ export async function mergeWorktree(w: WorktreeInfo, label?: string): Promise<Me
   if (current !== w.projectBranch) {
     throw new Error(`Project is on ${JSON.stringify(current || "detached")}, expected ${JSON.stringify(w.projectBranch)}. Check out ${w.projectBranch} first.`);
   }
-  const mergeOutput = await git(w.projectRoot, ["merge", "--no-edit", w.branch]);
+  const startHead = await git(w.projectRoot, ["rev-parse", "HEAD"]);
+  const worktreeHead = await git(w.path, ["rev-parse", "HEAD"]);
+  let mergeOutput: string;
+  try {
+    mergeOutput = await git(w.projectRoot, ["merge", "--no-edit", w.branch]);
+  } catch (err) {
+    const raw = err as { stdout?: unknown; stderr?: unknown };
+    const output = [raw.stdout, raw.stderr].filter((part): part is string => typeof part === "string").join("\n");
+    if (output.includes("CONFLICT (")) {
+      const currentHead = await git(w.projectRoot, ["rev-parse", "HEAD"]).catch(() => "");
+      const mergeHead = await git(w.projectRoot, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).catch(() => "");
+      if (currentHead === startHead && mergeHead === worktreeHead) {
+        await git(w.projectRoot, ["merge", "--abort"]).catch(() => undefined);
+      }
+    }
+    throw err;
+  }
   return { committed, mergeOutput };
 }
 

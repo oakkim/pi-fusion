@@ -515,7 +515,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} is busy (turn ${w.activeTurnId}); merge only idle workers.` }) }], details: { status: "error" } };
       }
       try {
-        const result = await mergeWorktree(w.worktree, w.label);
+        const result = await runSerialized(() => mergeWorktree(w.worktree!, w.label));
         return {
           content: [{ type: "text", text: JSON.stringify({ worker_id: w.id, status: "merged", branch: w.worktree.branch, committed: result.committed, merge: result.mergeOutput.slice(0, 2000) }, null, 2) }],
           details: { status: "merged" },

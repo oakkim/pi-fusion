@@ -120,7 +120,7 @@ eq("empty ctx", buildRecentContext([], 4), undefined);
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
@@ -178,6 +178,71 @@ try {
   await removeWorktree(wt);
   const branches = (await sh("git", ["branch", "--list", "pi-fusion/fix1"], { cwd: repo })).stdout.trim();
   eq("branch removed", branches, "");
+
+  const detached = await createWorktree(repo, "detached");
+  writeFileSync(_join(detached.path, "detached.txt"), "must-not-commit\n");
+  await tgit(detached.path, ["checkout", "--detach"]);
+  let detachedErr = "";
+  try { await mergeWorktree(detached, "test"); } catch (e) { detachedErr = (e as Error).message; }
+  const detachedStatus = (await sh("git", ["status", "--porcelain"], { cwd: detached.path })).stdout.trim();
+  eq("detached worktree rejected before staging", [detachedErr.includes("expected"), detachedStatus], [true, "?? detached.txt"]);
+  await removeWorktree(detached);
+
+  const pending = await createWorktree(repo, "pending");
+  await tgit(pending.path, ["commit", "--allow-empty", "-m", "pending side"]);
+  writeFileSync(_join(pending.path, "pending.txt"), "must-not-stage\n");
+  await tgit(repo, ["commit", "--allow-empty", "-m", "pending project"]);
+  await tgit(repo, ["merge", "--no-ff", "--no-commit", pending.branch]);
+  const pendingMergeHead = (await sh("git", ["rev-parse", "MERGE_HEAD"], { cwd: repo })).stdout.trim();
+  let pendingErr = "";
+  try { await mergeWorktree(pending, "test"); } catch (e) { pendingErr = (e as Error).message; }
+  const pendingMergeHeadAfter = (await sh("git", ["rev-parse", "MERGE_HEAD"], { cwd: repo })).stdout.trim();
+  const pendingStatus = (await sh("git", ["status", "--porcelain"], { cwd: pending.path })).stdout.trim();
+  eq("existing merge preserved", [pendingErr.includes("already has a merge"), pendingMergeHeadAfter, pendingStatus], [true, pendingMergeHead, "?? pending.txt"]);
+  await tgit(repo, ["merge", "--abort"]);
+  await removeWorktree(pending);
+
+  const race = await createWorktree(repo, "race");
+  await tgit(race.path, ["commit", "--allow-empty", "-m", "race side"]);
+  const raceHead = (await sh("git", ["rev-parse", race.branch], { cwd: repo })).stdout.trim();
+  await tgit(repo, ["commit", "--allow-empty", "-m", "race project"]);
+  const realGit = (await sh("sh", ["-c", "command -v git"])).stdout.trim();
+  const fakeBin = mkdtempSync(_join(tmpdir(), "fusion-git-"));
+  writeFileSync(_join(fakeBin, "git"), `#!/bin/sh
+if [ "$1" = merge ] && [ "$2" = --no-edit ] && [ "$3" = ${race.branch} ]; then
+  "$PI_FUSION_REAL_GIT" merge --no-ff --no-commit ${race.branch} || exit $?
+fi
+exec "$PI_FUSION_REAL_GIT" "$@"
+`);
+  chmodSync(_join(fakeBin, "git"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${oldPath}`;
+  process.env.PI_FUSION_REAL_GIT = realGit;
+  let raceErr = "";
+  try { await mergeWorktree(race, "test"); } catch (e) { raceErr = (e as Error).message; }
+  finally {
+    process.env.PATH = oldPath;
+    delete process.env.PI_FUSION_REAL_GIT;
+    rmSync(fakeBin, { recursive: true, force: true });
+  }
+  const raceMergeHead = (await sh("git", ["rev-parse", "MERGE_HEAD"], { cwd: repo })).stdout.trim();
+  eq("same-branch competing merge preserved", [raceErr.includes("git merge"), raceMergeHead], [true, raceHead]);
+  await tgit(repo, ["merge", "--abort"]);
+  await removeWorktree(race);
+
+  writeFileSync(_join(repo, "conflict.txt"), "base\n");
+  await tgit(repo, ["add", "conflict.txt"]);
+  await tgit(repo, ["commit", "-m", "conflict base"]);
+  const conflict = await createWorktree(repo, "conflict");
+  writeFileSync(_join(conflict.path, "conflict.txt"), "sidekick\n");
+  writeFileSync(_join(repo, "conflict.txt"), "project\n");
+  await tgit(repo, ["commit", "-am", "project conflict"]);
+  let conflictErr = "";
+  try { await mergeWorktree(conflict, "test"); } catch (e) { conflictErr = (e as Error).message; }
+  const mergeHead = await sh("git", ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { cwd: repo }).then(() => true, () => false);
+  const conflictStatus = (await sh("git", ["status", "--porcelain"], { cwd: repo })).stdout.trim();
+  eq("conflicting merge aborted", [conflictErr.includes("git merge"), mergeHead, conflictStatus, readFileSync(_join(repo, "conflict.txt"), "utf8")], [true, false, "", "project\n"]);
+  await removeWorktree(conflict);
 } finally {
   rmSync(repo, { recursive: true, force: true });
 }

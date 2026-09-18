@@ -272,7 +272,16 @@ export default function (pi: ExtensionAPI) {
       const mutating = isMutatingSelection(cfg.executorTools);
       const result = mutating ? await runSerialized(exec) : await exec();
       const output = getTextContent(result.message);
-      runtime.finishTurn(turnId, output, result.added);
+      if (!runtime.finishTurn(turnId, output, result.added)) {
+        const status = worker.status === "closed"
+          ? "closed"
+          : runtime.getTurn(turnId)?.status === "interrupted" ? "interrupted" : "stale";
+        persist(ctx, workerId);
+        return {
+          text: JSON.stringify({ status, worker_id: workerId, turn_id: turnId }, null, 2),
+          details: { status, worker_id: workerId, turn_id: turnId },
+        };
+      }
       // Independent compaction per worker (fusion-ref): the ladder rung is
       // re-evaluated from failures every turn, so a compaction boundary also
       // re-routes for free.

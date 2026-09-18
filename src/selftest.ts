@@ -162,6 +162,11 @@ const ladder2 = resolveLadder(
   fakeModels[0] as never, "p/flash", ["p/pro", "p/pro"], 1, [],
 );
 eq("ladder caps + dedupes", ladder2.map((m: FakeModel) => m.id), ["flash", "pro"]);
+const ladder3 = resolveLadder(
+  { ...stubRegistry, hasConfiguredAuth: () => true } as never,
+  fakeModels[0] as never, "p/flash", ["p/missing", "p/pro"], 1, [],
+);
+eq("unavailable fallback does not consume rung", ladder3.map((m: FakeModel) => m.id), ["flash", "pro"]);
 
 // failures climb, success resets (WorkerRuntime semantics runTurn relies on)
 const rt3 = new WorkerRuntime();
@@ -194,6 +199,48 @@ const c1 = addUsage(c0, { input: 10, output: 5, totalTokens: 15, cost: { total: 
 const c2 = addUsage(c1, { input: 3, cost: { total: 2 } });
 const c3 = addUsage(c2, undefined);
 eq("usage sum", c3, { input: 13, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: 3 });
+
+// --- 8c. executor dispatches through the configured model registry ---
+import { runExecutorTurn } from "../src/llm.ts";
+let registryCompleteCalls = 0;
+let registryCall: { model?: unknown; options?: Record<string, unknown> } = {};
+const registryModel = { provider: "opencode-go", id: "registered", input: ["text"] };
+const registrySignal = new AbortController().signal;
+const registryResult = await runExecutorTurn(
+  {
+    complete: async (model: unknown, _context: unknown, options: Record<string, unknown>) => {
+      registryCompleteCalls++;
+      registryCall = { model, options };
+      return {
+        role: "assistant",
+        content: [{ type: "text", text: "registry ok" }],
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+    },
+  } as never,
+  registryModel as never,
+  "system",
+  [{ role: "user", content: "task", timestamp: 0 }] as never,
+  128,
+  0.2,
+  registrySignal,
+  [],
+  1,
+  { sessionManager: { getSessionId: () => "session-test" } } as never,
+);
+eq("registry complete dispatch", [
+  registryCompleteCalls,
+  registryCall.model === registryModel,
+  registryCall.options?.signal === registrySignal,
+  registryCall.options?.maxTokens,
+  registryCall.options?.temperature,
+  registryCall.options?.headers,
+  registryResult.message.content,
+], [1, true, true, 128, 0.2, {
+  "x-opencode-session": "session-test",
+  "x-opencode-client": "pi",
+}, [{ type: "text", text: "registry ok" }]]);
 
 // --- 9. forced mode helpers ---
 import { forceFusionPrompt, fusionArgumentCompletions, isForcePrompt, modeLabel, normalizeMode, parseFusionCommand } from "../src/mode.ts";

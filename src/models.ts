@@ -40,7 +40,9 @@ export function resolveLadder(
     ladder.push(base);
     seen.add(modelDisplay(base));
   }
-  for (const id of fallbackExecutors.slice(0, Math.max(0, maxEscalations))) {
+  let addedFallbacks = 0;
+  for (const id of fallbackExecutors) {
+    if (addedFallbacks >= Math.max(0, maxEscalations)) break;
     const m = resolveModelIdentifier(registry, id);
     if (!m || !m.input.includes("text") || !registry.hasConfiguredAuth(m)) {
       warnings.push(`Fallback executor ${id} unavailable; skipping.`);
@@ -50,6 +52,7 @@ export function resolveLadder(
     if (!seen.has(key)) {
       seen.add(key);
       ladder.push(m);
+      addedFallbacks++;
     }
   }
   return ladder;

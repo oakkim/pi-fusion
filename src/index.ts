@@ -196,8 +196,9 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function refreshWatch(ctx: ExtensionContext, liveMessages: Message[] = []): void {
+  function refreshWatch(ctx: ExtensionContext, sourceWorkerId?: string, liveMessages: Message[] = []): void {
     if (!watchedWorkerId) return;
+    if (sourceWorkerId && sourceWorkerId !== watchedWorkerId) return;
     const worker = runtime.getWorker(watchedWorkerId);
     if (!worker) {
       clearWatch(ctx);
@@ -315,14 +316,14 @@ export default function (pi: ExtensionAPI) {
       if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
       runtime.untrackController(turnId);
       persist(ctx, workerId);
-      refreshWatch(ctx, liveMessages);
+      refreshWatch(ctx, workerId, liveMessages);
       return {
         text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
         details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
       };
     };
     if (signal.aborted) return interruptedResult();
-    refreshWatch(ctx);
+    refreshWatch(ctx, workerId);
 
     const cfg = effectiveConfig(ctx);
     const warnings: string[] = [];
@@ -361,7 +362,7 @@ export default function (pi: ExtensionAPI) {
         ctx,
         (message) => {
           liveMessages.push(message);
-          refreshWatch(ctx, liveMessages);
+          refreshWatch(ctx, workerId, liveMessages);
         },
       );
     };
@@ -386,7 +387,7 @@ export default function (pi: ExtensionAPI) {
       // re-routes for free.
       const compacted = runtime.compactHistory(worker, cfg.maxHistoryMessages);
       persist(ctx, workerId);
-      refreshWatch(ctx);
+      refreshWatch(ctx, workerId);
       try {
         (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-cost", {
           worker_id: workerId,
@@ -432,7 +433,7 @@ export default function (pi: ExtensionAPI) {
       const message = err instanceof Error ? err.message : String(err);
       runtime.failTurn(turnId, message);
       persist(ctx, workerId);
-      refreshWatch(ctx, liveMessages);
+      refreshWatch(ctx, workerId, liveMessages);
       return {
         text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message, consecutive_failures: worker.failures, next_rung: rungFor(worker.failures, ladder.length) }, null, 2),
         details: { status: "error", worker_id: workerId, turn_id: turnId, error: message },

@@ -545,6 +545,36 @@ try {
     widgetCalls.at(-1)?.content?.join("\n").includes("user:"),
     widgetCalls.at(-1)?.content?.join("\n").includes("assistant: done"),
   ], ["fusion-watch", "aboveEditor", true, true]);
+  const watchedAWidget = widgetCalls.at(-1)?.content?.join("\n");
+  let foreignProviderCalls = 0;
+  completeImpl = async () => {
+    foreignProviderCalls++;
+    if (foreignProviderCalls === 1) {
+      return {
+        role: "assistant",
+        content: [
+          { type: "text", text: "FOREIGN_ASSISTANT" },
+          { type: "toolCall", id: "foreign-tool", name: "missing_foreign_tool", arguments: {} },
+        ],
+        stopReason: "toolUse",
+        timestamp: Date.now(),
+      };
+    }
+    return {
+      role: "assistant",
+      content: [{ type: "text", text: "FOREIGN_FINAL" }],
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+  };
+  const widgetsBeforeForeignWorker = widgetCalls.length;
+  const foreignWorker = await spawn.execute("foreign", { task: "run worker B" }, undefined, undefined, context);
+  eq("other worker live output does not replace watched worker", [
+    foreignWorker.details.status,
+    widgetCalls.length,
+    widgetCalls.at(-1)?.content?.join("\n"),
+    widgetCalls.at(-1)?.content?.join("\n").includes("FOREIGN_"),
+  ], ["ok", widgetsBeforeForeignWorker, watchedAWidget, false]);
   await watch.handler("off", context);
   eq("watch off clears stable widget", [widgetCalls.at(-1)?.key, widgetCalls.at(-1)?.content], ["fusion-watch", undefined]);
   let executorSignal: AbortSignal | undefined;

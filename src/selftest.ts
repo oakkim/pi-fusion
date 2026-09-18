@@ -4,7 +4,7 @@ import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext } from "../src/utils.ts";
-import { combineTurnSignals } from "../src/index.ts";
+import fusionExtension from "../src/index.ts";
 
 let pass = 0;
 let fail = 0;
@@ -137,16 +137,9 @@ const entries = [
 eq("recent ctx", buildRecentContext(entries, 4)?.includes("hello"), true);
 eq("empty ctx", buildRecentContext([], 4), undefined);
 
-const internalAbort = new AbortController();
-const hostAbort = new AbortController();
-const combinedInternal = combineTurnSignals(internalAbort.signal, hostAbort.signal);
-internalAbort.abort();
-const combinedHost = combineTurnSignals(new AbortController().signal, AbortSignal.abort());
-eq("turn signal aborts from either source", [combinedInternal.aborted, combinedHost.aborted], [true, true]);
-
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { chmodSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
@@ -379,6 +372,150 @@ eq("registry complete dispatch", [
   "x-opencode-session": "session-test",
   "x-opencode-client": "pi",
 }, [{ type: "text", text: "registry ok" }]]);
+
+const toolAbort = new AbortController();
+let secondToolRuns = 0;
+let toolAbortEscaped = false;
+try {
+  await runExecutorTurn(
+    {
+      complete: async () => ({
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "first", name: "first", arguments: {} },
+          { type: "toolCall", id: "second", name: "second", arguments: {} },
+        ],
+        stopReason: "toolUse",
+        timestamp: Date.now(),
+      }),
+    } as never,
+    registryModel as never,
+    "system",
+    [{ role: "user", content: "task", timestamp: 0 }] as never,
+    128,
+    0.2,
+    toolAbort.signal,
+    [
+      {
+        name: "first", description: "first", parameters: {},
+        execute: async () => {
+          toolAbort.abort();
+          return { content: [{ type: "text", text: "done" }], isError: false };
+        },
+      },
+      {
+        name: "second", description: "second", parameters: {},
+        execute: async () => {
+          secondToolRuns++;
+          return { content: [{ type: "text", text: "must not run" }], isError: false };
+        },
+      },
+    ] as never,
+    2,
+    { sessionManager: { getSessionId: () => undefined } } as never,
+  );
+} catch {
+  toolAbortEscaped = true;
+}
+eq("abort stops later tool calls", [toolAbort.signal.aborted, toolAbortEscaped, secondToolRuns], [true, true, 0]);
+
+// --- 8d. registered tools propagate host cancellation through runTurn ---
+const fusionDir = mkdtempSync(_join(tmpdir(), "fusion-cancel-"));
+try {
+  mkdirSync(_join(fusionDir, ".pi"));
+  writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: "none" }));
+  const registered = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  fusionExtension({
+    on: () => {},
+    registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.set(tool.name, tool),
+    registerCommand: () => {},
+    appendEntry: () => {},
+  } as never);
+
+  const executorModel = { provider: "test", id: "executor", input: ["text"] };
+  let availableModels = [executorModel];
+  let completeImpl: (_model: unknown, _context: unknown, options: { signal?: AbortSignal }) => Promise<any> = async () => ({
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  const context = {
+    cwd: fusionDir,
+    hasUI: false,
+    isProjectTrusted: () => true,
+    model: undefined,
+    modelRegistry: {
+      getAll: () => [executorModel],
+      getAvailable: () => availableModels,
+      hasConfiguredAuth: () => true,
+      complete: (model: unknown, completeContext: unknown, options: { signal?: AbortSignal }) => completeImpl(model, completeContext, options),
+    },
+    sessionManager: { getBranch: () => [], getSessionId: () => undefined },
+  };
+  const spawn = registered.get("fusion_spawn")!;
+  const followup = registered.get("fusion_followup")!;
+  const status = registered.get("fusion_status")!;
+  const readStatus = async (id: string) => {
+    const result = await status.execute("status", { id }, undefined, undefined, context);
+    return JSON.parse(result.content[0].text);
+  };
+
+  const initial = await spawn.execute("initial", { task: "start" }, undefined, undefined, context);
+  const workerId = initial.details.worker_id as string;
+  availableModels = [];
+  const preAborted = await followup.execute(
+    "pre-aborted",
+    { worker_id: workerId, message: "cancelled" },
+    AbortSignal.abort(),
+    undefined,
+    context,
+  );
+  const preTurnId = preAborted.details.turn_id as string;
+  const preTurn = await readStatus(preTurnId);
+  const preWorker = await readStatus(workerId);
+  eq("pre-aborted followup wins over missing executor", [
+    preAborted.details.status,
+    preTurn.status,
+    preWorker.active_turn,
+    preWorker.consecutive_failures,
+  ], ["interrupted", "interrupted", null, 0]);
+
+  availableModels = [executorModel];
+  let executorSignal: AbortSignal | undefined;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  completeImpl = async (_model, _completeContext, options) => {
+    executorSignal = options.signal;
+    return new Promise((_resolve, reject) => {
+      if (!executorSignal) {
+        markStarted();
+        reject(new Error("executor signal missing"));
+        return;
+      }
+      executorSignal.addEventListener("abort", () => reject(executorSignal?.reason), { once: true });
+      markStarted();
+    });
+  };
+  const hostController = new AbortController();
+  const pendingSpawn = spawn.execute("deferred", { task: "wait" }, hostController.signal, undefined, context);
+  await started;
+  hostController.abort();
+  const deferred = await pendingSpawn;
+  const deferredTurnId = deferred.details.turn_id as string;
+  const deferredWorkerId = deferred.details.worker_id as string;
+  const deferredTurn = await readStatus(deferredTurnId);
+  const deferredWorker = await readStatus(deferredWorkerId);
+  eq("deferred host abort interrupts running turn", [
+    deferred.details.status,
+    deferredTurn.status,
+    deferredWorker.active_turn,
+    deferredWorker.consecutive_failures,
+    executorSignal?.aborted,
+  ], ["interrupted", "interrupted", null, 0, true]);
+} finally {
+  rmSync(fusionDir, { recursive: true, force: true });
+}
 
 // --- 9. forced mode helpers ---
 import { forceFusionPrompt, fusionArgumentCompletions, isForcePrompt, modeLabel, normalizeMode, parseFusionCommand } from "../src/mode.ts";

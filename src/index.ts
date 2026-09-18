@@ -66,10 +66,6 @@ function userMsg(text: string): Message {
   return { role: "user", content: text, timestamp: Date.now() } as Message;
 }
 
-export function combineTurnSignals(internal: AbortSignal, host?: AbortSignal): AbortSignal {
-  return host ? AbortSignal.any([internal, host]) : internal;
-}
-
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
 
@@ -235,6 +231,20 @@ export default function (pi: ExtensionAPI) {
   ): Promise<{ text: string; details: Record<string, unknown> }> {
     const worker = runtime.getWorker(workerId)!;
     const turn = runtime.getTurn(turnId)!;
+    const controller = new AbortController();
+    runtime.trackController(turnId, controller);
+    const signal = hostSignal ? AbortSignal.any([controller.signal, hostSignal]) : controller.signal;
+    const interruptedResult = () => {
+      if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
+      runtime.untrackController(turnId);
+      persist(ctx, workerId);
+      return {
+        text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
+        details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
+      };
+    };
+    if (signal.aborted) return interruptedResult();
+
     const cfg = effectiveConfig(ctx);
     const warnings: string[] = [];
     const ladder = resolveLadder(ctx.modelRegistry, ctx.model, cfg.executor, cfg.fallbackExecutors, cfg.maxEscalations, warnings);
@@ -251,9 +261,6 @@ export default function (pi: ExtensionAPI) {
 
     const execCwd = worker.worktree ? execDirOf(worker.worktree) : ctx.cwd;
     const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
-    const controller = new AbortController();
-    runtime.trackController(turnId, controller);
-    const signal = combineTurnSignals(controller.signal, hostSignal);
 
     onUpdate?.({
       content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
@@ -336,13 +343,7 @@ export default function (pi: ExtensionAPI) {
       // don't record a failure (no false escalation).
       const cur = runtime.getTurn(turnId);
       if (cur?.status === "interrupted" || signal.aborted) {
-        if (cur?.status === "running") runtime.interrupt(workerId);
-        runtime.untrackController(turnId);
-        persist(ctx, workerId);
-        return {
-          text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
-          details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
-        };
+        return interruptedResult();
       }
       const message = err instanceof Error ? err.message : String(err);
       runtime.failTurn(turnId, message);

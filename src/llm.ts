@@ -111,6 +111,7 @@ export async function runExecutorTurn(
     let forceFinalize = false;
 
     for (const tc of calls) {
+      signal?.throwIfAborted();
       if (forceFinalize || used >= maxToolCalls) {
         const syn = syntheticResult(tc, forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted");
         messages.push(syn);

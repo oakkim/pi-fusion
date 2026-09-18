@@ -51,7 +51,7 @@ function build(name: ToolName, cwd: string): ExecutorToolDef {
   return {
     ...def,
     execute: (id, args, signal, extra, ctx) =>
-      def.execute(id, args, signal, extra, Object.assign(Object.create(ctx as object), { cwd })),
+      def.execute(id, args, signal, extra, Object.create(ctx as object, { cwd: { value: cwd, enumerable: true } })),
   };
 }
 

@@ -114,10 +114,20 @@ const shared = mkdtempSync(_join(tmpdir(), "fusion-shared-"));
 const isolated = mkdtempSync(_join(tmpdir(), "fusion-isolated-"));
 try {
   const tools = resolveToolDefs(["write", "bash"], isolated);
-  const ctx = { cwd: shared, sessionManager: { getSessionId: () => undefined, getSessionFile: () => undefined } };
+  let sessionReads = 0;
+  let sessionCalls = 0;
+  const sessionManager = {
+    getSessionId: () => { sessionCalls++; return undefined; },
+    getSessionFile: () => { sessionCalls++; return undefined; },
+  };
+  const ctx = {
+    get cwd() { return shared; },
+    get sessionManager() { sessionReads++; return sessionManager; },
+  };
   await tools.find((tool) => tool.name === "write")!.execute("write-cwd", { path: "write-cwd.txt", content: "isolated\n" }, undefined, undefined, ctx);
   await tools.find((tool) => tool.name === "bash")!.execute("bash-cwd", { command: "pwd > bash-cwd.txt" }, undefined, undefined, ctx);
   eq("tools use bound cwd", [readFileSync(_join(isolated, "write-cwd.txt"), "utf8"), readFileSync(_join(isolated, "bash-cwd.txt"), "utf8").trim()], ["isolated\n", realpathSync(isolated)]);
+  eq("tool context remains accessible", [sessionReads > 0, sessionCalls > 0], [true, true]);
 } finally {
   rmSync(shared, { recursive: true, force: true });
   rmSync(isolated, { recursive: true, force: true });

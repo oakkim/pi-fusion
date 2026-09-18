@@ -95,6 +95,10 @@ export async function mergeWorktree(w: WorktreeInfo, label?: string): Promise<Me
   if (worktreeBranch !== w.branch) {
     throw new Error(`Worktree is on ${JSON.stringify(worktreeBranch || "detached")}, expected ${JSON.stringify(w.branch)}.`);
   }
+  const mergeInProgress = await git(w.projectRoot, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).then(() => true, () => false);
+  if (mergeInProgress) {
+    throw new Error("Project checkout already has a merge in progress; finish or abort it first.");
+  }
   // 1. Commit worktree changes (with fallback identity so it always works).
   await git(w.path, ["add", "-A"]);
   const dirty = await git(w.path, ["status", "--porcelain"]);

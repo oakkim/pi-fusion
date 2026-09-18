@@ -188,6 +188,20 @@ try {
   eq("detached worktree rejected before staging", [detachedErr.includes("expected"), detachedStatus], [true, "?? detached.txt"]);
   await removeWorktree(detached);
 
+  const pending = await createWorktree(repo, "pending");
+  await tgit(pending.path, ["commit", "--allow-empty", "-m", "pending side"]);
+  writeFileSync(_join(pending.path, "pending.txt"), "must-not-stage\n");
+  await tgit(repo, ["commit", "--allow-empty", "-m", "pending project"]);
+  await tgit(repo, ["merge", "--no-ff", "--no-commit", pending.branch]);
+  const pendingMergeHead = (await sh("git", ["rev-parse", "MERGE_HEAD"], { cwd: repo })).stdout.trim();
+  let pendingErr = "";
+  try { await mergeWorktree(pending, "test"); } catch (e) { pendingErr = (e as Error).message; }
+  const pendingMergeHeadAfter = (await sh("git", ["rev-parse", "MERGE_HEAD"], { cwd: repo })).stdout.trim();
+  const pendingStatus = (await sh("git", ["status", "--porcelain"], { cwd: pending.path })).stdout.trim();
+  eq("existing merge preserved", [pendingErr.includes("already has a merge"), pendingMergeHeadAfter, pendingStatus], [true, pendingMergeHead, "?? pending.txt"]);
+  await tgit(repo, ["merge", "--abort"]);
+  await removeWorktree(pending);
+
   writeFileSync(_join(repo, "conflict.txt"), "base\n");
   await tgit(repo, ["add", "conflict.txt"]);
   await tgit(repo, ["commit", "-m", "conflict base"]);

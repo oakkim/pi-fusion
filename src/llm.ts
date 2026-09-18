@@ -146,6 +146,7 @@ async function runComplete(
   context: { systemPrompt: string; messages: Message[]; tools?: Tool[] },
   options: CompleteOptions,
 ): Promise<AssistantMessage> {
+  options.signal?.throwIfAborted();
   const resp = await registry.complete(model, context, options);
   if (resp.stopReason === "error" || resp.stopReason === "aborted") {
     throw new Error(resp.errorMessage ?? `Model stopped with reason: ${resp.stopReason}`);

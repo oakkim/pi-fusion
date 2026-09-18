@@ -419,6 +419,43 @@ try {
 }
 eq("abort stops later tool calls", [toolAbort.signal.aborted, toolAbortEscaped, secondToolRuns], [true, true, 0]);
 
+const lastToolAbort = new AbortController();
+let modelRequestsAfterAbort = 0;
+let lastToolAbortEscaped = false;
+try {
+  await runExecutorTurn(
+    {
+      complete: async () => {
+        modelRequestsAfterAbort++;
+        return {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "only", name: "only", arguments: {} }],
+          stopReason: "toolUse",
+          timestamp: Date.now(),
+        };
+      },
+    } as never,
+    registryModel as never,
+    "system",
+    [{ role: "user", content: "task", timestamp: 0 }] as never,
+    128,
+    0.2,
+    lastToolAbort.signal,
+    [{
+      name: "only", description: "only", parameters: {},
+      execute: async () => {
+        lastToolAbort.abort();
+        return { content: [{ type: "text", text: "done" }], isError: false };
+      },
+    }] as never,
+    2,
+    { sessionManager: { getSessionId: () => undefined } } as never,
+  );
+} catch {
+  lastToolAbortEscaped = true;
+}
+eq("abort after last tool skips next model request", [lastToolAbortEscaped, modelRequestsAfterAbort], [true, 1]);
+
 // --- 8d. registered tools propagate host cancellation through runTurn ---
 const fusionDir = mkdtempSync(_join(tmpdir(), "fusion-cancel-"));
 try {
@@ -572,6 +609,47 @@ try {
     worktreeList.includes(duringWorktree),
     journalEntries.length,
   ], [true, true, "", false, journalBeforeWorktrees]);
+
+  const failedCleanupWorktree = `cleanup-fail-${worktreeSuffix}`;
+  const lockStarted = _join(fusionDir, "lock-started");
+  const lockRelease = _join(fusionDir, "lock-release");
+  writeFileSync(postCheckout, `#!/bin/sh\nprintf test > "$(git rev-parse --git-path locked)"\ntouch ${JSON.stringify(lockStarted)}\nwhile [ ! -f ${JSON.stringify(lockRelease)} ]; do sleep 0.01; done\n`);
+  const failedCleanupController = new AbortController();
+  const pendingFailedCleanup = spawn.execute(
+    "cleanup-failure",
+    { task: "surface cleanup failure", worktree: failedCleanupWorktree },
+    failedCleanupController.signal,
+    undefined,
+    context,
+  );
+  for (let i = 0; i < 1_000 && !existsSync(lockStarted); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  const lockWasCreated = existsSync(lockStarted);
+  failedCleanupController.abort();
+  writeFileSync(lockRelease, "continue\n");
+  let cleanupFailure = "";
+  try {
+    await pendingFailedCleanup;
+  } catch (err) {
+    cleanupFailure = err instanceof Error ? err.message : String(err);
+  }
+  const failedBranch = (await sh("git", ["branch", "--list", `pi-fusion/${failedCleanupWorktree}`], { cwd: fusionDir })).stdout.trim();
+  const failedWorktreeList = (await sh("git", ["worktree", "list", "--porcelain"], { cwd: fusionDir })).stdout;
+  const failedBlock = failedWorktreeList.split("\n\n").find((block) => block.includes(`branch refs/heads/pi-fusion/${failedCleanupWorktree}`));
+  const failedPath = failedBlock?.match(/^worktree (.+)$/m)?.[1];
+  if (failedPath) {
+    await sh("git", ["worktree", "unlock", failedPath], { cwd: fusionDir }).catch(() => undefined);
+    await sh("git", ["worktree", "remove", "--force", failedPath], { cwd: fusionDir }).catch(() => undefined);
+    await sh("git", ["branch", "-D", `pi-fusion/${failedCleanupWorktree}`], { cwd: fusionDir }).catch(() => undefined);
+  }
+  eq("cleanup failure is surfaced instead of hidden by abort", [
+    lockWasCreated,
+    cleanupFailure.includes("Could not remove worktree"),
+    failedBranch.length > 0,
+    failedWorktreeList.includes(failedCleanupWorktree),
+    journalEntries.length,
+  ], [true, true, true, true, journalBeforeWorktrees]);
 } finally {
   rmSync(fusionDir, { recursive: true, force: true });
 }

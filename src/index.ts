@@ -396,14 +396,13 @@ export default function (pi: ExtensionAPI) {
       if (params.worktree) {
         try {
           worktree = await createWorktree(ctx.cwd, params.worktree);
-          if (signal?.aborted) {
-            await removeWorktree(worktree);
-            signal.throwIfAborted();
-          }
         } catch (err) {
-          if (signal?.aborted) signal.throwIfAborted();
           const message = err instanceof Error ? err.message : String(err);
           return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: message }, null, 2) }], details: { status: "error", error: message } };
+        }
+        if (signal?.aborted) {
+          await removeWorktree(worktree);
+          signal.throwIfAborted();
         }
       }
       const taskText = handoffTaskText(1, params.task, contextText, params.label);

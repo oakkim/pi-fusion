@@ -466,12 +466,22 @@ try {
   await tgit(fusionDir, ["add", "-A"]);
   await tgit(fusionDir, ["commit", "-m", "init"]);
   const registered = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const registeredCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+  const registeredEvents = new Map<string, (event: any, ctx: any) => Promise<any>>();
   const journalEntries: string[] = [];
+  const journalPayloads: Array<{ type: string; data: any }> = [];
+  const statusCalls: Array<{ key: string; text: string | undefined }> = [];
+  const widgetCalls: Array<{ key: string; content: string[] | undefined; options?: { placement?: string } }> = [];
+  const notifications: Array<{ text: string; level: string }> = [];
+  let footerCalls = 0;
   fusionExtension({
-    on: () => {},
+    on: (event: string, handler: (event: any, ctx: any) => Promise<any>) => registeredEvents.set(event, handler),
     registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.set(tool.name, tool),
-    registerCommand: () => {},
-    appendEntry: (type: string) => journalEntries.push(type),
+    registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => registeredCommands.set(name, command),
+    appendEntry: (type: string, data: any) => {
+      journalEntries.push(type);
+      journalPayloads.push({ type, data });
+    },
   } as never);
 
   const executorModel = { provider: "test", id: "executor", input: ["text"] };
@@ -487,7 +497,14 @@ try {
   const context = {
     cwd: fusionDir,
     hasUI: true,
-    ui: { confirm: () => { confirmCalls++; return confirmImpl(); } },
+    mode: "interactive",
+    ui: {
+      confirm: () => { confirmCalls++; return confirmImpl(); },
+      notify: (text: string, level: string) => notifications.push({ text, level }),
+      setStatus: (key: string, text: string | undefined) => statusCalls.push({ key, text }),
+      setFooter: () => { footerCalls++; },
+      setWidget: (key: string, content: string[] | undefined, options?: { placement?: string }) => widgetCalls.push({ key, content, options }),
+    },
     isProjectTrusted: () => true,
     model: undefined,
     modelRegistry: {
@@ -498,9 +515,15 @@ try {
     },
     sessionManager: { getBranch: () => [], getSessionId: () => undefined },
   };
+  await registeredEvents.get("session_start")!({}, context);
+  eq("fusion uses status without replacing footer", [statusCalls.at(-1)?.key, statusCalls.at(-1)?.text?.startsWith("Fusion available"), footerCalls], ["fusion", true, 0]);
+
   const spawn = registered.get("fusion_spawn")!;
   const followup = registered.get("fusion_followup")!;
   const status = registered.get("fusion_status")!;
+  const close = registered.get("fusion_close")!;
+  const interrupt = registered.get("fusion_interrupt")!;
+  const watch = registeredCommands.get("fusion-watch")!;
   const readStatus = async (id: string) => {
     const result = await status.execute("status", { id }, undefined, undefined, context);
     return JSON.parse(result.content[0].text);
@@ -517,6 +540,49 @@ try {
 
   const initial = await spawn.execute("initial", { task: "start" }, undefined, undefined, context);
   const workerId = initial.details.worker_id as string;
+  const initialWorkerSnapshot = journalPayloads.filter(({ type }) => type === "fusion-worker").at(-1)!.data;
+  const widgetsBeforeUnknown = widgetCalls.length;
+  await watch.handler("wrk_missing", context);
+  eq("watch rejects unknown worker", [notifications.at(-1)?.level, notifications.at(-1)?.text, widgetCalls.length], ["error", "Worker wrk_missing was not found.", widgetsBeforeUnknown]);
+  await watch.handler(workerId, context);
+  eq("watch shows worker above editor", [
+    widgetCalls.at(-1)?.key,
+    widgetCalls.at(-1)?.options?.placement,
+    widgetCalls.at(-1)?.content?.join("\n").includes("user:"),
+    widgetCalls.at(-1)?.content?.join("\n").includes("assistant: done"),
+  ], ["fusion-watch", "aboveEditor", true, true]);
+  const watchedAWidget = widgetCalls.at(-1)?.content?.join("\n");
+  let foreignProviderCalls = 0;
+  completeImpl = async () => {
+    foreignProviderCalls++;
+    if (foreignProviderCalls === 1) {
+      return {
+        role: "assistant",
+        content: [
+          { type: "text", text: "FOREIGN_ASSISTANT" },
+          { type: "toolCall", id: "foreign-tool", name: "missing_foreign_tool", arguments: {} },
+        ],
+        stopReason: "toolUse",
+        timestamp: Date.now(),
+      };
+    }
+    return {
+      role: "assistant",
+      content: [{ type: "text", text: "FOREIGN_FINAL" }],
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+  };
+  const widgetsBeforeForeignWorker = widgetCalls.length;
+  const foreignWorker = await spawn.execute("foreign", { task: "run worker B" }, undefined, undefined, context);
+  eq("other worker live output does not replace watched worker", [
+    foreignWorker.details.status,
+    widgetCalls.length,
+    widgetCalls.at(-1)?.content?.join("\n"),
+    widgetCalls.at(-1)?.content?.join("\n").includes("FOREIGN_"),
+  ], ["ok", widgetsBeforeForeignWorker, watchedAWidget, false]);
+  await watch.handler("off", context);
+  eq("watch off clears stable widget", [widgetCalls.at(-1)?.key, widgetCalls.at(-1)?.content], ["fusion-watch", undefined]);
   let executorSignal: AbortSignal | undefined;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
@@ -771,6 +837,136 @@ try {
   ], [true, false, "interrupted", "interrupted", null, 0, 1]);
   finishFirst(completedMessage);
   await firstMutating;
+
+  await watch.handler(workerId, context);
+  let watchProviderCalls = 0;
+  completeImpl = async () => {
+    watchProviderCalls++;
+    if (watchProviderCalls === 1) {
+      return {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "SECRET_REASONING" },
+          { type: "text", text: "watch working" },
+          { type: "toolCall", id: "watch-tool", name: "missing_tool", arguments: { path: "x" } },
+        ],
+        stopReason: "toolUse",
+        timestamp: Date.now(),
+      };
+    }
+    return {
+      role: "assistant",
+      content: [{ type: "text", text: "watch finished" }],
+      stopReason: "stop",
+      timestamp: Date.now(),
+    };
+  };
+  const liveWidgetStart = widgetCalls.length;
+  const watchedFollowup = await followup.execute("watch-live", { worker_id: workerId, message: "show progress" }, undefined, undefined, context);
+  const liveWidgetText = widgetCalls.slice(liveWidgetStart).flatMap((call) => call.content ?? []).join("\n");
+  eq("watch refreshes for assistant and tool results without thinking", [
+    watchedFollowup.details.status,
+    liveWidgetText.includes("assistant: watch working"),
+    liveWidgetText.includes("tool missing_tool:"),
+    liveWidgetText.includes("result missing_tool:"),
+    liveWidgetText.includes("assistant: watch finished"),
+    liveWidgetText.includes("SECRET_REASONING"),
+  ], ["ok", true, true, true, true, false]);
+
+  let resolveInterruptedProvider!: (message: unknown) => void;
+  let markInterruptedProviderStarted!: () => void;
+  const interruptedProviderStarted = new Promise<void>((resolve) => { markInterruptedProviderStarted = resolve; });
+  completeImpl = async () => new Promise((resolve) => {
+    resolveInterruptedProvider = resolve;
+    markInterruptedProviderStarted();
+  });
+  const pendingInterruptedTurn = followup.execute("watch-interrupt", { worker_id: workerId, message: "wait until interrupted" }, undefined, undefined, context);
+  await interruptedProviderStarted;
+  const journalBeforeWatchInterrupt = journalEntries.length;
+  const watchInterrupt = await interrupt.execute("watch-interrupt", { worker_id: workerId }, undefined, undefined, context);
+  const watchInterruptDetails = JSON.parse(watchInterrupt.content[0].text);
+  eq("interrupt immediately persists and renders watched worker idle", [
+    typeof watchInterruptDetails.interrupted_turn === "string",
+    widgetCalls.at(-1)?.content?.[0]?.includes("[idle]"),
+    journalEntries.length > journalBeforeWatchInterrupt,
+  ], [true, true, true]);
+  const interruptedTurnResult = await pendingInterruptedTurn;
+  const widgetCallsAfterInterrupt = widgetCalls.length;
+  const widgetAfterInterrupt = widgetCalls.at(-1)?.content?.join("\n");
+  resolveInterruptedProvider({
+    role: "assistant",
+    content: [{ type: "text", text: "ABANDONED_AFTER_INTERRUPT" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  eq("late provider output cannot overwrite interrupted worker watch", [
+    interruptedTurnResult.details.status,
+    widgetCalls.length,
+    widgetCalls.at(-1)?.content?.join("\n"),
+    widgetCalls.at(-1)?.content?.join("\n").includes("ABANDONED_AFTER_INTERRUPT"),
+  ], ["interrupted", widgetCallsAfterInterrupt, widgetAfterInterrupt, false]);
+
+  let resolveAbandonedTurn!: (message: unknown) => void;
+  let markAbandonedTurnStarted!: () => void;
+  const abandonedTurnStarted = new Promise<void>((resolve) => { markAbandonedTurnStarted = resolve; });
+  completeImpl = async () => new Promise((resolve) => {
+    resolveAbandonedTurn = resolve;
+    markAbandonedTurnStarted();
+  });
+  const abandonedTurn = followup.execute("abandoned", { worker_id: workerId, message: "old branch turn" }, undefined, undefined, context);
+  await abandonedTurnStarted;
+  await registeredEvents.get("session_tree")!({}, {
+    ...context,
+    sessionManager: {
+      getBranch: () => [{ type: "custom", customType: "fusion-worker", data: initialWorkerSnapshot }],
+      getSessionId: () => undefined,
+    },
+  });
+  const restoredWidgetCalls = widgetCalls.length;
+  const restoredWidget = widgetCalls.at(-1)?.content?.join("\n");
+  resolveAbandonedTurn({
+    role: "assistant",
+    content: [{ type: "text", text: "ABANDONED_OUTPUT" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  const abandonedResult = await abandonedTurn;
+  await new Promise((resolve) => setImmediate(resolve));
+  eq("restored worker ignores abandoned same-id turn updates", [
+    abandonedResult.details.status,
+    restoredWidget?.includes("assistant: done"),
+    restoredWidget?.includes("ABANDONED_OUTPUT"),
+    widgetCalls.length,
+    widgetCalls.at(-1)?.content?.join("\n"),
+  ], ["interrupted", true, false, restoredWidgetCalls, restoredWidget]);
+
+  availableModels.length = 0;
+  const journalBeforeMissingExecutor = journalEntries.length;
+  const missingExecutor = await followup.execute("missing-executor", { worker_id: workerId, message: "executor unavailable" }, undefined, undefined, context);
+  const workerAfterMissingExecutor = await readStatus(workerId);
+  const interruptAfterMissingExecutor = await interrupt.execute("interrupt-failed", { worker_id: workerId }, undefined, undefined, context);
+  const interruptDetails = JSON.parse(interruptAfterMissingExecutor.content[0].text);
+  eq("missing executor settles watched worker and journals failure", [
+    missingExecutor.details.status,
+    widgetCalls.at(-1)?.content?.[0]?.includes("[idle]"),
+    workerAfterMissingExecutor.active_turn,
+    workerAfterMissingExecutor.consecutive_failures,
+    interruptDetails.interrupted_turn,
+    journalEntries.length - journalBeforeMissingExecutor,
+  ], ["error", true, null, 1, null, 2]);
+  availableModels.push(executorModel);
+
+  await close.execute("close-watched", { worker_id: workerId }, undefined, undefined, context);
+  eq("closing watched worker clears widget", [widgetCalls.at(-1)?.key, widgetCalls.at(-1)?.content], ["fusion-watch", undefined]);
+
+  await watch.handler(deferredWorkerId, context);
+  const widgetsBeforeNonUi = widgetCalls.length;
+  await watch.handler("off", { ...context, hasUI: false, mode: "rpc" });
+  eq("watch gives non-UI guidance without widget call", [notifications.at(-1)?.text, widgetCalls.length], ["Fusion watch is available only in the interactive UI.", widgetsBeforeNonUi]);
+
+  await registeredEvents.get("session_tree")!({}, { ...context, sessionManager: { getBranch: () => [], getSessionId: () => undefined } });
+  eq("session restore clears missing watched worker", [widgetCalls.at(-1)?.key, widgetCalls.at(-1)?.content], ["fusion-watch", undefined]);
 } finally {
   rmSync(fusionDir, { recursive: true, force: true });
 }

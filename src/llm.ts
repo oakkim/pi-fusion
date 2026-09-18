@@ -81,6 +81,7 @@ export async function runExecutorTurn(
   toolDefs: ExecutorToolDef[],
   maxToolCalls: number,
   ctx: ExtensionContext,
+  onMessage?: (message: Message) => void,
 ): Promise<ToolLoopResult> {
   const options = buildCompleteOptions(model, maxTokens, temperature, signal, ctx);
   const tools: Tool[] = toolDefs.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }));
@@ -98,6 +99,7 @@ export async function runExecutorTurn(
 
   while (true) {
     const resp = await runComplete(registry, model, { systemPrompt, messages, tools }, options);
+    onMessage?.(resp);
     turns++;
     usage = addUsage(usage, resp.usage);
     const calls = resp.content.filter((c): c is ToolCall => c.type === "toolCall");
@@ -116,10 +118,11 @@ export async function runExecutorTurn(
         const syn = syntheticResult(tc, forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted");
         messages.push(syn);
         added.push(syn);
+        onMessage?.(syn);
         toolCalls.push({ name: tc.name, ok: false });
         continue;
       }
-      const ok = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added);
+      const ok = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added, onMessage);
       used++;
       toolCalls.push({ name: tc.name, ok });
       const key = `${tc.name}:${JSON.stringify(tc.arguments)}`;
@@ -132,6 +135,7 @@ export async function runExecutorTurn(
     if (forceFinalize || used >= maxToolCalls) {
       const finalSystem = `${systemPrompt}\n\nYou have reached the tool-call limit. Write your complete final answer now using only what you have already gathered — do not request any more tools.`;
       const finalMsg = await runComplete(registry, model, { systemPrompt: finalSystem, messages }, options);
+      onMessage?.(finalMsg);
       turns++;
       usage = addUsage(usage, finalMsg.usage);
       added.push(finalMsg);
@@ -161,6 +165,7 @@ async function executeToolCall(
   ctx: ExtensionContext,
   messages: Message[],
   added: Message[],
+  onMessage?: (message: Message) => void,
 ): Promise<boolean> {
   try {
     if (!def) throw new Error(`unknown tool: ${tc.name}`);
@@ -175,6 +180,7 @@ async function executeToolCall(
     };
     messages.push(msg);
     added.push(msg);
+    onMessage?.(msg);
     return !out.isError;
   } catch (err) {
     const text = sanitizeError(err instanceof Error ? err.message : String(err));
@@ -188,6 +194,7 @@ async function executeToolCall(
     };
     messages.push(msg);
     added.push(msg);
+    onMessage?.(msg);
     return false;
   }
 }

@@ -83,7 +83,18 @@ recording a failure, so interrupting never causes false escalation.
 Forced mode hooks `input`: normal prompts are rewritten with the planner
 prefix before the lead sees them (commands and already-forced prompts pass
 through). Mode persists in the session journal (`fusion-mode` entry) and shows
-in the footer (`Fusion forced • executor ...`).
+in the status bar (`Fusion forced • executor ...`).
+
+## Worker watch
+
+```
+/fusion-watch wrk_... -> show that worker's recent conversation above the editor
+/fusion-watch off     -> hide it
+```
+
+Watch is available in the interactive UI. It updates while the worker runs and
+shows handoffs, assistant text, tool calls, and tool results; hidden reasoning
+is never displayed.
 
 ## Executor picker (v0.5)
 

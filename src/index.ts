@@ -54,6 +54,10 @@ const InterruptParams = Type.Object({
   worker_id: Type.String({ description: "Worker ID (wrk_...) whose active turn to stop. The worker stays open; no failure is recorded." }),
 });
 
+const WATCH_WIDGET_KEY = "fusion-watch";
+const WATCH_MAX_ITEMS = 8;
+const WATCH_MAX_CHARS = 240;
+
 /** Serialize mutating executor runs to avoid clobbered writes (port of pi-devin-fusion). */
 let mutationQueue: Promise<unknown> = Promise.resolve();
 function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -81,6 +85,8 @@ function userMsg(text: string): Message {
 
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
+  let runtimeEpoch = 0;
+  let watchedWorkerId: string | undefined;
 
   function restoreMode(ctx: ExtensionContext): FusionMode {
     try {
@@ -137,7 +143,7 @@ export default function (pi: ExtensionAPI) {
     return applyDefaults(applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx)));
   }
 
-  function refreshFooter(ctx: ExtensionContext): void {
+  function refreshStatus(ctx: ExtensionContext): void {
     try {
       if (!ctx.hasUI) return;
       const mode = restoreMode(ctx);
@@ -145,19 +151,77 @@ export default function (pi: ExtensionAPI) {
       const resolved = resolveExecutorModel(ctx.modelRegistry, ctx.model, effectiveConfig(ctx).executor, warnings);
       const execLabel = resolved ? modelDisplay(resolved) : "unset";
       const text = `${modeLabel(mode)} • executor ${execLabel}`;
-      ctx.ui.setFooter(() => ({
-        dispose() {},
-        invalidate() {},
-        render: () => [text],
-      }));
+      ctx.ui.setStatus("fusion", text);
     } catch {
-      // footer is cosmetic
+      // status is cosmetic
+    }
+  }
+
+  function compactWatchText(text: string): string {
+    const compact = text.replace(/\s+/g, " ").trim();
+    return compact.length <= WATCH_MAX_CHARS ? compact : `${compact.slice(0, WATCH_MAX_CHARS - 1)}…`;
+  }
+
+  function watchLines(messages: Message[]): string[] {
+    const lines: string[] = [];
+    for (const message of messages) {
+      if (message.role === "user") {
+        const content = typeof message.content === "string"
+          ? message.content
+          : message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ");
+        if (content.trim()) lines.push(`user: ${compactWatchText(content)}`);
+        continue;
+      }
+      if (message.role === "assistant") {
+        for (const part of message.content) {
+          if (part.type === "text" && part.text.trim()) lines.push(`assistant: ${compactWatchText(part.text)}`);
+          if (part.type === "toolCall") lines.push(`tool ${part.name}: ${compactWatchText(JSON.stringify(part.arguments))}`);
+        }
+        continue;
+      }
+      if (message.role === "toolResult") {
+        const content = message.content.filter((part) => part.type === "text").map((part) => part.text).join(" ");
+        if (content.trim()) lines.push(`result ${message.toolName}: ${compactWatchText(content)}`);
+      }
+    }
+    return lines.slice(-WATCH_MAX_ITEMS);
+  }
+
+  function clearWatch(ctx: ExtensionContext): void {
+    watchedWorkerId = undefined;
+    if (!ctx.hasUI) return;
+    try {
+      ctx.ui.setWidget(WATCH_WIDGET_KEY, undefined);
+    } catch {
+      // widget is cosmetic
+    }
+  }
+
+  function refreshWatch(ctx: ExtensionContext, sourceWorkerId?: string, sourceEpoch?: number, liveMessages: Message[] = []): void {
+    if (!watchedWorkerId) return;
+    if (sourceWorkerId && (sourceWorkerId !== watchedWorkerId || sourceEpoch !== runtimeEpoch)) return;
+    const worker = runtime.getWorker(watchedWorkerId);
+    if (!worker) {
+      clearWatch(ctx);
+      return;
+    }
+    if (!ctx.hasUI) return;
+    const lines = watchLines([...worker.history, ...liveMessages]);
+    try {
+      ctx.ui.setWidget(
+        WATCH_WIDGET_KEY,
+        [`Fusion watch ${worker.id} [${worker.status}] g${worker.generation}`, ...(lines.length ? lines : ["(no visible messages)"])],
+        { placement: "aboveEditor" },
+      );
+    } catch {
+      // widget is cosmetic
     }
   }
 
   function restoreRuntime(ctx: ExtensionContext): void {
     try {
       runtime.restore(ctx.sessionManager.getBranch() as unknown[]);
+      runtimeEpoch++;
     } catch {
       // restore is best-effort; a fresh runtime is fine
     }
@@ -165,14 +229,16 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     restoreRuntime(ctx);
-    refreshFooter(ctx);
+    refreshStatus(ctx);
+    refreshWatch(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     restoreRuntime(ctx);
-    refreshFooter(ctx);
+    refreshStatus(ctx);
+    refreshWatch(ctx);
   });
-  pi.on("model_select", async (_event, ctx) => refreshFooter(ctx));
+  pi.on("model_select", async (_event, ctx) => refreshStatus(ctx));
 
   // Off mode: fusion tools are mechanically disabled, not just discouraged.
   // Delegate enforcement (opencode-fusion style): when leadMutations is
@@ -242,8 +308,10 @@ export default function (pi: ExtensionAPI) {
     hostSignal?: AbortSignal,
     onUpdate?: (partial: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void,
   ): Promise<{ text: string; details: Record<string, unknown> }> {
+    const turnEpoch = runtimeEpoch;
     const worker = runtime.getWorker(workerId)!;
     const turn = runtime.getTurn(turnId)!;
+    const liveMessages: Message[] = [];
     const controller = new AbortController();
     runtime.trackController(turnId, controller);
     const signal = hostSignal ? AbortSignal.any([controller.signal, hostSignal]) : controller.signal;
@@ -251,12 +319,14 @@ export default function (pi: ExtensionAPI) {
       if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
       runtime.untrackController(turnId);
       persist(ctx, workerId);
+      refreshWatch(ctx, workerId, turnEpoch);
       return {
         text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
         details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
       };
     };
     if (signal.aborted) return interruptedResult();
+    refreshWatch(ctx, workerId, turnEpoch);
 
     const cfg = effectiveConfig(ctx);
     const warnings: string[] = [];
@@ -264,6 +334,9 @@ export default function (pi: ExtensionAPI) {
     if (ladder.length === 0) {
       const error = "no authed text executor model available";
       runtime.failTurn(turnId, error);
+      runtime.untrackController(turnId);
+      persist(ctx, workerId);
+      refreshWatch(ctx, workerId, turnEpoch);
       return { text: JSON.stringify({ status: "error", error }, null, 2), details: { status: "error", error } };
     }
     // Escalation: one rung per consecutive failure, auto-de-escalates on success
@@ -293,6 +366,11 @@ export default function (pi: ExtensionAPI) {
         toolDefs,
         clampMaxToolCalls(cfg.maxToolCalls),
         ctx,
+        (message) => {
+          if (runtime.getWorker(workerId)?.activeTurnId !== turnId) return;
+          liveMessages.push(message);
+          refreshWatch(ctx, workerId, turnEpoch, liveMessages);
+        },
       );
     };
 
@@ -316,6 +394,7 @@ export default function (pi: ExtensionAPI) {
       // re-routes for free.
       const compacted = runtime.compactHistory(worker, cfg.maxHistoryMessages);
       persist(ctx, workerId);
+      refreshWatch(ctx, workerId, turnEpoch);
       try {
         (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-cost", {
           worker_id: workerId,
@@ -361,6 +440,7 @@ export default function (pi: ExtensionAPI) {
       const message = err instanceof Error ? err.message : String(err);
       runtime.failTurn(turnId, message);
       persist(ctx, workerId);
+      refreshWatch(ctx, workerId, turnEpoch, liveMessages);
       return {
         text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message, consecutive_failures: worker.failures, next_rung: rungFor(worker.failures, ladder.length) }, null, 2),
         details: { status: "error", worker_id: workerId, turn_id: turnId, error: message },
@@ -506,6 +586,7 @@ export default function (pi: ExtensionAPI) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       runtime.close(params.worker_id);
+      if (watchedWorkerId === params.worker_id) clearWatch(ctx);
       let worktreeRemoved = false;
       let removeError: string | undefined;
       if (params.remove && w.worktree) {
@@ -564,10 +645,14 @@ export default function (pi: ExtensionAPI) {
     label: "Fusion Interrupt",
     description: "Stop a worker's active turn but keep the worker open. No failure is recorded (no false escalation).",
     parameters: InterruptParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       const interruptedTurnId = runtime.interrupt(params.worker_id);
+      if (interruptedTurnId) {
+        persist(ctx, w.id);
+        refreshWatch(ctx, w.id, runtimeEpoch);
+      }
       return {
         content: [{ type: "text", text: JSON.stringify({ worker_id: w.id, status: w.status, interrupted_turn: interruptedTurnId ?? null }) }],
         details: { status: w.status },
@@ -587,7 +672,7 @@ export default function (pi: ExtensionAPI) {
       if (parsed.kind === "set" || parsed.kind === "toggle") {
         const next = parsed.kind === "set" ? parsed.mode : (restoreMode(ctx) === "forced" ? "available" : "forced");
         persistMode(next);
-        refreshFooter(ctx);
+        refreshStatus(ctx);
         tell(modeLabel(next));
         return;
       }
@@ -618,7 +703,7 @@ export default function (pi: ExtensionAPI) {
 
       const apply = (override: ExecutorOverride, label: string) => {
         persistExecutorOverride(override);
-        refreshFooter(ctx);
+        refreshStatus(ctx);
         tell(`Fusion executor: ${label}`);
       };
 
@@ -675,6 +760,35 @@ export default function (pi: ExtensionAPI) {
       const text = `${head}\n${body}`;
       if (ctx.mode === "print") console.log(text);
       else ctx.ui.notify(text, "info");
+    },
+  });
+
+  pi.registerCommand("fusion-watch", {
+    description: "Show a worker's recent conversation above the editor: /fusion-watch <worker_id> | off",
+    handler: async (args, ctx) => {
+      if (ctx.mode === "print" || !ctx.hasUI) {
+        const text = "Fusion watch is available only in the interactive UI.";
+        if (ctx.mode === "print") console.log(text);
+        else ctx.ui.notify(text, "warning");
+        return;
+      }
+      const arg = args.trim();
+      if (arg.toLowerCase() === "off") {
+        clearWatch(ctx);
+        ctx.ui.notify("Fusion watch off", "info");
+        return;
+      }
+      if (!arg) {
+        ctx.ui.notify("Usage: /fusion-watch <worker_id> | off", "warning");
+        return;
+      }
+      if (!runtime.getWorker(arg)) {
+        ctx.ui.notify(`Worker ${arg} was not found.`, "error");
+        return;
+      }
+      watchedWorkerId = arg;
+      refreshWatch(ctx);
+      ctx.ui.notify(`Watching ${arg}`, "info");
     },
   });
 }

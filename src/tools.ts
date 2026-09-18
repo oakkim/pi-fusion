@@ -38,15 +38,21 @@ export const ALL_TOOL_NAMES = [...READONLY_TOOL_NAMES, ...MUTATING_TOOL_NAMES] a
 type ToolName = (typeof ALL_TOOL_NAMES)[number];
 
 function build(name: ToolName, cwd: string): ExecutorToolDef {
+  let def: ExecutorToolDef;
   switch (name) {
-    case "read": return createReadToolDefinition(cwd) as unknown as ExecutorToolDef;
-    case "grep": return createGrepToolDefinition(cwd) as unknown as ExecutorToolDef;
-    case "find": return createFindToolDefinition(cwd) as unknown as ExecutorToolDef;
-    case "ls": return createLsToolDefinition(cwd) as unknown as ExecutorToolDef;
-    case "bash": return createBashToolDefinition(cwd) as unknown as ExecutorToolDef;
-    case "edit": return createEditToolDefinition(cwd) as unknown as ExecutorToolDef;
-    case "write": return createWriteToolDefinition(cwd) as unknown as ExecutorToolDef;
+    case "read": def = createReadToolDefinition(cwd) as unknown as ExecutorToolDef; break;
+    case "grep": def = createGrepToolDefinition(cwd) as unknown as ExecutorToolDef; break;
+    case "find": def = createFindToolDefinition(cwd) as unknown as ExecutorToolDef; break;
+    case "ls": def = createLsToolDefinition(cwd) as unknown as ExecutorToolDef; break;
+    case "bash": def = createBashToolDefinition(cwd) as unknown as ExecutorToolDef; break;
+    case "edit": def = createEditToolDefinition(cwd) as unknown as ExecutorToolDef; break;
+    case "write": def = createWriteToolDefinition(cwd) as unknown as ExecutorToolDef; break;
   }
+  return {
+    ...def,
+    execute: (id, args, signal, extra, ctx) =>
+      def.execute(id, args, signal, extra, Object.assign(Object.create(ctx as object), { cwd })),
+  };
 }
 
 function isToolName(value: string): value is ToolName {

@@ -44,8 +44,9 @@ close wrk_... remove=true -> delete checkout + branch.
 ```
 
 Rules enforced: name must match `[a-zA-Z0-9-_]`; merge only idle workers; merge requires
-the project to be on the same branch as at spawn; `/var`-style symlinks are canonicalized
-with realpath so the executor can never escape the worktree.
+the project to be on the same branch as at spawn. The worktree is the default directory for
+relative tool paths and shell commands, not a filesystem sandbox: absolute paths and shell
+commands that leave the directory can still access other locations.
 
 ## Escalation (v0.3)
 

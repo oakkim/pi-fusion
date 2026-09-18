@@ -505,6 +505,15 @@ try {
     const result = await status.execute("status", { id }, undefined, undefined, context);
     return JSON.parse(result.content[0].text);
   };
+  const settlesPromptly = async (promise: Promise<unknown>) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const settled = await Promise.race([
+      promise.then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 100); }),
+    ]);
+    clearTimeout(timer!);
+    return settled;
+  };
 
   const initial = await spawn.execute("initial", { task: "start" }, undefined, undefined, context);
   const workerId = initial.details.worker_id as string;
@@ -684,15 +693,16 @@ try {
   );
   await dialogOpen;
   consentController.abort();
+  const observedConsent = pendingConsent.then(
+    () => "completed",
+    (err) => err instanceof Error ? err.name : String(err),
+  );
+  const consentSettledPromptly = await settlesPromptly(observedConsent);
   resolveConsent(false);
-  let duringConsentAbort = "";
-  try {
-    await pendingConsent;
-  } catch (err) {
-    duringConsentAbort = err instanceof Error ? err.name : String(err);
-  }
+  const duringConsentAbort = await observedConsent;
   const afterDuringConsent = await readStatus(workerId);
   eq("abort during consent wins over decline without mutation", [
+    consentSettledPromptly,
     duringConsentAbort,
     confirmCalls,
     afterDuringConsent.generation,
@@ -700,6 +710,7 @@ try {
     afterDuringConsent.active_turn,
     journalEntries.length,
   ], [
+    true,
     "AbortError",
     1,
     beforeConsentTests.generation,
@@ -707,6 +718,59 @@ try {
     beforeConsentTests.active_turn,
     journalBeforeConsentTests,
   ]);
+
+  confirmImpl = async () => true;
+  let finishFirst!: (message: unknown) => void;
+  let markFirstStarted!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+  let providerCallsWhileQueued = 0;
+  const completedMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "done" }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+  completeImpl = async () => {
+    providerCallsWhileQueued++;
+    if (providerCallsWhileQueued > 1) return completedMessage;
+    return new Promise((resolve) => {
+      finishFirst = resolve;
+      markFirstStarted();
+    });
+  };
+  let firstFinished = false;
+  const firstMutating = spawn.execute("queue-first", { task: "hold queue" }, undefined, undefined, context)
+    .finally(() => { firstFinished = true; });
+  await firstStarted;
+
+  let markSecondQueued!: () => void;
+  const secondQueued = new Promise<void>((resolve) => { markSecondQueued = resolve; });
+  const queuedController = new AbortController();
+  const secondMutating = spawn.execute(
+    "queue-second",
+    { task: "cancel while queued" },
+    queuedController.signal,
+    () => markSecondQueued(),
+    context,
+  );
+  await secondQueued;
+  queuedController.abort();
+  const queuedSettledPromptly = await settlesPromptly(secondMutating);
+  if (!queuedSettledPromptly) finishFirst(completedMessage);
+  const queuedResult = await secondMutating;
+  const queuedTurn = await readStatus(queuedResult.details.turn_id as string);
+  const queuedWorker = await readStatus(queuedResult.details.worker_id as string);
+  eq("queued mutating abort settles before active run", [
+    queuedSettledPromptly,
+    firstFinished,
+    queuedResult.details.status,
+    queuedTurn.status,
+    queuedWorker.active_turn,
+    queuedWorker.consecutive_failures,
+    providerCallsWhileQueued,
+  ], [true, false, "interrupted", "interrupted", null, 0, 1]);
+  finishFirst(completedMessage);
+  await firstMutating;
 } finally {
   rmSync(fusionDir, { recursive: true, force: true });
 }

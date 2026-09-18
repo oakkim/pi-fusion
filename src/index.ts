@@ -56,10 +56,23 @@ const InterruptParams = Type.Object({
 
 /** Serialize mutating executor runs to avoid clobbered writes (port of pi-devin-fusion). */
 let mutationQueue: Promise<unknown> = Promise.resolve();
-function runSerialized<T>(fn: () => Promise<T>): Promise<T> {
+function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    promise.then(
+      (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
+      (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
+    );
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function runSerialized<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
   const run = mutationQueue.then(fn, fn);
   mutationQueue = run.then(() => undefined, () => undefined);
-  return run;
+  return raceWithAbort(run, signal);
 }
 
 function userMsg(text: string): Message {
@@ -285,7 +298,7 @@ export default function (pi: ExtensionAPI) {
 
     try {
       const mutating = isMutatingSelection(cfg.executorTools);
-      const result = mutating ? await runSerialized(exec) : await exec();
+      const result = mutating ? await runSerialized(exec, signal) : await exec();
       signal.throwIfAborted();
       const output = getTextContent(result.message);
       if (!runtime.finishTurn(turnId, output, result.added)) {
@@ -378,7 +391,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       signal?.throwIfAborted();
       const cfg = effectiveConfig(ctx);
-      const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
+      const consent = await raceWithAbort(ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted()), signal);
       signal?.throwIfAborted();
       if (!consent.ok) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: consent.error }, null, 2) }], details: { status: "error", error: consent.error } };
@@ -429,7 +442,7 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       signal?.throwIfAborted();
       const cfg = effectiveConfig(ctx);
-      const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
+      const consent = await raceWithAbort(ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted()), signal);
       signal?.throwIfAborted();
       if (!consent.ok) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: consent.error }, null, 2) }], details: { status: "error", error: consent.error } };

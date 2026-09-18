@@ -53,15 +53,15 @@ const interrupted = rt.interrupt(worker.id);
 eq("interrupt returns turn", interrupted, t4.id);
 eq("turn interrupted", rt.getTurn(t4.id)?.status, "interrupted");
 const historyAfterInterrupt = worker.history.length;
-rt.finishTurn(t4.id, "late", [{ role: "assistant", content: "late", timestamp: 9 }] as never);
-eq("late finish keeps interruption", [rt.getTurn(t4.id)?.status, worker.status, worker.history.length], ["interrupted", "idle", historyAfterInterrupt]);
+const lateFinish = rt.finishTurn(t4.id, "late", [{ role: "assistant", content: "late", timestamp: 9 }] as never);
+eq("late finish keeps interruption", [lateFinish, rt.getTurn(t4.id)?.status, worker.status, worker.history.length], [false, "interrupted", "idle", historyAfterInterrupt]);
 const t5 = rt.followup(worker.id, { role: "user", content: "newer", timestamp: 10 } as never);
 rt.failTurn(t4.id, "late failure");
 eq("stale failure keeps newer turn", [rt.getTurn(t4.id)?.status, worker.activeTurnId, worker.failures], ["interrupted", t5.id, 0]);
 rt.close(worker.id);
 eq("closed", rt.getWorker(worker.id)?.status, "closed");
-rt.finishTurn(t5.id, "late after close", [{ role: "assistant", content: "late", timestamp: 11 }] as never);
-eq("late finish keeps closed", [rt.getTurn(t5.id)?.status, worker.status, worker.history.length], ["interrupted", "closed", historyAfterInterrupt + 1]);
+const lateClosedFinish = rt.finishTurn(t5.id, "late after close", [{ role: "assistant", content: "late", timestamp: 11 }] as never);
+eq("late finish keeps closed", [lateClosedFinish, rt.getTurn(t5.id)?.status, worker.status, worker.history.length], [false, "interrupted", "closed", historyAfterInterrupt + 1]);
 let closedErr = "";
 try { rt.followup(worker.id, { role: "user", content: "y", timestamp: 12 } as never); }
 catch (e) { closedErr = (e as Error).message; }

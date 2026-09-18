@@ -84,10 +84,10 @@ export class WorkerRuntime {
     return turn;
   }
 
-  finishTurn(turnId: string, text: string, assistantMessages: Message[]): void {
+  finishTurn(turnId: string, text: string, assistantMessages: Message[]): boolean {
     const turn = this.#turns.get(turnId);
     const worker = turn ? this.#workers.get(turn.workerId) : undefined;
-    if (!turn || !worker || turn.status !== "running" || worker.activeTurnId !== turnId) return;
+    if (!turn || !worker || turn.status !== "running" || worker.activeTurnId !== turnId) return false;
     turn.status = "completed";
     turn.text = text;
     worker.history.push(...assistantMessages);
@@ -95,6 +95,7 @@ export class WorkerRuntime {
     worker.status = "idle";
     worker.failures = 0;
     this.#controllers.delete(turnId);
+    return true;
   }
 
   failTurn(turnId: string, error: string): void {

@@ -98,16 +98,41 @@ eq("empty ctx", buildRecentContext([], 4), undefined);
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree, validateWorktreeName } from "../src/worktree.ts";
+import { resolveToolDefs } from "../src/tools.ts";
 
 const sh = _promisify(_execFile);
 async function tgit(cwd: string, args: string[]): Promise<void> {
   await sh("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd });
 }
+
+const shared = mkdtempSync(_join(tmpdir(), "fusion-shared-"));
+const isolated = mkdtempSync(_join(tmpdir(), "fusion-isolated-"));
+try {
+  const tools = resolveToolDefs(["write", "bash"], isolated);
+  let sessionReads = 0;
+  let sessionCalls = 0;
+  const sessionManager = {
+    getSessionId: () => { sessionCalls++; return undefined; },
+    getSessionFile: () => { sessionCalls++; return undefined; },
+  };
+  const ctx = {
+    get cwd() { return shared; },
+    get sessionManager() { sessionReads++; return sessionManager; },
+  };
+  await tools.find((tool) => tool.name === "write")!.execute("write-cwd", { path: "write-cwd.txt", content: "isolated\n" }, undefined, undefined, ctx);
+  await tools.find((tool) => tool.name === "bash")!.execute("bash-cwd", { command: "pwd > bash-cwd.txt" }, undefined, undefined, ctx);
+  eq("tools use bound cwd", [readFileSync(_join(isolated, "write-cwd.txt"), "utf8"), readFileSync(_join(isolated, "bash-cwd.txt"), "utf8").trim()], ["isolated\n", realpathSync(isolated)]);
+  eq("tool context remains accessible", [sessionReads > 0, sessionCalls > 0], [true, true]);
+} finally {
+  rmSync(shared, { recursive: true, force: true });
+  rmSync(isolated, { recursive: true, force: true });
+}
+
 let badName = "";
 try { validateWorktreeName("no spaces!"); } catch (e) { badName = (e as Error).message; }
 eq("bad worktree name rejected", badName.includes("Invalid"), true);

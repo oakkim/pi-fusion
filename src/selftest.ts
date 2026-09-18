@@ -52,10 +52,18 @@ const t4 = rt.followup(worker.id, { role: "user", content: "x", timestamp: 8 } a
 const interrupted = rt.interrupt(worker.id);
 eq("interrupt returns turn", interrupted, t4.id);
 eq("turn interrupted", rt.getTurn(t4.id)?.status, "interrupted");
+const historyAfterInterrupt = worker.history.length;
+rt.finishTurn(t4.id, "late", [{ role: "assistant", content: "late", timestamp: 9 }] as never);
+eq("late finish keeps interruption", [rt.getTurn(t4.id)?.status, worker.status, worker.history.length], ["interrupted", "idle", historyAfterInterrupt]);
+const t5 = rt.followup(worker.id, { role: "user", content: "newer", timestamp: 10 } as never);
+rt.failTurn(t4.id, "late failure");
+eq("stale failure keeps newer turn", [rt.getTurn(t4.id)?.status, worker.activeTurnId, worker.failures], ["interrupted", t5.id, 0]);
 rt.close(worker.id);
 eq("closed", rt.getWorker(worker.id)?.status, "closed");
+rt.finishTurn(t5.id, "late after close", [{ role: "assistant", content: "late", timestamp: 11 }] as never);
+eq("late finish keeps closed", [rt.getTurn(t5.id)?.status, worker.status, worker.history.length], ["interrupted", "closed", historyAfterInterrupt + 1]);
 let closedErr = "";
-try { rt.followup(worker.id, { role: "user", content: "y", timestamp: 9 } as never); }
+try { rt.followup(worker.id, { role: "user", content: "y", timestamp: 12 } as never); }
 catch (e) { closedErr = (e as Error).message; }
 eq("closed rejected", closedErr.includes("closed"), true);
 
@@ -68,6 +76,20 @@ for (let i = 0; i < 50; i++) {
 const didCompact = rt2.compactHistory(w2, 40);
 eq("compacted", didCompact, true);
 eq("compact keeps first+39", [w2.history.length, (w2.history[0] as {content:string}).content], [40, "t0"]);
+
+const w2Tools = rt2.spawn({ label: undefined, executorModelId: "m", firstMessage: { role: "user", content: "task", timestamp: 0 } as never }).worker;
+w2Tools.history.push(
+  { role: "assistant", content: [{ type: "toolCall", id: "old", name: "read", arguments: {} }], timestamp: 1 } as never,
+  { role: "toolResult", toolCallId: "old", toolName: "read", content: [{ type: "text", text: "old" }], isError: false, timestamp: 2 } as never,
+  { role: "assistant", content: [{ type: "text", text: "old done" }], timestamp: 3 } as never,
+  { role: "user", content: "next", timestamp: 4 } as never,
+  { role: "assistant", content: [{ type: "toolCall", id: "new", name: "read", arguments: {} }], timestamp: 5 } as never,
+  { role: "toolResult", toolCallId: "new", toolName: "read", content: [{ type: "text", text: "new" }], isError: false, timestamp: 6 } as never,
+  { role: "assistant", content: [{ type: "text", text: "new done" }], timestamp: 7 } as never,
+);
+rt2.compactHistory(w2Tools, 7);
+eq("compact starts at user handoff", w2Tools.history.map((message) => message.role), ["user", "user", "assistant", "toolResult", "assistant"]);
+eq("compact keeps tool pair", (w2Tools.history[3] as { toolCallId: string }).toolCallId, "new");
 
 // --- 3. routing: turn keeps, compaction reconsiders ---
 const policy = new AdaptiveRoutingPolicy(

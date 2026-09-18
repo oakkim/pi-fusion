@@ -87,7 +87,7 @@ export class WorkerRuntime {
   finishTurn(turnId: string, text: string, assistantMessages: Message[]): void {
     const turn = this.#turns.get(turnId);
     const worker = turn ? this.#workers.get(turn.workerId) : undefined;
-    if (!turn || !worker) return;
+    if (!turn || !worker || turn.status !== "running" || worker.activeTurnId !== turnId) return;
     turn.status = "completed";
     turn.text = text;
     worker.history.push(...assistantMessages);
@@ -100,7 +100,7 @@ export class WorkerRuntime {
   failTurn(turnId: string, error: string): void {
     const turn = this.#turns.get(turnId);
     const worker = turn ? this.#workers.get(turn.workerId) : undefined;
-    if (!turn || !worker) return;
+    if (!turn || !worker || turn.status !== "running" || worker.activeTurnId !== turnId) return;
     turn.status = "failed";
     turn.error = error;
     worker.activeTurnId = null;
@@ -141,8 +141,12 @@ export class WorkerRuntime {
   /** Independent compaction: keep history bounded per worker. */
   compactHistory(worker: WorkerRecord, maxMessages: number): boolean {
     if (worker.history.length <= maxMessages) return false;
-    // Keep first (original task) + last N-1. Cache boundary -> routing reconsidered by caller.
-    const keep = worker.history.slice(-(maxMessages - 1));
+    // Keep the original task, then prefer a complete handoff over a protocol fragment.
+    let start = worker.history.length - (maxMessages - 1);
+    const handoff = worker.history.findIndex((message, index) => index >= start && message.role === "user");
+    if (handoff >= 0) start = handoff;
+    else while (worker.history[start]?.role === "toolResult") start++;
+    const keep = worker.history.slice(start);
     worker.history = [worker.history[0]!, ...keep];
     return true;
   }

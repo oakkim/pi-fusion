@@ -142,16 +142,23 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  function restoreRuntime(ctx: ExtensionContext): void {
     try {
       runtime.restore(ctx.sessionManager.getBranch() as unknown[]);
     } catch {
       // restore is best-effort; a fresh runtime is fine
     }
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    restoreRuntime(ctx);
     refreshFooter(ctx);
   });
 
-  pi.on("session_tree", async (_event, ctx) => refreshFooter(ctx));
+  pi.on("session_tree", async (_event, ctx) => {
+    restoreRuntime(ctx);
+    refreshFooter(ctx);
+  });
   pi.on("model_select", async (_event, ctx) => refreshFooter(ctx));
 
   // Off mode: fusion tools are mechanically disabled, not just discouraged.
@@ -186,13 +193,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   function persist(ctx: ExtensionContext, workerId: string): void {
-    const worker = runtime.getWorker(workerId);
-    if (!worker) return;
+    const snapshot = runtime.snapshot().find(({ worker }) => worker.id === workerId);
+    if (!snapshot) return;
     try {
-      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-worker", {
-        worker: { ...worker, history: [...worker.history] },
-        turns: runtime.list().length ? undefined : undefined,
-      });
+      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-worker", snapshot);
     } catch {
       // journal is best-effort
     }

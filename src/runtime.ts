@@ -157,11 +157,16 @@ export class WorkerRuntime {
   snapshot(): Array<{ worker: WorkerRecord; turns: TurnRecord[] }> {
     return [...this.#workers.values()].map((w) => ({
       worker: { ...w, history: [...w.history] },
-      turns: [...this.#turns.values()].filter((t) => t.workerId === w.id),
+      turns: [...this.#turns.values()].filter((t) => t.workerId === w.id).map((t) => ({ ...t })),
     }));
   }
 
   restore(entries: unknown[]): void {
+    for (const controller of this.#controllers.values()) controller.abort();
+    this.#workers.clear();
+    this.#turns.clear();
+    this.#controllers.clear();
+
     // Scan session branch for fusion-worker snapshots, last wins per worker id.
     for (const entry of entries) {
       const e = entry as { type?: unknown; customType?: unknown; data?: unknown };

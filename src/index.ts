@@ -427,8 +427,10 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: FollowupParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      signal?.throwIfAborted();
       const cfg = effectiveConfig(ctx);
       const consent = await ensureConsent(ctx, isMutatingSelection(cfg.executorTools), ctx.isProjectTrusted());
+      signal?.throwIfAborted();
       if (!consent.ok) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: consent.error }, null, 2) }], details: { status: "error", error: consent.error } };
       }

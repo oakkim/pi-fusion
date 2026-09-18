@@ -475,7 +475,9 @@ try {
   } as never);
 
   const executorModel = { provider: "test", id: "executor", input: ["text"] };
-  let availableModels = [executorModel];
+  const availableModels = [executorModel];
+  let confirmCalls = 0;
+  let confirmImpl: () => Promise<boolean> = async () => true;
   let completeImpl: (_model: unknown, _context: unknown, options: { signal?: AbortSignal }) => Promise<any> = async () => ({
     role: "assistant",
     content: [{ type: "text", text: "done" }],
@@ -484,7 +486,8 @@ try {
   });
   const context = {
     cwd: fusionDir,
-    hasUI: false,
+    hasUI: true,
+    ui: { confirm: () => { confirmCalls++; return confirmImpl(); } },
     isProjectTrusted: () => true,
     model: undefined,
     modelRegistry: {
@@ -505,25 +508,6 @@ try {
 
   const initial = await spawn.execute("initial", { task: "start" }, undefined, undefined, context);
   const workerId = initial.details.worker_id as string;
-  availableModels = [];
-  const preAborted = await followup.execute(
-    "pre-aborted",
-    { worker_id: workerId, message: "cancelled" },
-    AbortSignal.abort(),
-    undefined,
-    context,
-  );
-  const preTurnId = preAborted.details.turn_id as string;
-  const preTurn = await readStatus(preTurnId);
-  const preWorker = await readStatus(workerId);
-  eq("pre-aborted followup wins over missing executor", [
-    preAborted.details.status,
-    preTurn.status,
-    preWorker.active_turn,
-    preWorker.consecutive_failures,
-  ], ["interrupted", "interrupted", null, 0]);
-
-  availableModels = [executorModel];
   let executorSignal: AbortSignal | undefined;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
@@ -650,6 +634,79 @@ try {
     failedWorktreeList.includes(failedCleanupWorktree),
     journalEntries.length,
   ], [true, true, true, true, journalBeforeWorktrees]);
+
+  writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: "all" }));
+  const beforeConsentTests = await readStatus(workerId);
+  const journalBeforeConsentTests = journalEntries.length;
+  let preFollowupAbort = "";
+  try {
+    await followup.execute(
+      "pre-consent",
+      { worker_id: workerId, message: "must not prompt" },
+      AbortSignal.abort(),
+      undefined,
+      context,
+    );
+  } catch (err) {
+    preFollowupAbort = err instanceof Error ? err.name : String(err);
+  }
+  const afterPreConsent = await readStatus(workerId);
+  eq("pre-aborted followup stops before consent and mutation", [
+    preFollowupAbort,
+    confirmCalls,
+    afterPreConsent.generation,
+    afterPreConsent.history_messages,
+    afterPreConsent.active_turn,
+    journalEntries.length,
+  ], [
+    "AbortError",
+    0,
+    beforeConsentTests.generation,
+    beforeConsentTests.history_messages,
+    beforeConsentTests.active_turn,
+    journalBeforeConsentTests,
+  ]);
+
+  let resolveConsent!: (value: boolean) => void;
+  let markDialogOpen!: () => void;
+  const dialogOpen = new Promise<void>((resolve) => { markDialogOpen = resolve; });
+  confirmImpl = () => new Promise<boolean>((resolve) => {
+    resolveConsent = resolve;
+    markDialogOpen();
+  });
+  const consentController = new AbortController();
+  const pendingConsent = followup.execute(
+    "during-consent",
+    { worker_id: workerId, message: "must not append" },
+    consentController.signal,
+    undefined,
+    context,
+  );
+  await dialogOpen;
+  consentController.abort();
+  resolveConsent(false);
+  let duringConsentAbort = "";
+  try {
+    await pendingConsent;
+  } catch (err) {
+    duringConsentAbort = err instanceof Error ? err.name : String(err);
+  }
+  const afterDuringConsent = await readStatus(workerId);
+  eq("abort during consent wins over decline without mutation", [
+    duringConsentAbort,
+    confirmCalls,
+    afterDuringConsent.generation,
+    afterDuringConsent.history_messages,
+    afterDuringConsent.active_turn,
+    journalEntries.length,
+  ], [
+    "AbortError",
+    1,
+    beforeConsentTests.generation,
+    beforeConsentTests.history_messages,
+    beforeConsentTests.active_turn,
+    journalBeforeConsentTests,
+  ]);
 } finally {
   rmSync(fusionDir, { recursive: true, force: true });
 }

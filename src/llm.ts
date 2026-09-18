@@ -4,7 +4,6 @@
  */
 
 import {
-  complete,
   type AssistantMessage,
   type Message,
   type Tool,
@@ -21,7 +20,6 @@ import { truncateToBytes } from "./utils.ts";
 type ToolContent = ToolResultMessage["content"];
 
 interface CompleteOptions {
-  apiKey: string;
   headers?: Record<string, string | null>;
   maxTokens: number;
   temperature?: number;
@@ -31,8 +29,8 @@ interface CompleteOptions {
 /**
  * Mirror pi core's provider-attribution: opencode-family providers require
  * x-opencode-session / x-opencode-client headers, which the normal agent loop
- * adds for us. Direct complete() calls must add them manually, otherwise the
- * provider rejects with 400 MissingSessionID.
+ * adds for us. Executor calls bypass that loop, so they must add the headers
+ * manually or the provider rejects with 400 MissingSessionID.
  */
 function opencodeSessionHeaders(model: Model<Api>, sessionId: string | undefined): Record<string, string> | undefined {
   if (!sessionId) return undefined;
@@ -45,22 +43,16 @@ function opencodeSessionHeaders(model: Model<Api>, sessionId: string | undefined
   return { "x-opencode-session": sessionId, "x-opencode-client": "pi" };
 }
 
-async function buildCompleteOptions(
-  registry: ModelRegistry,
+function buildCompleteOptions(
   model: Model<Api>,
   maxTokens: number,
   temperature: number,
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
-): Promise<CompleteOptions> {
-  const auth = await registry.getApiKeyAndHeaders(model);
-  if (!auth.ok || !auth.apiKey) {
-    throw new Error(auth.ok ? `No API key for ${model.provider}/${model.id}` : auth.error);
-  }
+): CompleteOptions {
   const sessionId = (ctx.sessionManager as unknown as { getSessionId?: () => string | undefined }).getSessionId?.();
   const options: CompleteOptions = {
-    apiKey: auth.apiKey,
-    headers: { ...opencodeSessionHeaders(model, sessionId), ...auth.headers },
+    headers: opencodeSessionHeaders(model, sessionId),
     signal,
     maxTokens,
   };
@@ -90,7 +82,7 @@ export async function runExecutorTurn(
   maxToolCalls: number,
   ctx: ExtensionContext,
 ): Promise<ToolLoopResult> {
-  const options = await buildCompleteOptions(registry, model, maxTokens, temperature, signal, ctx);
+  const options = buildCompleteOptions(model, maxTokens, temperature, signal, ctx);
   const tools: Tool[] = toolDefs.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }));
   const byName = new Map(toolDefs.map((d) => [d.name, d]));
 
@@ -105,7 +97,7 @@ export async function runExecutorTurn(
   let errorStreak = 0;
 
   while (true) {
-    const resp = await runComplete(model, { systemPrompt, messages, tools }, options);
+    const resp = await runComplete(registry, model, { systemPrompt, messages, tools }, options);
     turns++;
     usage = addUsage(usage, resp.usage);
     const calls = resp.content.filter((c): c is ToolCall => c.type === "toolCall");
@@ -138,7 +130,7 @@ export async function runExecutorTurn(
 
     if (forceFinalize || used >= maxToolCalls) {
       const finalSystem = `${systemPrompt}\n\nYou have reached the tool-call limit. Write your complete final answer now using only what you have already gathered — do not request any more tools.`;
-      const finalMsg = await runComplete(model, { systemPrompt: finalSystem, messages }, options);
+      const finalMsg = await runComplete(registry, model, { systemPrompt: finalSystem, messages }, options);
       turns++;
       usage = addUsage(usage, finalMsg.usage);
       added.push(finalMsg);
@@ -148,11 +140,12 @@ export async function runExecutorTurn(
 }
 
 async function runComplete(
+  registry: ModelRegistry,
   model: Model<Api>,
   context: { systemPrompt: string; messages: Message[]; tools?: Tool[] },
   options: CompleteOptions,
 ): Promise<AssistantMessage> {
-  const resp = await complete(model, context, options as unknown as Parameters<typeof complete>[2]);
+  const resp = await registry.complete(model, context, options);
   if (resp.stopReason === "error" || resp.stopReason === "aborted") {
     throw new Error(resp.errorMessage ?? `Model stopped with reason: ${resp.stopReason}`);
   }

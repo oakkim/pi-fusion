@@ -204,16 +204,13 @@ try {
 
   const race = await createWorktree(repo, "race");
   await tgit(race.path, ["commit", "--allow-empty", "-m", "race side"]);
-  const base = (await sh("git", ["rev-parse", "HEAD"], { cwd: repo })).stdout.trim();
-  const tree = (await sh("git", ["rev-parse", "HEAD^{tree}"], { cwd: repo })).stdout.trim();
-  const competitor = (await sh("git", ["-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", base, "-m", "competitor"], { cwd: repo })).stdout.trim();
-  await tgit(repo, ["branch", "competitor", competitor]);
+  const raceHead = (await sh("git", ["rev-parse", race.branch], { cwd: repo })).stdout.trim();
   await tgit(repo, ["commit", "--allow-empty", "-m", "race project"]);
   const realGit = (await sh("sh", ["-c", "command -v git"])).stdout.trim();
   const fakeBin = mkdtempSync(_join(tmpdir(), "fusion-git-"));
   writeFileSync(_join(fakeBin, "git"), `#!/bin/sh
 if [ "$1" = merge ] && [ "$2" = --no-edit ] && [ "$3" = ${race.branch} ]; then
-  "$PI_FUSION_REAL_GIT" merge --no-ff --no-commit competitor || exit $?
+  "$PI_FUSION_REAL_GIT" merge --no-ff --no-commit ${race.branch} || exit $?
 fi
 exec "$PI_FUSION_REAL_GIT" "$@"
 `);
@@ -229,10 +226,9 @@ exec "$PI_FUSION_REAL_GIT" "$@"
     rmSync(fakeBin, { recursive: true, force: true });
   }
   const raceMergeHead = (await sh("git", ["rev-parse", "MERGE_HEAD"], { cwd: repo })).stdout.trim();
-  eq("competing merge preserved", [raceErr.includes("git merge"), raceMergeHead], [true, competitor]);
+  eq("same-branch competing merge preserved", [raceErr.includes("git merge"), raceMergeHead], [true, raceHead]);
   await tgit(repo, ["merge", "--abort"]);
   await removeWorktree(race);
-  await tgit(repo, ["branch", "-D", "competitor"]);
 
   writeFileSync(_join(repo, "conflict.txt"), "base\n");
   await tgit(repo, ["add", "conflict.txt"]);

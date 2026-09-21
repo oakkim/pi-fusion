@@ -26,10 +26,11 @@ Lead (your model, planner/reviewer)
   |-- fusion_status wrk_abc | trn_1 | inq_1 | iqt_1
   |-- fusion_close wrk_abc [remove]  -> retire; remove=true deletes checkout+branch
   |-- /fusion-fast on|off            -> OpenAI priority tier for sidekick turns
+  |-- /fusion-monitor open           -> separate read-only worker TUI
   +-- /fusion-status (list workers)
 ```
 
-- Sidekick keeps **independent persistent history** per worker (`WorkerRuntime`). Its final visible result is queued into the lead context only after completion; private thinking is never forwarded.
+- Sidekick keeps **independent persistent history** per worker (`WorkerRuntime`). Its final visible result is steered into the Lead at the next safe checkpoint after completion; private thinking is never forwarded.
 - Spawn and follow-up return IDs immediately, so the Lead and user can keep talking while the worker runs. Idle/queued follow-ups append to the same history with bumped `generation` (`<fusion_handoff generation="N">`); a busy `steer` stays inside the active generation.
 - Independent compaction per worker (`maxHistoryMessages`, default 40; keeps first + last N-1) with routing reconsidered at that boundary.
 - Mutating tools (bash/edit/write) require trusted project + consent, and mutating runs are serialized — same fail-closed posture as pi-devin-fusion.
@@ -241,6 +242,34 @@ the latest end-user message only as a language cue, so sidekick prose follows
 the current conversation while code, paths, commands, and raw output stay
 unchanged. Private thinking text is never exposed. Updates are throttled and
 the elapsed timer stops when no workers are active.
+
+## Read-only monitor sidecar (v0.16)
+
+```text
+/fusion-monitor              -> publish telemetry and open a separate monitor window
+/fusion-monitor open         -> open another monitor window
+/fusion-monitor status       -> show publisher state and snapshot path
+/fusion-monitor close        -> stop publishing and close connected sidecars
+```
+
+On macOS, pi-fusion opens a dedicated Ghostty window when available and falls
+back to Terminal.app. The sidecar uses `@earendil-works/pi-tui` in an alternate
+screen with a full-width worker list and scrollable detail view:
+
+- `j` / `k` or Tab / Shift-Tab selects a worker
+- Up / Down and Page Up / Page Down scroll output
+- `f` follows the newest live activity, `r` refreshes, and `q` closes
+- visible sidekick responses, tool arguments/output, elapsed time, queue/steer
+  counts, persistent public history, and worktree metadata are displayed
+- private thinking is removed before publication and terminal control sequences
+  from model/tool text are stripped before rendering
+
+The bridge is read-only and local: the extension atomically writes a bounded,
+owner-only (`0600`) session snapshot under the OS temporary directory, and the
+sidecar only reads it. No control socket or network listener is opened. Updates
+are throttled, and session shutdown marks the snapshot closed so the sidecar
+exits. The monitor improves observability; it does not change worker execution
+speed.
 
 ## Optional worker conversation pane (v0.9)
 

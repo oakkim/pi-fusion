@@ -10,6 +10,7 @@
  * - fusion_close   : retire a worker (interrupts active turn)
  */
 
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai/compat";
@@ -30,7 +31,14 @@ import {
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
 import { SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
-import { FusionPaneController, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
+import { FusionPaneController, formatPaneHistory, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
+import {
+  FusionMonitorPublisher,
+  launchMonitorWindow,
+  manualMonitorCommand,
+  sanitizeMonitorText,
+  type MonitorSnapshotPayload,
+} from "./monitor.ts";
 import { getTextContent, runExecutorTurn, supportsOpenAIFastMode } from "./llm.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
@@ -268,12 +276,14 @@ export default function (pi: ExtensionAPI) {
   let activeContext: ExtensionContext | undefined;
   let sessionActive = true;
   let sessionEpoch = 0;
+  let monitor!: FusionMonitorPublisher;
   const pane = new FusionPaneController(
     (id) => runtime.getWorker(id),
     () => {
       if (sessionActive && activeContext) refreshStatus(activeContext);
     },
   );
+  monitor = new FusionMonitorPublisher(() => buildMonitorPayload());
 
   function restoreMode(ctx: ExtensionContext): FusionMode {
     try {
@@ -431,6 +441,47 @@ export default function (pi: ExtensionAPI) {
     return [...workers].reverse().find((worker) => worker.status === "running")?.id ?? workers.at(-1)?.id;
   }
 
+  function buildMonitorPayload(): MonitorSnapshotPayload {
+    const ctx = activeContext;
+    if (!ctx) throw new Error("Fusion session is not active.");
+    const sessionId = ctx.sessionManager.getSessionId() ?? `ephemeral-${process.pid}-${sessionEpoch}`;
+    return {
+      schemaVersion: 1,
+      sessionId,
+      cwd: ctx.cwd,
+      selectedWorkerId: pane.state.workerId,
+      workers: runtime.list().map((worker) => {
+        const live = pane.getLive(worker.id);
+        return {
+          id: worker.id,
+          label: worker.label,
+          status: worker.status,
+          generation: worker.generation,
+          executor: worker.executorModelId,
+          activeTurnId: worker.activeTurnId ?? undefined,
+          createdAt: worker.createdAt,
+          worktree: worker.worktree ? { branch: worker.worktree.branch, path: worker.worktree.path } : undefined,
+          queuedFollowups: pendingFollowups.get(worker.id)?.length ?? 0,
+          steeringUpdates: steeringFor(worker.id, worker.activeTurnId ?? undefined).length,
+          history: formatPaneHistory(worker.history).slice(-120).map((item) => ({
+            role: item.role,
+            text: sanitizeMonitorText(item.text),
+          })),
+          live: live ? {
+            ...live,
+            text: sanitizeMonitorText(live.text, 4_000),
+            tools: live.tools.map((tool) => ({
+              ...tool,
+              name: sanitizeMonitorText(tool.name, 200),
+              arguments: sanitizeMonitorText(tool.arguments, 2_000),
+              output: sanitizeMonitorText(tool.output, 4_000),
+            })),
+          } : undefined,
+        };
+      }),
+    };
+  }
+
   function restorePane(ctx: ExtensionContext): void {
     const state = restorePaneState(ctx);
     const workerId = state.workerId && runtime.getWorker(state.workerId) ? state.workerId : latestWorkerId();
@@ -526,6 +577,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function refreshStatus(ctx: ExtensionContext): void {
+    monitor.refresh();
     try {
       if (!ctx.hasUI) return;
       const active = runtime.list().filter(
@@ -595,6 +647,7 @@ export default function (pi: ExtensionAPI) {
       pendingFollowups.clear();
       steeringInstructions.clear();
       closedSteeringTurns.clear();
+      await monitor.close("Pi session ended.");
       pane.shutdown();
     }
     await stopBackgroundTurns();
@@ -1938,6 +1991,60 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       tell(`Unknown fast mode: ${args.trim()}. Use on, off, default, or status.`, "error");
+    },
+  });
+
+  pi.registerCommand("fusion-monitor", {
+    description: "Open a read-only Fusion worker monitor in a separate terminal: /fusion-monitor [open|close|status]",
+    getArgumentCompletions: (prefix) => {
+      const normalized = prefix.trim().toLowerCase();
+      const values = ["open", "close", "status"];
+      const matches = values.filter((value) => value.startsWith(normalized)).map((value) => ({ value, label: value }));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const tell = (text: string, level: "info" | "warning" | "error" = "info") => {
+        if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
+        else ctx.ui.notify(text, level);
+      };
+      const action = args.trim().toLowerCase() || "open";
+      if (action === "status") {
+        const detail = monitor.path ? ` • ${monitor.path}` : "";
+        const error = monitor.lastError ? ` • last error: ${monitor.lastError}` : "";
+        tell(`Fusion monitor: ${monitor.active ? "open" : "closed"}${detail}${error}`);
+        return;
+      }
+      if (action === "close") {
+        await monitor.close("Closed by /fusion-monitor.");
+        tell("Fusion monitor closed.");
+        return;
+      }
+      if (action !== "open") {
+        tell(`Unknown monitor action: ${args.trim()}. Use open, close, or status.`, "error");
+        return;
+      }
+      if (ctx.mode !== "tui") {
+        tell("Fusion monitor requires an active TUI session.", "warning");
+        return;
+      }
+
+      activeContext = ctx;
+      const payload = buildMonitorPayload();
+      let snapshotPath: string;
+      try {
+        snapshotPath = await monitor.open(payload.sessionId);
+      } catch (error) {
+        tell(`Could not start Fusion monitor publisher: ${error instanceof Error ? error.message : String(error)}`, "error");
+        return;
+      }
+      const scriptPath = fileURLToPath(new URL("./monitor-cli.ts", import.meta.url));
+      try {
+        const plan = await launchMonitorWindow(scriptPath, snapshotPath);
+        tell(`Fusion monitor opened in ${plan.kind === "ghostty" ? "Ghostty" : "Terminal"}.`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        tell(`${message}\nManual command: ${manualMonitorCommand(scriptPath, snapshotPath)}`, "warning");
+      }
     },
   });
 

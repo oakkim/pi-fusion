@@ -9,6 +9,7 @@ import fusionExtension, { formatElapsedDuration, formatLiveStatusAction, formatT
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
+import { buildMonitorLaunchPlan, FusionMonitorPublisher, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, type MonitorSnapshot } from "../src/monitor.ts";
 
 let pass = 0;
 let fail = 0;
@@ -164,7 +165,7 @@ eq("latest user language sample", latestUserText([...entries, { type: "message",
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
@@ -1714,6 +1715,77 @@ await commands.get("fusion-pane")!.handler("open", {
   ui: { ...consentContext.ui, notify: (text: string) => { paneNotice = text; } },
 });
 eq("pane rejects non-tui", paneNotice, "Fusion pane requires TUI mode.");
+
+// --- 14. read-only monitor sidecar renders and publishes safe live snapshots ---
+const monitorSnapshot: MonitorSnapshot = {
+  schemaVersion: 1,
+  sessionId: "session-test",
+  cwd: "/tmp/project",
+  selectedWorkerId: "wrk_monitor",
+  updatedAt: Date.now() - 2_000,
+  connected: true,
+  ownerPid: process.pid,
+  workers: [{
+    id: "wrk_monitor",
+    label: "한국어 monitor",
+    status: "running",
+    generation: 2,
+    executor: "openai-codex/gpt-test",
+    activeTurnId: "trn_monitor",
+    createdAt: Date.now() - 10_000,
+    queuedFollowups: 1,
+    steeringUpdates: 2,
+    history: Array.from({ length: 24 }, (_, index) => ({
+      role: index % 3 === 0 ? "LEAD" as const : index % 3 === 1 ? "SIDEKICK" as const : "TOOL" as const,
+      text: `visible history ${index}`,
+    })),
+    live: {
+      phase: "tool",
+      startedAt: Date.now() - 5_000,
+      text: "보이는 응답",
+      tools: [{ id: "tool-1", name: "bash", arguments: '{"command":"npm test"}', output: "all good\u001b]2;INJECTED\u0007", status: "running" }],
+    },
+  }],
+};
+const monitorWide = renderMonitorScreen(monitorSnapshot, 110, 28, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
+const monitorNarrow = renderMonitorScreen(monitorSnapshot, 64, 20, { scroll: 0, follow: false });
+eq("monitor screen dimensions", [monitorWide.lines.length, monitorWide.lines.every((line) => visibleWidth(line) <= 110), monitorNarrow.lines.length, monitorNarrow.lines.every((line) => visibleWidth(line) <= 64)], [28, true, 20, true]);
+eq("monitor follows live tail", [monitorWide.selectedWorkerId, monitorWide.scroll, monitorWide.maxScroll, monitorWide.lines.some((line) => line.includes("bash"))], ["wrk_monitor", monitorWide.maxScroll, monitorWide.maxScroll, true]);
+eq("monitor strips injected terminal controls", [sanitizeMonitorText("safe\u001b]2;INJECTED\u0007"), monitorWide.lines.some((line) => line.includes("INJECTED"))], ["safe", false]);
+eq("monitor parser rejects invalid snapshots", [parseMonitorSnapshot("{}"), parseMonitorSnapshot(JSON.stringify(monitorSnapshot))?.workers.length], [undefined, 1]);
+const ghosttyPlan = buildMonitorLaunchPlan("/pkg/monitor-cli.ts", "/tmp/snapshot.json", { platform: "darwin", ghostty: true, terminal: false });
+eq("monitor Ghostty launch plan", [ghosttyPlan?.kind, ghosttyPlan?.command, ghosttyPlan?.args.includes("-e"), ghosttyPlan?.args.at(-1)], ["ghostty", "/usr/bin/open", true, "/tmp/snapshot.json"]);
+eq("monitor has no unsupported launcher", buildMonitorLaunchPlan("script", "snapshot", { platform: "linux", ghostty: false, terminal: false }), undefined);
+eq("monitor command registered", commands.has("fusion-monitor"), true);
+let monitorNotice = "";
+await commands.get("fusion-monitor")!.handler("open", {
+  ...consentContext,
+  mode: "rpc",
+  ui: { ...consentContext.ui, notify: (text: string) => { monitorNotice = text; } },
+});
+eq("monitor rejects non-tui launch", monitorNotice, "Fusion monitor requires an active TUI session.");
+
+const monitorFixture = mkdtempSync(_join(tmpdir(), "fusion-monitor-test-"));
+let publishedPayload = { ...monitorSnapshot, workers: monitorSnapshot.workers };
+const publisher = new FusionMonitorPublisher(() => ({
+  schemaVersion: 1,
+  sessionId: publishedPayload.sessionId,
+  cwd: publishedPayload.cwd,
+  selectedWorkerId: publishedPayload.selectedWorkerId,
+  workers: publishedPayload.workers,
+}));
+const publishedPath = await publisher.open("session/test", monitorFixture);
+const firstPublished = parseMonitorSnapshot(readFileSync(publishedPath, "utf8"));
+eq("monitor publisher writes owner-only snapshot", [firstPublished?.connected, firstPublished?.workers.length, statSync(publishedPath).mode & 0o777], [true, 1, 0o600]);
+publishedPayload = { ...publishedPayload, workers: [] };
+publisher.refresh();
+await new Promise((resolve) => setTimeout(resolve, 140));
+const refreshedSnapshot = parseMonitorSnapshot(readFileSync(publishedPath, "utf8"));
+eq("monitor publisher refreshes atomically", [refreshedSnapshot?.connected, refreshedSnapshot?.workers.length], [true, 0]);
+await publisher.close("test complete");
+const closedSnapshot = parseMonitorSnapshot(readFileSync(publishedPath, "utf8"));
+eq("monitor publisher closes sidecar", [publisher.active, closedSnapshot?.connected, closedSnapshot?.closed, closedSnapshot?.closeReason], [false, false, true, "test complete"]);
+rmSync(monitorFixture, { recursive: true, force: true });
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

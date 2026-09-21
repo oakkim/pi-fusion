@@ -25,9 +25,9 @@ import {
   type ExecutorOverride,
   type ThinkingOverride,
 } from "./config.ts";
-import { buildRecentContext } from "./utils.ts";
+import { buildRecentContext, latestUserText } from "./utils.ts";
 import { SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
-import { FusionPaneController, type PaneState } from "./pane.ts";
+import { FusionPaneController, type LiveActivity, type PaneState } from "./pane.ts";
 import { getTextContent, runExecutorTurn } from "./llm.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
@@ -92,12 +92,48 @@ function userMsg(text: string): Message {
   return { role: "user", content: text, timestamp: Date.now() } as Message;
 }
 
+function statusText(value: string): string {
+  return value
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function clipStatus(value: string, max: number, tail = false): string {
+  const text = statusText(value);
+  if (text.length <= max) return text;
+  return tail ? `…${text.slice(-(max - 1))}` : `${text.slice(0, max - 1)}…`;
+}
+
+export function formatLiveStatusAction(activity: LiveActivity | undefined): string {
+  if (!activity) return "starting";
+  if (activity.phase === "tool") {
+    const tool = [...activity.tools].reverse().find((item) => item.status === "running") ?? activity.tools.at(-1);
+    if (!tool) return "tool";
+    const args = clipStatus(tool.arguments, 58);
+    return clipStatus(`${tool.name}${args ? ` ${args}` : ""}`, 72);
+  }
+  if (activity.phase === "responding") {
+    // Show the worker's actual visible words. Its response language therefore
+    // appears naturally without translating or summarizing the stream.
+    return clipStatus(activity.text, 72, true) || "responding";
+  }
+  return activity.phase;
+}
+
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
-  const pane = new FusionPaneController((id) => runtime.getWorker(id));
   const backgroundTurns = new Map<string, Promise<void>>();
+  let activeContext: ExtensionContext | undefined;
   let sessionActive = true;
   let sessionEpoch = 0;
+  const pane = new FusionPaneController(
+    (id) => runtime.getWorker(id),
+    () => {
+      if (sessionActive && activeContext) refreshStatus(activeContext);
+    },
+  );
 
   function restoreMode(ctx: ExtensionContext): FusionMode {
     try {
@@ -203,9 +239,11 @@ export default function (pi: ExtensionAPI) {
       for (let i = branch.length - 1; i >= 0; i--) {
         const e = branch[i] as { type?: unknown; customType?: unknown; data?: unknown };
         if (e?.type === "custom" && e?.customType === "fusion-pane" && e.data && typeof e.data === "object") {
-          const data = e.data as { visible?: unknown; workerId?: unknown };
+          const data = e.data as { visible?: unknown; workerId?: unknown; manual?: unknown };
           return {
-            visible: data.visible === true,
+            // Before v0.11, spawn auto-opened and journaled the overlay. Require
+            // an explicit command marker so those old entries restore closed.
+            visible: data.manual === true && data.visible === true,
             ...(typeof data.workerId === "string" ? { workerId: data.workerId } : {}),
           };
         }
@@ -218,7 +256,7 @@ export default function (pi: ExtensionAPI) {
 
   function persistPaneState(): void {
     try {
-      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-pane", { ...pane.state, timestamp: Date.now() });
+      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-pane", { ...pane.state, manual: true, timestamp: Date.now() });
     } catch {
       // journal is best-effort
     }
@@ -238,11 +276,10 @@ export default function (pi: ExtensionAPI) {
     pane.refresh();
   }
 
-  function openPaneForWorker(ctx: ExtensionContext, workerId: string): void {
-    if (ctx.mode !== "tui") return;
-    pane.open(ctx, workerId);
-    persistPaneState();
-    pane.refresh();
+  function selectWorkerForActivity(ctx: ExtensionContext, workerId: string): void {
+    activeContext = ctx;
+    pane.select(workerId);
+    refreshStatus(ctx);
   }
 
   /** Session command overrides win over fusion.json. */
@@ -255,6 +292,17 @@ export default function (pi: ExtensionAPI) {
   function refreshStatus(ctx: ExtensionContext): void {
     try {
       if (!ctx.hasUI) return;
+      const running = runtime.list().filter((worker) => worker.status === "running");
+      if (running.length > 0) {
+        const selected = pane.state.workerId;
+        const worker = running.find((item) => item.id === selected) ?? running.at(-1)!;
+        const activity = pane.getLive(worker.id);
+        const label = clipStatus(worker.label || worker.id.slice(4, 12), 24);
+        const elapsed = activity ? `${Math.max(0, Math.floor((Date.now() - activity.startedAt) / 1000))}s` : "0s";
+        const more = running.length > 1 ? ` • +${running.length - 1}` : "";
+        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${formatLiveStatusAction(activity)} • ${elapsed}${more}`);
+        return;
+      }
       const mode = restoreMode(ctx);
       const warnings: string[] = [];
       const cfg = effectiveConfig(ctx);
@@ -299,6 +347,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     sessionEpoch += 1;
     sessionActive = true;
+    activeContext = ctx;
     restoreRuntime(ctx);
     restorePane(ctx);
     refreshStatus(ctx);
@@ -314,13 +363,18 @@ export default function (pi: ExtensionAPI) {
     await suspendSession();
     restoreRuntime(ctx);
     sessionActive = true;
+    activeContext = ctx;
     restorePane(ctx);
     refreshStatus(ctx);
   });
   pi.on("session_shutdown", async () => {
     await suspendSession();
+    activeContext = undefined;
   });
-  pi.on("model_select", async (_event, ctx) => refreshStatus(ctx));
+  pi.on("model_select", async (_event, ctx) => {
+    activeContext = ctx;
+    refreshStatus(ctx);
+  });
 
   // Off mode: fusion tools are mechanically disabled, not just discouraged.
   // Delegate enforcement (opencode-fusion style): when leadMutations is
@@ -635,9 +689,11 @@ export default function (pi: ExtensionAPI) {
       if (!executor) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: "no authed text executor model available" }, null, 2) }], details: { status: "error" } };
       }
+      const branch = ctx.sessionManager.getBranch() as unknown[];
+      const userLanguageSample = latestUserText(branch, params.task);
       const contextText =
         (params.context_mode ?? "none") === "recent"
-          ? buildRecentContext(ctx.sessionManager.getBranch() as unknown[], params.context_turns)
+          ? buildRecentContext(branch, params.context_turns)
           : undefined;
       let worktree: WorkerRecord["worktree"];
       if (params.worktree) {
@@ -652,10 +708,10 @@ export default function (pi: ExtensionAPI) {
           signal.throwIfAborted();
         }
       }
-      const taskText = handoffTaskText(1, params.task, contextText, params.label);
+      const taskText = handoffTaskText(1, params.task, contextText, params.label, userLanguageSample);
       const { worker, turn } = runtime.spawn({ label: params.label, executorModelId: modelDisplay(executor), firstMessage: userMsg(taskText), worktree });
       persist(ctx, worker.id);
-      openPaneForWorker(ctx, worker.id);
+      selectWorkerForActivity(ctx, worker.id);
       onUpdate?.({
         content: [{ type: "text", text: `Starting Fusion worker ${worker.id} asynchronously...` }],
         details: { status: "starting", worker_id: worker.id, turn_id: turn.id },
@@ -708,7 +764,8 @@ export default function (pi: ExtensionAPI) {
       if (worker.activeTurnId) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} is busy (turn ${worker.activeTurnId}).` }, null, 2) }], details: { status: "error" } };
       }
-      const taskText = handoffTaskText(worker.generation + 1, params.message, undefined, worker.label);
+      const userLanguageSample = latestUserText(ctx.sessionManager.getBranch() as unknown[], params.message);
+      const taskText = handoffTaskText(worker.generation + 1, params.message, undefined, worker.label, userLanguageSample);
       let turn;
       try {
         turn = runtime.followup(worker.id, userMsg(taskText));
@@ -717,7 +774,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: message }, null, 2) }], details: { status: "error", error: message } };
       }
       persist(ctx, worker.id);
-      openPaneForWorker(ctx, worker.id);
+      selectWorkerForActivity(ctx, worker.id);
       onUpdate?.({
         content: [{ type: "text", text: `Starting Fusion follow-up ${turn.id} asynchronously...` }],
         details: { status: "starting", worker_id: worker.id, turn_id: turn.id },
@@ -996,7 +1053,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("fusion-pane", {
-    description: "Show sidekick history: /fusion-pane [open|close|toggle|wrk_...]",
+    description: "Show optional detailed sidekick pane: /fusion-pane [open|close|toggle|wrk_...]",
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trim().toLowerCase();
       const values = ["open", "close", "toggle", ...runtime.list().map((worker) => worker.id)];

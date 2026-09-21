@@ -232,7 +232,10 @@ export class FusionPaneController {
   #renderTimer?: ReturnType<typeof setTimeout>;
   #renderQueued = false;
 
-  constructor(private readonly getWorker: (id: string) => WorkerRecord | undefined) {}
+  constructor(
+    private readonly getWorker: (id: string) => WorkerRecord | undefined,
+    private readonly onActivityChange?: () => void,
+  ) {}
 
   get state(): PaneState {
     return { ...this.#state };
@@ -269,7 +272,7 @@ export class FusionPaneController {
     const token = ++this.#liveSequence;
     this.#liveTokens.set(workerId, token);
     this.#live.set(workerId, { phase: "waiting", startedAt, text: "", tools: [] });
-    if (this.#state.visible) this.#ensureElapsedTimer();
+    if (this.#state.visible || this.onActivityChange) this.#ensureElapsedTimer();
     this.refresh();
     return token;
   }
@@ -371,7 +374,7 @@ export class FusionPaneController {
       this.#finish = undefined;
       this.#tui = undefined;
       this.#state.visible = false;
-      this.#stopElapsedTimer();
+      if (!this.onActivityChange) this.#stopElapsedTimer();
       this.#clearRenderTimer();
     });
     return true;
@@ -384,7 +387,7 @@ export class FusionPaneController {
     this.#finish = undefined;
     this.#tui = undefined;
     this.#instance += 1;
-    this.#stopElapsedTimer();
+    if (!this.onActivityChange) this.#stopElapsedTimer();
     this.#clearRenderTimer();
     finish?.();
   }
@@ -396,19 +399,20 @@ export class FusionPaneController {
   }
 
   refresh(): void {
-    if (!this.#tui || this.#renderQueued) return;
+    if ((!this.#tui && !this.onActivityChange) || this.#renderQueued) return;
     this.#renderQueued = true;
     this.#renderTimer = setTimeout(() => {
       this.#renderTimer = undefined;
       this.#renderQueued = false;
       this.#tui?.requestRender();
+      this.onActivityChange?.();
     }, LIVE_RENDER_INTERVAL_MS);
   }
 
   #ensureElapsedTimer(): void {
     if (this.#elapsedTimer) return;
     this.#elapsedTimer = setInterval(() => {
-      if (this.#live.size === 0 || !this.#state.visible) {
+      if (this.#live.size === 0 || (!this.#state.visible && !this.onActivityChange)) {
         this.#stopElapsedTimer();
         return;
       }

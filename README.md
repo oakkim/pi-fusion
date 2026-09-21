@@ -143,27 +143,43 @@ without blocking conversation or encouraging status polling. Session switch,
 reload, and shutdown interrupt active background workers and wait briefly for
 cleanup.
 
-## Worker conversation pane (v0.9)
+## Live status line (v0.11)
+
+The default TUI view stays unobstructed. While a worker runs, the Pi status line
+shows one compact view of its existing live stream:
+
+- tool call: the actual tool name and arguments
+- visible response: the worker's latest visible words, unchanged
+- otherwise: `waiting`, `thinking`, or `starting`
+- elapsed time, plus `+N` when other workers are also active
+
+There is no extra summarization, translation, or model call. Because visible
+response text is passed through directly, the worker's conversation language
+naturally appears in the status line. Each handoff includes a bounded copy of
+the latest end-user message only as a language cue, so sidekick prose follows
+the current conversation while code, paths, commands, and raw output stay
+unchanged. Private thinking text is never exposed. Updates are throttled and
+the elapsed timer stops when no workers are active.
+
+## Optional worker conversation pane (v0.9)
 
 ```
-/fusion-pane                 -> toggle the worker pane
+/fusion-pane                 -> toggle the detailed worker pane
 /fusion-pane open            -> show the latest/running worker
 /fusion-pane close           -> close the pane
 /fusion-pane wrk_...         -> show a specific worker
 ```
 
-In TUI mode, spawning or following up a worker automatically opens a
-non-capturing right-side pane with recent LEAD, SIDEKICK, and TOOL messages.
-While a turn runs it also shows a throttled live phase (`waiting`, `thinking`,
-or `responding`), elapsed time, visible answer text, tool arguments, partial
-built-in tool output, and tool success/error. Private thinking text is never
-shown. Live activity is transient: it is not added to worker history or the
-session journal, and is cleared when a turn finishes, fails, is interrupted, or
-the session shuts down. Closing the pane only hides it, so reopening during an
-active turn restores the current live view. The selected worker and visibility
-remain journaled. The pane
-uses the available overlay height, is somewhat wider for readability, and
-automatically hides below 110 terminal columns.
+The non-capturing right-side overlay is now opt-in because it can obscure the
+transcript. When explicitly opened, it shows recent LEAD, SIDEKICK, and TOOL
+messages plus live phase, elapsed time, visible answer text, tool arguments,
+partial built-in tool output, and tool success/error. Live activity is
+transient: it is not added to worker history or the session journal, and is
+cleared when a turn finishes, fails, is interrupted, or the session shuts down.
+Closing the pane only hides it, so reopening during an active turn restores the
+current live view. Explicit pane visibility remains journaled; old auto-open
+journal entries restore closed. The pane automatically hides below 110 terminal
+columns.
 
 This is an overlay, not a true split: Pi's extension API cannot shrink or
 reflow the main transcript area. The overlay stays unfocused so the normal

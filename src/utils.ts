@@ -34,6 +34,20 @@ function partText(content: unknown): string {
     .trim();
 }
 
+export function latestUserText(entries: unknown[], fallbackText = "", maxChars = 1_000): string {
+  let text = fallbackText.trim();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i] as { type?: unknown; message?: { role?: unknown; content?: unknown } };
+    if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+    const candidate = partText(entry.message.content);
+    if (candidate) {
+      text = candidate;
+      break;
+    }
+  }
+  return text.length > maxChars ? text.slice(-maxChars) : text;
+}
+
 export function buildRecentContext(entries: unknown[], turns: number | undefined): string | undefined {
   const maxTurns = normalizeContextTurns(turns);
   const messages: Array<{ role: string; text: string }> = [];

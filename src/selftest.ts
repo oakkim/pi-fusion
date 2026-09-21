@@ -3,8 +3,8 @@ import { WorkerRuntime } from "../src/runtime.ts";
 import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
-import { buildRecentContext } from "../src/utils.ts";
-import fusionExtension from "../src/index.ts";
+import { buildRecentContext, latestUserText } from "../src/utils.ts";
+import fusionExtension, { formatLiveStatusAction } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
@@ -127,6 +127,8 @@ eq("failure escalates sidekick", policy.select({ complexity: 0.95, previous: pre
 // --- 4. handoff framing ---
 const h = handoffTaskText(2, "fix auth", "recent ctx");
 eq("handoff gen+task", h.includes('generation="2"') && h.includes("fix auth") && h.includes("recent ctx"), true);
+const localizedHandoff = handoffTaskText(1, "inspect", undefined, undefined, "지금 <상태>를 보여줘");
+eq("handoff carries latest user language sample", [localizedHandoff.includes("지금 &lt;상태&gt;를 보여줘"), localizedHandoff.includes("same natural language")], [true, true]);
 
 // --- 5. config defaults ---
 const cfg = applyDefaults({});
@@ -139,6 +141,7 @@ const entries = [
 ];
 eq("recent ctx", buildRecentContext(entries, 4)?.includes("hello"), true);
 eq("empty ctx", buildRecentContext([], 4), undefined);
+eq("latest user language sample", latestUserText([...entries, { type: "message", message: { role: "user", content: "한국어로 답해줘" } }], "fallback"), "한국어로 답해줘");
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
@@ -599,6 +602,8 @@ try {
   const executorModel = { provider: "test", id: "executor", input: ["text"] };
   const availableModels = [executorModel];
   let confirmCalls = 0;
+  let customCalls = 0;
+  let fusionStatusLine = "";
   let confirmImpl: () => Promise<boolean> = async () => true;
   let completeImpl: (_model: unknown, _context: unknown, options: { signal?: AbortSignal }) => Promise<any> = async () => ({
     role: "assistant",
@@ -608,8 +613,13 @@ try {
   });
   const context = {
     cwd: fusionDir,
+    mode: "tui",
     hasUI: true,
-    ui: { confirm: () => { confirmCalls++; return confirmImpl(); } },
+    ui: {
+      confirm: () => { confirmCalls++; return confirmImpl(); },
+      custom: () => { customCalls++; return Promise.resolve(); },
+      setStatus: (_key: string, text: string) => { fusionStatusLine = text; },
+    },
     isProjectTrusted: () => true,
     model: undefined,
     modelRegistry: {
@@ -620,6 +630,7 @@ try {
     },
     sessionManager: { getBranch: () => [], getSessionId: () => undefined },
   };
+  await lifecycleHandlers.get("session_start")?.({}, context);
   const spawn = registered.get("fusion_spawn")!;
   const followup = registered.get("fusion_followup")!;
   const status = registered.get("fusion_status")!;
@@ -673,10 +684,12 @@ try {
     });
   };
   const hostController = new AbortController();
-  const deferred = await spawn.execute("deferred", { task: "wait" }, hostController.signal, undefined, context);
+  const deferred = await spawn.execute("deferred", { task: "wait", label: "status-test" }, hostController.signal, undefined, context);
   const deferredTurnId = deferred.details.turn_id as string;
   const deferredWorkerId = deferred.details.worker_id as string;
   await started;
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  eq("background activity uses status line without auto-opening pane", [customCalls, fusionStatusLine.includes("status-test"), fusionStatusLine.includes("waiting")], [0, true, true]);
   hostController.abort();
   await new Promise((resolve) => setTimeout(resolve, 10));
   const detachedTurn = await readStatus(deferredTurnId);
@@ -692,7 +705,8 @@ try {
   await interrupt.execute("interrupt", { worker_id: deferredWorkerId }, undefined, undefined, context);
   const deferredTurn = await waitForStatus(deferredTurnId, "interrupted");
   const deferredWorker = await readStatus(deferredWorkerId);
-  eq("explicit interrupt stops detached turn", [deferredTurn.status, deferredWorker.active_turn, executorSignal?.aborted], ["interrupted", null, true]);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  eq("explicit interrupt stops detached turn", [deferredTurn.status, deferredWorker.active_turn, executorSignal?.aborted, fusionStatusLine.includes("Fusion available")], ["interrupted", null, true, true]);
 
   const worktreeSuffix = Date.now().toString(36);
   const preWorktree = `pre-cancel-${worktreeSuffix}`;
@@ -1086,6 +1100,11 @@ eq("pane uses expanded line capacity", [expandedPane.some((line) => line.include
 const thinkingActivity: LiveActivity = { phase: "thinking", startedAt: Date.now() - 2_000, text: "", tools: [] };
 const thinkingPane = renderWorkerPane(paneWorker, 42, 20, thinkingActivity);
 eq("live thinking phase without private text", [thinkingPane.some((line) => line.includes("thinking")), thinkingPane.some((line) => line.includes("private chain of thought"))], [true, false]);
+eq("status line passes through visible worker activity", [
+  formatLiveStatusAction({ phase: "responding", startedAt: 0, text: "한국어로 작업 결과를 설명 중", tools: [] }),
+  formatLiveStatusAction({ phase: "tool", startedAt: 0, text: "", tools: [{ id: "1", name: "bash", arguments: '{"command":"git status"}', output: "", status: "running" }] }),
+  formatLiveStatusAction(thinkingActivity),
+], ["한국어로 작업 결과를 설명 중", 'bash {"command":"git status"}', "thinking"]);
 const crowdedActivity: LiveActivity = {
   phase: "tool",
   startedAt: Date.now() - 2_000,

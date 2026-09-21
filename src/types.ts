@@ -7,7 +7,7 @@
  * - fusion-ref (Kylejeong2/fusion): AdaptiveRoutingPolicy at compaction boundary
  */
 
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 export type { Api, Model };
 
@@ -25,6 +25,8 @@ export interface FusionConfig {
   maxExecutorOutputTokens?: number;
   /** Sampling temperature. Default 0.2. */
   temperature?: number;
+  /** Sidekick reasoning effort. Default "off". */
+  thinkingLevel?: ModelThinkingLevel;
   /** Skip consent prompt for mutating tools (trusted projects only). Default false. */
   executorToolsConsent?: boolean;
   /** Max turns of sidekick history kept before compaction. Default 40 messages. */
@@ -48,6 +50,7 @@ export interface ResolvedFusionConfig {
   maxToolCalls: number;
   maxExecutorOutputTokens: number;
   temperature: number;
+  thinkingLevel: ModelThinkingLevel;
   executorToolsConsent: boolean;
   maxHistoryMessages: number;
   fallbackExecutors: string[];

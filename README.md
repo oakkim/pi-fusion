@@ -98,6 +98,22 @@ Resolution order: `/fusion-model` override > `fusion.json` > auto (first
 non-lead authed text model). Override lives in the session journal
 (`fusion-executor` entry); `/fusion-status` shows the effective executor.
 
+## Executor thinking (v0.8)
+
+```
+/fusion-thinking                  -> interactive picker (TUI) or current display (print)
+/fusion-thinking high             -> set a session override for the sidekick
+/fusion-thinking off              -> disable sidekick reasoning
+/fusion-thinking clear            -> return to fusion.json (default: off)
+```
+
+The picker only offers levels supported by the effective executor. The requested
+level is clamped again for each escalation rung, so switching to a fallback model
+cannot send an unsupported reasoning effort. Calls use Pi's provider-neutral
+`streamSimple` path, which maps the level to each provider's native thinking API.
+The override is journaled as a `fusion-thinking` entry and applies to existing
+persistent workers on their next turn.
+
 ## Lead discipline (v0.7)
 
 Two layers, following what others found (opencode-fusion's systemic Main edit
@@ -153,12 +169,15 @@ pi install git:github.com/oakkim/pi-fusion
   "maxToolCalls": 16,
   "maxExecutorOutputTokens": 4096,
   "temperature": 0.2,
+  "thinkingLevel": "off",
   "executorToolsConsent": false,
   "maxHistoryMessages": 40
 }
 ```
 
 `executorTools`: `"none" | "readonly" | "all" | ["read","grep","find","ls","bash","edit","write"]`.
+
+`thinkingLevel`: `"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`.
 
 ## Check
 

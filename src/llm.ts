@@ -10,7 +10,7 @@ import {
   type ToolCall,
   type ToolResultMessage,
 } from "@earendil-works/pi-ai/compat";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, ModelThinkingLevel, ThinkingLevel } from "@earendil-works/pi-ai";
 import type { ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { TOOL_OUTPUT_MAX_BYTES } from "./config.ts";
 import type { ExecutorToolDef } from "./tools.ts";
@@ -23,6 +23,7 @@ interface CompleteOptions {
   headers?: Record<string, string | null>;
   maxTokens: number;
   temperature?: number;
+  reasoning?: ThinkingLevel;
   signal: AbortSignal | undefined;
 }
 
@@ -47,6 +48,7 @@ function buildCompleteOptions(
   model: Model<Api>,
   maxTokens: number,
   temperature: number,
+  thinkingLevel: ModelThinkingLevel,
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
 ): CompleteOptions {
@@ -57,6 +59,7 @@ function buildCompleteOptions(
     maxTokens,
   };
   if (getSupportsTemperature(model)) options.temperature = temperature;
+  if (thinkingLevel !== "off") options.reasoning = thinkingLevel;
   return options;
 }
 
@@ -81,8 +84,9 @@ export async function runExecutorTurn(
   toolDefs: ExecutorToolDef[],
   maxToolCalls: number,
   ctx: ExtensionContext,
+  thinkingLevel: ModelThinkingLevel = "off",
 ): Promise<ToolLoopResult> {
-  const options = buildCompleteOptions(model, maxTokens, temperature, signal, ctx);
+  const options = buildCompleteOptions(model, maxTokens, temperature, thinkingLevel, signal, ctx);
   const tools: Tool[] = toolDefs.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }));
   const byName = new Map(toolDefs.map((d) => [d.name, d]));
 
@@ -147,7 +151,20 @@ async function runComplete(
   options: CompleteOptions,
 ): Promise<AssistantMessage> {
   options.signal?.throwIfAborted();
-  const resp = await registry.complete(model, context, options);
+  const compatibleRegistry = registry as unknown as {
+    streamSimple?: (
+      model: Model<Api>,
+      context: { systemPrompt: string; messages: Message[]; tools?: Tool[] },
+      options: CompleteOptions,
+    ) => { result(): Promise<AssistantMessage> };
+  };
+  if (options.reasoning && !compatibleRegistry.streamSimple) {
+    throw new Error("Fusion thinking requires pi 0.86 or newer.");
+  }
+  const resp = compatibleRegistry.streamSimple
+    ? await compatibleRegistry.streamSimple(model, context, options).result()
+    : await registry.complete(model, context, options);
+
   if (resp.stopReason === "error" || resp.stopReason === "aborted") {
     throw new Error(resp.errorMessage ?? `Model stopped with reason: ${resp.stopReason}`);
   }

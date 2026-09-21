@@ -127,7 +127,7 @@ eq("handoff gen+task", h.includes('generation="2"') && h.includes("fix auth") &&
 
 // --- 5. config defaults ---
 const cfg = applyDefaults({});
-eq("defaults", [cfg.executorTools, cfg.maxToolCalls, cfg.maxExecutorOutputTokens, cfg.temperature, cfg.maxHistoryMessages], ["all", 16, 4096, 0.2, 40]);
+eq("defaults", [cfg.executorTools, cfg.maxToolCalls, cfg.maxExecutorOutputTokens, cfg.temperature, cfg.thinkingLevel, cfg.maxHistoryMessages], ["all", 16, 4096, 0.2, "off", 40]);
 
 // --- 6. recent context builder ---
 const entries = [
@@ -314,7 +314,7 @@ const cfg2 = applyDefaults({ fallbackExecutors: ["p/pro", "p/pro", ""], maxEscal
 eq("config ladder", [cfg2.fallbackExecutors, cfg2.maxEscalations], [["p/pro"], 5]);
 
 // --- 9b. config override ---
-import { applyOverride, applyDefaults as _ad } from "../src/config.ts";
+import { applyOverride, applyThinkingOverride, applyDefaults as _ad } from "../src/config.ts";
 eq("leadMutations default", _ad({}).leadMutations, "allow");
 eq("leadMutations delegate", _ad({ leadMutations: "delegate" }).leadMutations, "delegate");
 eq("leadMutations bogus", _ad({ leadMutations: "sometimes" as unknown as "allow" }).leadMutations, "allow");
@@ -322,6 +322,9 @@ eq("override executor", applyOverride({ executor: "a/x" }, { executor: "b/y" }),
 eq("override auto", applyOverride({ executor: "a/x" }, { auto: true }), {});
 eq("override empty", applyOverride({ executor: "a/x" }, {}), { executor: "a/x" });
 eq("override none", applyOverride({ executor: "a/x" }, undefined), { executor: "a/x" });
+eq("thinking config", [_ad({ thinkingLevel: "high" }).thinkingLevel, _ad({ thinkingLevel: "bogus" as never }).thinkingLevel], ["high", "off"]);
+eq("thinking override", applyThinkingOverride({ thinkingLevel: "low" }, { thinkingLevel: "xhigh" }), { thinkingLevel: "xhigh" });
+eq("thinking override clear", applyThinkingOverride({ thinkingLevel: "low" }, {}), { thinkingLevel: "low" });
 
 // --- 8b. cost accounting ---
 import { addUsage, zeroUsage } from "../src/cost.ts";
@@ -333,21 +336,22 @@ eq("usage sum", c3, { input: 13, output: 5, cacheRead: 0, cacheWrite: 0, totalTo
 
 // --- 8c. executor dispatches through the configured model registry ---
 import { runExecutorTurn } from "../src/llm.ts";
+const resultStream = (result: unknown | Promise<unknown>) => ({ result: () => Promise.resolve(result) });
 let registryCompleteCalls = 0;
 let registryCall: { model?: unknown; options?: Record<string, unknown> } = {};
 const registryModel = { provider: "opencode-go", id: "registered", input: ["text"] };
 const registrySignal = new AbortController().signal;
 const registryResult = await runExecutorTurn(
   {
-    complete: async (model: unknown, _context: unknown, options: Record<string, unknown>) => {
+    streamSimple: (model: unknown, _context: unknown, options: Record<string, unknown>) => {
       registryCompleteCalls++;
       registryCall = { model, options };
-      return {
+      return resultStream({
         role: "assistant",
         content: [{ type: "text", text: "registry ok" }],
         stopReason: "stop",
         timestamp: Date.now(),
-      };
+      });
     },
   } as never,
   registryModel as never,
@@ -359,16 +363,18 @@ const registryResult = await runExecutorTurn(
   [],
   1,
   { sessionManager: { getSessionId: () => "session-test" } } as never,
+  "high",
 );
-eq("registry complete dispatch", [
+eq("registry streamSimple dispatch", [
   registryCompleteCalls,
   registryCall.model === registryModel,
   registryCall.options?.signal === registrySignal,
   registryCall.options?.maxTokens,
   registryCall.options?.temperature,
+  registryCall.options?.reasoning,
   registryCall.options?.headers,
   registryResult.message.content,
-], [1, true, true, 128, 0.2, {
+], [1, true, true, 128, 0.2, "high", {
   "x-opencode-session": "session-test",
   "x-opencode-client": "pi",
 }, [{ type: "text", text: "registry ok" }]]);
@@ -379,7 +385,7 @@ let toolAbortEscaped = false;
 try {
   await runExecutorTurn(
     {
-      complete: async () => ({
+      streamSimple: () => resultStream({
         role: "assistant",
         content: [
           { type: "toolCall", id: "first", name: "first", arguments: {} },
@@ -425,14 +431,14 @@ let lastToolAbortEscaped = false;
 try {
   await runExecutorTurn(
     {
-      complete: async () => {
+      streamSimple: () => {
         modelRequestsAfterAbort++;
-        return {
+        return resultStream({
           role: "assistant",
           content: [{ type: "toolCall", id: "only", name: "only", arguments: {} }],
           stopReason: "toolUse",
           timestamp: Date.now(),
-        };
+        });
       },
     } as never,
     registryModel as never,
@@ -494,7 +500,7 @@ try {
       getAll: () => [executorModel],
       getAvailable: () => availableModels,
       hasConfiguredAuth: () => true,
-      complete: (model: unknown, completeContext: unknown, options: { signal?: AbortSignal }) => completeImpl(model, completeContext, options),
+      streamSimple: (model: unknown, completeContext: unknown, options: { signal?: AbortSignal }) => resultStream(completeImpl(model, completeContext, options)),
     },
     sessionManager: { getBranch: () => [], getSessionId: () => undefined },
   };
@@ -811,6 +817,37 @@ await sessionStartHandlers[0]?.({}, {
   modelRegistry: { getAll: () => [], getAvailable: () => [] },
 });
 eq("fusion preserves built-in footer", [statusCall?.[0], statusCall?.[1].includes("Fusion available"), customFooterCalls], ["fusion", true, 0]);
+
+// --- 11. /fusion-thinking persists a session override ---
+const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+const thinkingBranch: unknown[] = [];
+let thinkingNotice = "";
+fusionExtension({
+  on: () => {},
+  registerTool: () => {},
+  registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => commands.set(name, command),
+  appendEntry: (customType: string, data: unknown) => thinkingBranch.push({ type: "custom", customType, data }),
+} as never);
+const thinkingModel = { provider: "test", id: "reasoner", input: ["text"], reasoning: true };
+await commands.get("fusion-thinking")!.handler("high", {
+  cwd: "/tmp",
+  mode: "tui",
+  hasUI: true,
+  ui: {
+    notify: (text: string) => { thinkingNotice = text; },
+    setStatus: () => {},
+  },
+  sessionManager: { getBranch: () => thinkingBranch },
+  isProjectTrusted: () => false,
+  model: thinkingModel,
+  modelRegistry: {
+    getAll: () => [thinkingModel],
+    getAvailable: () => [thinkingModel],
+    hasConfiguredAuth: () => true,
+  },
+});
+const thinkingEntry = thinkingBranch.at(-1) as { customType: string; data: { thinkingLevel: string } };
+eq("fusion thinking command", [thinkingEntry.customType, thinkingEntry.data.thinkingLevel, thinkingNotice], ["fusion-thinking", "high", "Fusion thinking: high (session override)"]);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

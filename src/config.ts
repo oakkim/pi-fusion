@@ -3,6 +3,7 @@
  * Reads .pi/fusion.json (trusted projects) then global agent dir fallback.
  */
 
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -22,6 +23,7 @@ export const TOOL_OUTPUT_MAX_BYTES = 12_000;
 
 const TOOL_NAMES = ["read", "grep", "find", "ls", "bash", "edit", "write"] as const;
 const TOOL_MODES = ["none", "readonly", "all"] as const;
+export const FUSION_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
 
 export function loadConfig(cwd: string, projectTrusted: boolean): FusionConfig {
   const paths: string[] = [];
@@ -54,6 +56,7 @@ function normalizeConfig(raw: unknown): FusionConfig {
   if (typeof input.temperature === "number" && input.temperature >= 0 && input.temperature <= 2) {
     out.temperature = input.temperature;
   }
+  if (isFusionThinkingLevel(input.thinkingLevel)) out.thinkingLevel = input.thinkingLevel;
   if (typeof input.executorToolsConsent === "boolean") out.executorToolsConsent = input.executorToolsConsent;
   if (typeof input.maxHistoryMessages === "number" && input.maxHistoryMessages >= 4) {
     out.maxHistoryMessages = Math.min(200, Math.floor(input.maxHistoryMessages));
@@ -67,6 +70,10 @@ function normalizeConfig(raw: unknown): FusionConfig {
     out.leadMutations = input.leadMutations;
   }
   return out;
+}
+
+export function isFusionThinkingLevel(value: unknown): value is ModelThinkingLevel {
+  return typeof value === "string" && (FUSION_THINKING_LEVELS as readonly string[]).includes(value);
 }
 
 function normalizeStringList(value: unknown): string[] | undefined {
@@ -109,12 +116,21 @@ export interface ExecutorOverride {
   auto?: boolean;
 }
 
+export interface ThinkingOverride {
+  thinkingLevel?: ModelThinkingLevel;
+}
+
 /** Pure overlay: session override wins over file config (unit-tested). */
 export function applyOverride(base: FusionConfig, override: ExecutorOverride | undefined): FusionConfig {
   if (!override) return base;
   if (override.auto) return { ...base, executor: undefined };
   if (override.executor) return { ...base, executor: override.executor };
   return base;
+}
+
+export function applyThinkingOverride(base: FusionConfig, override: ThinkingOverride | undefined): FusionConfig {
+  if (!override?.thinkingLevel) return base;
+  return { ...base, thinkingLevel: override.thinkingLevel };
 }
 
 export function applyDefaults(config: FusionConfig): ResolvedFusionConfig {
@@ -125,6 +141,7 @@ export function applyDefaults(config: FusionConfig): ResolvedFusionConfig {
     maxToolCalls: n.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS,
     maxExecutorOutputTokens: n.maxExecutorOutputTokens ?? DEFAULT_MAX_TOKENS,
     temperature: n.temperature ?? DEFAULT_TEMPERATURE,
+    thinkingLevel: n.thinkingLevel ?? "off",
     executorToolsConsent: n.executorToolsConsent ?? false,
     maxHistoryMessages: n.maxHistoryMessages ?? DEFAULT_MAX_HISTORY,
     fallbackExecutors: n.fallbackExecutors ?? [],

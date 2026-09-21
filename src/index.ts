@@ -10,9 +10,19 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
-import { applyDefaults, applyOverride, loadConfig, type ExecutorOverride } from "./config.ts";
+import {
+  applyDefaults,
+  applyOverride,
+  applyThinkingOverride,
+  FUSION_THINKING_LEVELS,
+  isFusionThinkingLevel,
+  loadConfig,
+  type ExecutorOverride,
+  type ThinkingOverride,
+} from "./config.ts";
 import { buildRecentContext } from "./utils.ts";
 import { SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
 import { getTextContent, runExecutorTurn } from "./llm.ts";
@@ -132,9 +142,34 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /** Effective config: session override (/fusion-model) wins over fusion.json. */
+  function restoreThinkingOverride(ctx: ExtensionContext): ThinkingOverride | undefined {
+    try {
+      const branch = ctx.sessionManager.getBranch() as unknown[];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const e = branch[i] as { type?: unknown; customType?: unknown; data?: unknown };
+        if (e?.type === "custom" && e?.customType === "fusion-thinking" && e.data && typeof e.data === "object") {
+          const thinkingLevel = (e.data as { thinkingLevel?: unknown }).thinkingLevel;
+          return isFusionThinkingLevel(thinkingLevel) ? { thinkingLevel } : {};
+        }
+      }
+    } catch {
+      // fall through
+    }
+    return undefined;
+  }
+
+  function persistThinkingOverride(override: ThinkingOverride): void {
+    try {
+      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-thinking", { ...override, timestamp: Date.now() });
+    } catch {
+      // journal is best-effort
+    }
+  }
+
+  /** Session command overrides win over fusion.json. */
   function effectiveConfig(ctx: ExtensionContext) {
-    return applyDefaults(applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx)));
+    const modelConfig = applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx));
+    return applyDefaults(applyThinkingOverride(modelConfig, restoreThinkingOverride(ctx)));
   }
 
   function refreshStatus(ctx: ExtensionContext): void {
@@ -142,9 +177,11 @@ export default function (pi: ExtensionAPI) {
       if (!ctx.hasUI) return;
       const mode = restoreMode(ctx);
       const warnings: string[] = [];
-      const resolved = resolveExecutorModel(ctx.modelRegistry, ctx.model, effectiveConfig(ctx).executor, warnings);
+      const cfg = effectiveConfig(ctx);
+      const resolved = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
       const execLabel = resolved ? modelDisplay(resolved) : "unset";
-      ctx.ui.setStatus("fusion", `${modeLabel(mode)} • executor ${execLabel}`);
+      const thinkingLevel = resolved ? clampThinkingLevel(resolved, cfg.thinkingLevel) : "off";
+      ctx.ui.setStatus("fusion", `${modeLabel(mode)} • executor ${execLabel} • thinking ${thinkingLevel}`);
     } catch {
       // status is cosmetic
     }
@@ -266,12 +303,13 @@ export default function (pi: ExtensionAPI) {
     // compaction boundaries: a failing cheap model burns more than a cache miss.
     const rung = rungFor(worker.failures, ladder.length);
     const executor = ladder[rung]!;
+    const thinkingLevel = clampThinkingLevel(executor, cfg.thinkingLevel);
 
     const execCwd = worker.worktree ? execDirOf(worker.worktree) : ctx.cwd;
     const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
 
     onUpdate?.({
-      content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
+      content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | thinking ${thinkingLevel} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
       details: { phase: "executing", workerId, turnId },
     });
 
@@ -288,6 +326,7 @@ export default function (pi: ExtensionAPI) {
         toolDefs,
         clampMaxToolCalls(cfg.maxToolCalls),
         ctx,
+        thinkingLevel,
       );
     };
 
@@ -317,6 +356,7 @@ export default function (pi: ExtensionAPI) {
           turn_id: turnId,
           generation: turn.generation,
           executor: modelDisplay(executor),
+          thinking_level: thinkingLevel,
           rung,
           usage: result.usage,
           turns: result.turns,
@@ -326,7 +366,7 @@ export default function (pi: ExtensionAPI) {
       } catch {
         // cost journal is best-effort
       }
-      const header = `[fusion ${worker.id} | turn ${turnId} | generation ${turn.generation} | executor ${modelDisplay(executor)}${rung > 0 ? ` (escalated rung ${rung})` : ""}]`;
+      const header = `[fusion ${worker.id} | turn ${turnId} | generation ${turn.generation} | executor ${modelDisplay(executor)} | thinking ${thinkingLevel}${rung > 0 ? ` | escalated rung ${rung}` : ""}]`;
       return {
         text: `${header}\n\n${output}`,
         details: {
@@ -335,6 +375,7 @@ export default function (pi: ExtensionAPI) {
           turn_id: turnId,
           generation: turn.generation,
           executor_model: modelDisplay(executor),
+          thinking_level: thinkingLevel,
           rung,
           escalated: rung > 0,
           ladder: ladder.map(modelDisplay),
@@ -656,6 +697,71 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("fusion-thinking", {
+    description: "Set sidekick thinking: /fusion-thinking [off|minimal|low|medium|high|xhigh|max|clear]",
+    getArgumentCompletions: (prefix) => {
+      const normalized = prefix.trim().toLowerCase();
+      const values = [...FUSION_THINKING_LEVELS, "clear"];
+      const matches = values.filter((value) => value.startsWith(normalized)).map((value) => ({ value, label: value }));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const tell = (text: string, level: "info" | "warning" | "error" = "info") => {
+        if (ctx.mode === "print") console.log(text);
+        else ctx.ui.notify(text, level);
+      };
+      const cfg = effectiveConfig(ctx);
+      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+      const warnings: string[] = [];
+      const executor = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
+      const availableLevels = executor ? getSupportedThinkingLevels(executor) : ["off" as const];
+      const currentLevel = executor ? clampThinkingLevel(executor, cfg.thinkingLevel) : "off";
+      const arg = args.trim().toLowerCase();
+
+      const apply = (override: ThinkingOverride, requestedLevel: typeof cfg.thinkingLevel, source: string) => {
+        persistThinkingOverride(override);
+        const level = executor ? clampThinkingLevel(executor, requestedLevel) : "off";
+        refreshStatus(ctx);
+        tell(`Fusion thinking: ${level} (${source})`);
+      };
+
+      if (!arg) {
+        if (!ctx.hasUI) {
+          const override = restoreThinkingOverride(ctx);
+          const source = override?.thinkingLevel ? "session override" : fileConfig.thinkingLevel ? "config file" : "default";
+          tell(`Fusion thinking: ${currentLevel} (${source})\nUsage: /fusion-thinking <${availableLevels.join("|")}> | clear`);
+          return;
+        }
+        const choice = await ctx.ui.select(`Fusion executor thinking (current: ${currentLevel}):`, [
+          `default (${fileConfig.thinkingLevel ?? "off"})`,
+          ...availableLevels,
+        ]);
+        if (!choice) {
+          tell("Fusion thinking unchanged", "warning");
+          return;
+        }
+        if (choice.startsWith("default")) {
+          const configured = fileConfig.thinkingLevel ?? "off";
+          apply({}, configured, "config/default");
+          return;
+        }
+        if (isFusionThinkingLevel(choice)) apply({ thinkingLevel: choice }, choice, "session override");
+        return;
+      }
+
+      if (arg === "clear" || arg === "default") {
+        const configured = fileConfig.thinkingLevel ?? "off";
+        apply({}, configured, "config/default");
+        return;
+      }
+      if (!isFusionThinkingLevel(arg) || !availableLevels.includes(arg)) {
+        tell(`Unknown or unsupported thinking level \"${args.trim()}\". Available levels: ${availableLevels.join(", ")}.`, "error");
+        return;
+      }
+      apply({ thinkingLevel: arg }, arg, "session override");
+    },
+  });
+
   pi.registerCommand("fusion-status", {
     description: "List persistent sidekick workers (id, status, generation, history size)",
     handler: async (_args, ctx) => {
@@ -663,7 +769,8 @@ export default function (pi: ExtensionAPI) {
       const cfg = effectiveConfig(ctx);
       const warnings: string[] = [];
       const exec = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
-      const head = `${modeLabel(restoreMode(ctx))} • executor ${exec ? modelDisplay(exec) : "unset"}${cfg.fallbackExecutors.length ? ` • fallbacks ${cfg.fallbackExecutors.join(",")}` : ""}`;
+      const thinkingLevel = exec ? clampThinkingLevel(exec, cfg.thinkingLevel) : "off";
+      const head = `${modeLabel(restoreMode(ctx))} • executor ${exec ? modelDisplay(exec) : "unset"} • thinking ${thinkingLevel}${cfg.fallbackExecutors.length ? ` • fallbacks ${cfg.fallbackExecutors.join(",")}` : ""}`;
       const body = workers.length
         ? workers.map((w) => `${w.id} [${w.status}] g${w.generation} msgs=${w.history.length}${w.worktree ? ` wt=${w.worktree.name}:${w.worktree.branch}` : ""} ${w.label ?? ""} (${w.executorModelId})`).join("\n")
         : "No fusion workers yet. The lead can spawn one with fusion_spawn.";

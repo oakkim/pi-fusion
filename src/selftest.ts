@@ -1,5 +1,6 @@
 /** v0 self-test: no LLM calls. Verifies the persistence core. */
 import { WorkerRuntime } from "../src/runtime.ts";
+import { InquiryRuntime } from "../src/inquiry.ts";
 import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
@@ -88,6 +89,24 @@ eq("restore aborts active controllers", oldController.signal.aborted, true);
 eq("restore removes old branch workers", rtRestore.getWorker(old.worker.id), undefined);
 eq("restore keeps closed worker", rtRestore.getWorker("wrk_restored")?.status, "closed");
 eq("restore keeps turn and interrupts running", rtRestore.getTurn("trn_restored")?.status, "interrupted");
+
+// --- 1b. read-only inquiry threads stay separate from worker history ---
+const inquiryRuntime = new InquiryRuntime();
+const inquiryThread = inquiryRuntime.create(worker.id);
+const inquiryQuestion = { role: "user", content: "what are you doing?", timestamp: 20 } as never;
+const inquiryTurn = inquiryRuntime.start(inquiryThread.id, inquiryQuestion, { workerGeneration: 5, workerTurnId: "trn_live", capturedAt: 21 });
+eq("inquiry ids and snapshot", [inquiryThread.id.startsWith("inq_"), inquiryTurn.id.startsWith("iqt_"), inquiryTurn.workerGeneration, inquiryTurn.workerTurnId], [true, true, 5, "trn_live"]);
+let inquiryBusyError = "";
+try { inquiryRuntime.start(inquiryThread.id, inquiryQuestion, { workerGeneration: 5, workerTurnId: "trn_live" }); }
+catch (err) { inquiryBusyError = err instanceof Error ? err.message : String(err); }
+eq("inquiry rejects overlapping question", inquiryBusyError.includes("busy"), true);
+inquiryRuntime.finish(inquiryTurn.id, "editing the status line", { role: "assistant", content: "editing the status line", timestamp: 22 } as never);
+eq("inquiry history is sidecar only", [inquiryThread.history.length, worker.history.includes(inquiryQuestion), inquiryThread.activeTurnId], [2, false, null]);
+const inquiryNext = inquiryRuntime.start(inquiryThread.id, { role: "user", content: "what remains?", timestamp: 23 } as never, { workerGeneration: 6, workerTurnId: null });
+const inquirySnapshot = inquiryRuntime.snapshot(inquiryThread.id)[0]!;
+const restoredInquiries = new InquiryRuntime();
+restoredInquiries.restore([{ type: "custom", customType: "fusion-inquiry", data: inquirySnapshot }]);
+eq("inquiry restore interrupts active side query", [restoredInquiries.getThread(inquiryThread.id)?.activeTurnId, restoredInquiries.getTurn(inquiryNext.id)?.status, restoredInquiries.getThread(inquiryThread.id)?.history.length], [null, "interrupted", 2]);
 
 // --- 2. independent compaction ---
 const rt2 = new WorkerRuntime();
@@ -607,7 +626,7 @@ try {
   let confirmImpl: () => Promise<boolean> = async () => true;
   let completeImpl: (_model: unknown, _context: unknown, options: { signal?: AbortSignal }) => Promise<any> = async () => ({
     role: "assistant",
-    content: [{ type: "text", text: "done" }],
+    content: [{ type: "thinking", thinking: "private worker reasoning" }, { type: "text", text: "done" }],
     stopReason: "stop",
     timestamp: Date.now(),
   });
@@ -633,6 +652,7 @@ try {
   await lifecycleHandlers.get("session_start")?.({}, context);
   const spawn = registered.get("fusion_spawn")!;
   const followup = registered.get("fusion_followup")!;
+  const ask = registered.get("fusion_ask")!;
   const status = registered.get("fusion_status")!;
   const interrupt = registered.get("fusion_interrupt")!;
   const readStatus = async (id: string) => {
@@ -788,7 +808,21 @@ try {
   let executorSignal: AbortSignal | undefined;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
-  completeImpl = async (_model, _completeContext, options) => {
+  const inquiryContexts: string[] = [];
+  completeImpl = async (_model, completeContext, options) => {
+    const serializedContext = JSON.stringify(completeContext);
+    if (serializedContext.includes("read-only sidecar observer")) {
+      inquiryContexts.push(serializedContext);
+      return {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "private inquiry reasoning" },
+          { type: "text", text: "The worker is waiting in its active turn." },
+        ],
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+    }
     executorSignal = options.signal;
     return new Promise((_resolve, reject) => {
       if (!executorSignal) {
@@ -807,6 +841,58 @@ try {
   await started;
   await new Promise((resolve) => setTimeout(resolve, 80));
   eq("background activity uses status line without auto-opening pane", [customCalls, fusionStatusLine.includes("status-test"), fusionStatusLine.includes("waiting")], [0, true, true]);
+
+  const workerBeforeInquiry = await readStatus(deferredWorkerId);
+  const inquiryAccepted = await ask.execute(
+    "ask-active",
+    { worker_id: deferredWorkerId, question: "What is the worker doing?" },
+    undefined,
+    undefined,
+    context,
+  );
+  const inquiryId = inquiryAccepted.details.inquiry_id as string;
+  const inquiryTurnId = inquiryAccepted.details.inquiry_turn_id as string;
+  const completedInquiry = await waitForStatus(inquiryTurnId, "completed");
+  const workerAfterInquiry = await readStatus(deferredWorkerId);
+  const inquiryCompletion = completionMessages.find((item) => item.message.details?.inquiry_turn_id === inquiryTurnId);
+  eq("Lead can ask active worker without affecting it", [
+    inquiryAccepted.details.status,
+    inquiryId.startsWith("inq_"),
+    inquiryTurnId.startsWith("iqt_"),
+    completedInquiry.answer,
+    workerAfterInquiry.active_turn,
+    workerAfterInquiry.generation,
+    workerAfterInquiry.history_messages,
+    inquiryAccepted.details.worker_remembers_inquiry,
+    executorSignal?.aborted,
+    inquiryCompletion?.message.customType,
+    inquiryCompletion?.message.details?.worker_remembers_inquiry,
+    inquiryCompletion?.message.content.includes("will not remember this inquiry"),
+  ], ["running", true, true, "The worker is waiting in its active turn.", workerBeforeInquiry.active_turn, workerBeforeInquiry.generation, workerBeforeInquiry.history_messages, false, false, "fusion-inquiry-result", false, true]);
+  eq("inquiry receives safe public snapshot", [
+    inquiryContexts[0]?.includes("What is the worker doing?"),
+    inquiryContexts[0]?.includes("private_thinking_available"),
+    inquiryContexts[0]?.includes("private worker reasoning"),
+    inquiryContexts[0]?.includes("private inquiry reasoning"),
+  ], [true, true, false, false]);
+
+  const inquiryFollowup = await ask.execute(
+    "ask-followup",
+    { thread_id: inquiryId, question: "What remains?" },
+    undefined,
+    undefined,
+    context,
+  );
+  await waitForStatus(inquiryFollowup.details.inquiry_turn_id as string, "completed");
+  const inquiryThreadStatus = await readStatus(inquiryId);
+  eq("inquiry thread keeps separate chat context", [
+    inquiryFollowup.details.inquiry_id,
+    inquiryThreadStatus.history_messages,
+    inquiryThreadStatus.worker_remembers_inquiry,
+    inquiryContexts[1]?.includes("The worker is waiting in its active turn."),
+    inquiryContexts[1]?.includes("private inquiry reasoning"),
+  ], [inquiryId, 4, false, true, false]);
+
   hostController.abort();
   await new Promise((resolve) => setTimeout(resolve, 10));
   const detachedTurn = await readStatus(deferredTurnId);

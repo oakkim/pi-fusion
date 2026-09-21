@@ -4,7 +4,8 @@
  * Tools (planner calls these; executor never sees them):
  * - fusion_spawn   : start a persistent worker turn asynchronously (wrk_... + trn_...)
  * - fusion_followup: continue the SAME worker; queue or interrupt when it is busy
- * - fusion_status  : inspect worker or turn without blocking
+ * - fusion_ask     : ask a read-only sidecar rooted in a worker's context
+ * - fusion_status  : inspect worker, turn, inquiry, or inquiry turn without blocking
  * - fusion_interrupt: stop the active turn, keep the worker (no failure recorded)
  * - fusion_close   : retire a worker (interrupts active turn)
  */
@@ -26,12 +27,13 @@ import {
   type ThinkingOverride,
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
-import { SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
+import { SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
 import { FusionPaneController, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
 import { getTextContent, runExecutorTurn } from "./llm.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
 import { WorkerRuntime, type WorkerRecord } from "./runtime.ts";
+import { InquiryRuntime, type InquiryThread, type InquiryTurn } from "./inquiry.ts";
 import { fusionArgumentCompletions, isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, parseFusionCommand, type FusionMode } from "./mode.ts";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree } from "./worktree.ts";
 
@@ -67,8 +69,14 @@ const FollowupParams = Type.Object({
   when_busy: Type.Optional(FollowupBusyStrategy),
 });
 
+const AskParams = Type.Object({
+  question: Type.String({ description: "Question about the worker's observable context or current activity." }),
+  worker_id: Type.Optional(Type.String({ description: "Worker ID for a new side inquiry (wrk_...)." })),
+  thread_id: Type.Optional(Type.String({ description: "Existing inquiry thread ID (inq_...) for a follow-up question." })),
+});
+
 const StatusParams = Type.Object({
-  id: Type.String({ description: "Worker ID (wrk_...) or Turn ID (trn_...)." }),
+  id: Type.String({ description: "Worker/turn/inquiry ID (wrk_..., trn_..., inq_..., or iqt_...)." }),
 });
 
 const CloseParams = Type.Object({
@@ -108,6 +116,21 @@ function runSerialized<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T
 
 function userMsg(text: string): Message {
   return { role: "user", content: text, timestamp: Date.now() } as Message;
+}
+
+function inquirySafeMessages(messages: Message[]): Message[] {
+  return messages.map((message) => {
+    const value = message as unknown as { role?: string; content?: unknown; thinking?: unknown; [key: string]: unknown };
+    if (value.role !== "assistant") return message;
+    const clone = { ...value };
+    if (Array.isArray(value.content)) {
+      clone.content = value.content.filter((part) => {
+        return !part || typeof part !== "object" || (part as { type?: unknown }).type !== "thinking";
+      });
+    }
+    delete clone.thinking;
+    return clone as unknown as Message;
+  });
 }
 
 function statusText(value: string): string {
@@ -222,7 +245,9 @@ export function formatLiveStatusAction(activity: LiveActivity | undefined): stri
 
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
+  const inquiries = new InquiryRuntime();
   const backgroundTurns = new Map<string, Promise<void>>();
+  const backgroundInquiries = new Map<string, Promise<void>>();
   const pendingFollowups = new Map<string, PendingFollowup[]>();
   let activeContext: ExtensionContext | undefined;
   let sessionActive = true;
@@ -421,15 +446,18 @@ export default function (pi: ExtensionAPI) {
 
   function restoreRuntime(ctx: ExtensionContext): void {
     try {
-      runtime.restore(ctx.sessionManager.getBranch() as unknown[]);
+      const branch = ctx.sessionManager.getBranch() as unknown[];
+      runtime.restore(branch);
+      inquiries.restore(branch);
     } catch {
-      // restore is best-effort; a fresh runtime is fine
+      // restore is best-effort; fresh runtimes are fine
     }
   }
 
   async function stopBackgroundTurns(): Promise<void> {
     runtime.interruptAll();
-    const pending = [...backgroundTurns.values()];
+    inquiries.interruptAll();
+    const pending = [...backgroundTurns.values(), ...backgroundInquiries.values()];
     if (pending.length === 0) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([
@@ -517,6 +545,17 @@ export default function (pi: ExtensionAPI) {
     if (!snapshot) return;
     try {
       (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-worker", snapshot);
+    } catch {
+      // journal is best-effort
+    }
+    void ctx;
+  }
+
+  function persistInquiry(ctx: ExtensionContext, inquiryId: string): void {
+    const snapshot = inquiries.snapshot(inquiryId)[0];
+    if (!snapshot) return;
+    try {
+      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-inquiry", snapshot);
     } catch {
       // journal is best-effort
     }
@@ -808,6 +847,234 @@ export default function (pi: ExtensionAPI) {
     void task.then(() => backgroundTurns.delete(turnId));
   }
 
+  function inquiryObservation(worker: WorkerRecord, capturedAt: number): string {
+    const activity = pane.getLive(worker.id);
+    const queued = pendingFollowups.get(worker.id) ?? [];
+    return JSON.stringify({
+      captured_at: new Date(capturedAt).toISOString(),
+      private_thinking_available: false,
+      worker: {
+        id: worker.id,
+        label: worker.label,
+        status: worker.status,
+        generation: worker.generation,
+        active_turn: worker.activeTurnId,
+        history_messages: worker.history.length,
+        worktree: worker.worktree ? { branch: worker.worktree.branch, path: worker.worktree.path } : undefined,
+      },
+      live: activity ? {
+        phase: activity.phase,
+        elapsed_ms: Math.max(0, capturedAt - activity.startedAt),
+        visible_response: activity.text.slice(-4_000),
+        tools: activity.tools.slice(-8).map((tool) => ({
+          name: tool.name,
+          status: tool.status,
+          arguments: tool.arguments.slice(0, 2_000),
+          output: tool.output.slice(-2_000),
+        })),
+      } : null,
+      queued_followups: queued.map((item) => ({
+        queue_id: item.id,
+        strategy: item.strategy,
+        message: item.message.slice(0, 2_000),
+      })),
+    }, null, 2);
+  }
+
+  function deliverInquiryResult(
+    ctx: ExtensionContext,
+    thread: InquiryThread,
+    turn: InquiryTurn,
+    epoch: number,
+    answer: string,
+    status: "completed" | "failed" | "interrupted",
+    stale: boolean,
+  ): void {
+    if (!sessionActive || sessionEpoch !== epoch) return;
+    const content = [
+      `Fusion inquiry finished (${status}): ${thread.id} / ${turn.id} for ${thread.workerId}.`,
+      `This was a read-only context snapshot and did not alter the worker. The worker did not see and will not remember this inquiry; use fusion_followup separately if its work must change.${stale ? " The worker advanced after the snapshot; ask again for a fresh view." : ""}`,
+      "",
+      answer,
+    ].join("\n");
+    try {
+      pi.sendMessage({
+        customType: "fusion-inquiry-result",
+        content,
+        display: true,
+        details: {
+          inquiry_id: thread.id,
+          inquiry_turn_id: turn.id,
+          worker_id: thread.workerId,
+          status,
+          stale,
+          worker_remembers_inquiry: false,
+          captured_at: turn.capturedAt,
+        },
+      }, { deliverAs: "followUp", triggerTurn: true });
+    } catch {
+      // The extension runtime may have been invalidated during session replacement.
+    }
+    try {
+      if (ctx.hasUI) ctx.ui.notify(`Fusion inquiry ${thread.id} ${status}`, status === "failed" ? "error" : "info");
+    } catch {
+      // Cosmetic only.
+    }
+  }
+
+  function launchInquiry(
+    ctx: ExtensionContext,
+    thread: InquiryThread,
+    turn: InquiryTurn,
+    executorId: string,
+    messages: Message[],
+    workerHistoryLength: number,
+  ): void {
+    const epoch = sessionEpoch;
+    const controller = new AbortController();
+    inquiries.trackController(turn.id, controller);
+    const task = (async () => {
+      const executor = resolveModelIdentifier(ctx.modelRegistry, executorId);
+      if (!executor || !executor.input.includes("text") || !ctx.modelRegistry.hasConfiguredAuth(executor)) {
+        const error = `Inquiry executor ${executorId} is unavailable.`;
+        inquiries.fail(turn.id, error);
+        if (sessionActive && sessionEpoch === epoch) persistInquiry(ctx, thread.id);
+        deliverInquiryResult(ctx, thread, turn, epoch, error, "failed", false);
+        inquiries.untrackController(turn.id);
+        return;
+      }
+      try {
+        const cfg = effectiveConfig(ctx);
+        const thinkingLevel = clampThinkingLevel(executor, cfg.thinkingLevel);
+        const result = await runExecutorTurn(
+          ctx.modelRegistry,
+          executor,
+          SIDEKICK_INQUIRY_SYSTEM_PROMPT,
+          messages,
+          cfg.maxExecutorOutputTokens,
+          cfg.temperature,
+          controller.signal,
+          [],
+          1,
+          ctx,
+          thinkingLevel,
+        );
+        controller.signal.throwIfAborted();
+        const answer = getTextContent(result.message).trim() || "No visible answer was returned.";
+        const visibleAssistant = { ...result.message, content: [{ type: "text" as const, text: answer }] } as Message;
+        if (!inquiries.finish(turn.id, answer, visibleAssistant)) return;
+        const currentWorker = runtime.getWorker(thread.workerId);
+        const stale = !currentWorker
+          || currentWorker.generation !== turn.workerGeneration
+          || currentWorker.activeTurnId !== turn.workerTurnId
+          || currentWorker.history.length !== workerHistoryLength;
+        if (sessionActive && sessionEpoch === epoch) persistInquiry(ctx, thread.id);
+        try {
+          (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-inquiry-cost", {
+            inquiry_id: thread.id,
+            inquiry_turn_id: turn.id,
+            worker_id: thread.workerId,
+            executor: modelDisplay(executor),
+            thinking_level: thinkingLevel,
+            usage: result.usage,
+            turns: result.turns,
+            timestamp: Date.now(),
+          });
+        } catch {
+          // Cost journal is best-effort.
+        }
+        deliverInquiryResult(ctx, thread, turn, epoch, answer, "completed", stale);
+      } catch (err) {
+        const current = inquiries.getTurn(turn.id);
+        if (controller.signal.aborted || current?.status === "interrupted") {
+          if (current?.status === "running") inquiries.interrupt(thread.id);
+          if (sessionActive && sessionEpoch === epoch) persistInquiry(ctx, thread.id);
+          deliverInquiryResult(ctx, thread, turn, epoch, "Inquiry interrupted.", "interrupted", true);
+          return;
+        }
+        const error = err instanceof Error ? err.message : String(err);
+        inquiries.fail(turn.id, error);
+        if (sessionActive && sessionEpoch === epoch) persistInquiry(ctx, thread.id);
+        deliverInquiryResult(ctx, thread, turn, epoch, error, "failed", false);
+      } finally {
+        inquiries.untrackController(turn.id);
+      }
+    })();
+    backgroundInquiries.set(turn.id, task);
+    void task.then(
+      () => backgroundInquiries.delete(turn.id),
+      () => backgroundInquiries.delete(turn.id),
+    );
+  }
+
+  function beginInquiry(
+    ctx: ExtensionContext,
+    params: { question: string; worker_id?: string; thread_id?: string },
+  ): { ok: true; accepted: Record<string, unknown> } | { ok: false; error: string } {
+    const question = params.question.trim();
+    if (!question) return { ok: false, error: "Inquiry question must not be empty." };
+    if (!params.worker_id && !params.thread_id) {
+      return { ok: false, error: "Provide worker_id for a new inquiry or thread_id for a follow-up." };
+    }
+
+    const existingThread = params.thread_id ? inquiries.getThread(params.thread_id) : undefined;
+    if (params.thread_id && !existingThread) return { ok: false, error: `Inquiry ${params.thread_id} was not found.` };
+    if (existingThread && params.worker_id && existingThread.workerId !== params.worker_id) {
+      return { ok: false, error: `Inquiry ${existingThread.id} belongs to ${existingThread.workerId}, not ${params.worker_id}.` };
+    }
+    const workerId = existingThread?.workerId ?? params.worker_id!;
+    const worker = runtime.getWorker(workerId);
+    if (!worker) return { ok: false, error: `Worker ${workerId} was not found.` };
+    if (existingThread?.activeTurnId) {
+      return { ok: false, error: `Inquiry ${existingThread.id} is busy (turn ${existingThread.activeTurnId}).` };
+    }
+
+    const cfg = effectiveConfig(ctx);
+    const exact = resolveModelIdentifier(ctx.modelRegistry, worker.executorModelId);
+    const warnings: string[] = [];
+    const executor = exact && exact.input.includes("text") && ctx.modelRegistry.hasConfiguredAuth(exact)
+      ? exact
+      : resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
+    if (!executor) return { ok: false, error: "No authed text executor model is available for the inquiry." };
+
+    const thread = existingThread ?? inquiries.create(workerId);
+    const capturedAt = Date.now();
+    const questionMessage = userMsg(question);
+    let turn: InquiryTurn;
+    try {
+      turn = inquiries.start(thread.id, questionMessage, {
+        workerGeneration: worker.generation,
+        workerTurnId: worker.activeTurnId,
+        capturedAt,
+      });
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    const observation = inquiryObservation(worker, capturedAt);
+    const messages = [
+      ...inquirySafeMessages([...worker.history]),
+      ...inquirySafeMessages([...thread.history]),
+      userMsg(`The following JSON is a point-in-time, public observation of the worker. Private thinking is intentionally unavailable.\n\n${observation}`),
+      questionMessage,
+    ];
+    persistInquiry(ctx, thread.id);
+    launchInquiry(ctx, thread, turn, modelDisplay(executor), messages, worker.history.length);
+    const accepted = {
+      status: "running",
+      asynchronous: true,
+      inquiry_id: thread.id,
+      inquiry_turn_id: turn.id,
+      worker_id: worker.id,
+      worker_generation: turn.workerGeneration,
+      worker_turn_id: turn.workerTurnId,
+      captured_at: turn.capturedAt,
+      executor: modelDisplay(executor),
+      worker_remembers_inquiry: false,
+      message: "Read-only side inquiry continues in the background and will automatically return to the Lead. The main worker cannot see or remember this inquiry."
+    };
+    return { ok: true, accepted };
+  }
+
   pi.registerTool({
     name: "fusion_spawn",
     label: "Fusion Spawn",
@@ -999,9 +1266,40 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "fusion_ask",
+    label: "Fusion Ask",
+    description: [
+      "Open a read-only side inquiry over a Fusion worker's context without interrupting its work.",
+      "Use worker_id to create an inquiry thread, then thread_id for follow-up questions in the separate side chat.",
+      "The inquiry sees completed worker history plus bounded visible live telemetry, but never private thinking.",
+      "The main worker cannot see or remember inquiry questions or answers; use fusion_followup separately to change its work.",
+      "Returns immediately and hands the answer back to the Lead when ready.",
+    ].join(" "),
+    promptGuidelines: [
+      "Use fusion_ask when the user asks what an active worker is doing, why an observable action occurred, or what remains, without steering or interrupting it.",
+      "Treat inquiry answers as read-only snapshot evidence. The worker does not see or remember them, and private reasoning is unavailable.",
+      "If an inquiry reveals that work must change, send a separate fusion_followup (queue by default or interrupt only when necessary).",
+      "Continue a side conversation with thread_id; do not create a new inquiry thread for every follow-up question.",
+    ],
+    parameters: AskParams,
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      signal?.throwIfAborted();
+      const result = beginInquiry(ctx, params);
+      if (!result.ok) {
+        return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: result.error }, null, 2) }], details: { status: "error", error: result.error } };
+      }
+      onUpdate?.({
+        content: [{ type: "text", text: String(result.accepted.message) }],
+        details: result.accepted,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result.accepted, null, 2) }], details: result.accepted };
+    },
+  });
+
+  pi.registerTool({
     name: "fusion_status",
     label: "Fusion Status",
-    description: "Inspect a worker (wrk_...) or turn (trn_...) without blocking. Returns status, generation, history size.",
+    description: "Inspect a worker, worker turn, inquiry thread, or inquiry turn without blocking (wrk_..., trn_..., inq_..., iqt_...).",
     parameters: StatusParams,
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       if (params.id.startsWith("wrk_")) {
@@ -1033,7 +1331,47 @@ export default function (pi: ExtensionAPI) {
           details: { status: t.status },
         };
       }
-      return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Expected wrk_... or trn_...; got ${params.id}` }) }], details: { status: "error" } };
+      if (params.id.startsWith("inq_")) {
+        const thread = inquiries.getThread(params.id);
+        if (!thread) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Inquiry ${params.id} was not found.` }) }], details: { status: "error" } };
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            type: "inquiry",
+            inquiry_id: thread.id,
+            worker_id: thread.workerId,
+            status: thread.activeTurnId ? "running" : "idle",
+            active_turn: thread.activeTurnId,
+            generation: thread.generation,
+            history_messages: thread.history.length,
+            worker_remembers_inquiry: false,
+            created_at: thread.createdAt,
+            updated_at: thread.updatedAt,
+          }, null, 2) }],
+          details: { status: thread.activeTurnId ? "running" : "idle" },
+        };
+      }
+      if (params.id.startsWith("iqt_")) {
+        const turn = inquiries.getTurn(params.id);
+        if (!turn) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Inquiry turn ${params.id} was not found.` }) }], details: { status: "error" } };
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            type: "inquiry_turn",
+            inquiry_turn_id: turn.id,
+            inquiry_id: turn.inquiryId,
+            worker_id: turn.workerId,
+            status: turn.status,
+            generation: turn.generation,
+            worker_generation: turn.workerGeneration,
+            worker_turn_id: turn.workerTurnId,
+            captured_at: turn.capturedAt,
+            answer: turn.answer,
+            error: turn.error,
+            worker_remembers_inquiry: false,
+          }, null, 2) }],
+          details: { status: turn.status },
+        };
+      }
+      return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Expected wrk_..., trn_..., inq_..., or iqt_...; got ${params.id}` }) }], details: { status: "error" } };
     },
   });
 
@@ -1167,6 +1505,42 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       pi.sendUserMessage(forceFusionPrompt(parsed.prompt));
+    },
+  });
+
+  pi.registerCommand("fusion-ask", {
+    description: "Ask a read-only side chat: /fusion-ask <wrk_...|inq_...> <question>",
+    getArgumentCompletions: (prefix) => {
+      if (/\s/.test(prefix)) return null;
+      const normalized = prefix.trim().toLowerCase();
+      const values = [...runtime.list().map((worker) => worker.id), ...inquiries.list().map((thread) => thread.id)];
+      const matches = values.filter((value) => value.toLowerCase().startsWith(normalized)).map((value) => ({ value, label: value }));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const tell = (text: string, level: "info" | "error" = "info") => {
+        if (ctx.mode === "print") console.log(text);
+        else ctx.ui.notify(text, level);
+      };
+      const match = args.trim().match(/^(\S+)\s+([\s\S]+)$/);
+      if (!match) {
+        tell("Usage: /fusion-ask <wrk_...|inq_...> <question>", "error");
+        return;
+      }
+      if (ctx.mode === "print") {
+        tell("/fusion-ask requires an interactive session so its asynchronous answer can be delivered.", "error");
+        return;
+      }
+      const [, target, question] = match;
+      const result = beginInquiry(ctx, {
+        question: question!,
+        ...(target!.startsWith("inq_") ? { thread_id: target } : { worker_id: target }),
+      });
+      if (!result.ok) {
+        tell(result.error, "error");
+        return;
+      }
+      tell(`Fusion inquiry ${String(result.accepted.inquiry_id)} started. The worker will not see or remember this side chat.`);
     },
   });
 
@@ -1430,9 +1804,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("fusion-status", {
-    description: "List persistent sidekick workers (id, status, generation, history size)",
+    description: "List persistent sidekick workers and read-only inquiry threads",
     handler: async (_args, ctx) => {
       const workers = runtime.list();
+      const inquiryThreads = inquiries.list();
       const cfg = effectiveConfig(ctx);
       const warnings: string[] = [];
       const exec = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
@@ -1441,7 +1816,10 @@ export default function (pi: ExtensionAPI) {
       const body = workers.length
         ? workers.map((w) => `${w.id} [${w.status}] g${w.generation} msgs=${w.history.length}${w.worktree ? ` wt=${w.worktree.name}:${w.worktree.branch}` : ""} ${w.label ?? ""} (${w.executorModelId})`).join("\n")
         : "No fusion workers yet. The lead can spawn one with fusion_spawn.";
-      const text = `${head}\n${body}`;
+      const inquiryBody = inquiryThreads.length
+        ? `\nInquiries (worker does not remember these):\n${inquiryThreads.map((thread) => `${thread.id} [${thread.activeTurnId ? "running" : "idle"}] worker=${thread.workerId} g${thread.generation} msgs=${thread.history.length}`).join("\n")}`
+        : "";
+      const text = `${head}\n${body}${inquiryBody}`;
       if (ctx.mode === "print") console.log(text);
       else ctx.ui.notify(text, "info");
     },

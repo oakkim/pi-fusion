@@ -21,7 +21,9 @@ Lead (your model, planner/reviewer)
   |-- fusion_spawn worktree=parser ... -> wrk_def (isolated checkout pi-fusion/parser)
   |-- fusion_followup wrk_def ...   -> same worktree
   |-- fusion_merge wrk_def          -> commit + merge branch into project
-  |-- fusion_status wrk_abc | trn_1
+  |-- fusion_ask wrk_abc "what are you doing?" -> inq_1, iqt_1 (read-only side chat)
+  |-- fusion_ask inq_1 "what remains?"         -> same inquiry thread
+  |-- fusion_status wrk_abc | trn_1 | inq_1 | iqt_1
   |-- fusion_close wrk_abc [remove]  -> retire; remove=true deletes checkout+branch
   +-- /fusion-status (list workers)
 ```
@@ -30,7 +32,7 @@ Lead (your model, planner/reviewer)
 - Spawn and follow-up return IDs immediately, so the Lead and user can keep talking while the worker runs. Follow-ups append to the same history with bumped `generation` (`<fusion_handoff generation="N">`).
 - Independent compaction per worker (`maxHistoryMessages`, default 40; keeps first + last N-1) with routing reconsidered at that boundary.
 - Mutating tools (bash/edit/write) require trusted project + consent, and mutating runs are serialized — same fail-closed posture as pi-devin-fusion.
-- Session journal: worker snapshots are appended as `fusion-worker` custom entries and restored on `session_start` (best-effort durable across `/resume`).
+- Session journal: worker and inquiry snapshots are appended as `fusion-worker` / `fusion-inquiry` custom entries and restored on `session_start` (best-effort durable across `/resume`).
 
 ## Worktrees (v0.2)
 
@@ -151,8 +153,33 @@ When the worker finishes, pi-fusion shows a TUI notification and hands a small
 waits behind the active turn without interrupting it; if idle, it starts a Lead
 turn immediately. This preserves the brief -> result -> review/feedback loop
 without blocking conversation or encouraging status polling. Session switch,
-reload, and shutdown interrupt active background workers and wait briefly for
-cleanup.
+reload, and shutdown interrupt active background workers and inquiries, then
+wait briefly for cleanup.
+
+## Read-only worker inquiries (v0.13)
+
+The Lead can ask what a worker is doing without steering or interrupting it:
+
+```text
+fusion_ask { worker_id: "wrk_...", question: "What are you doing and what remains?" }
+fusion_ask { thread_id: "inq_...", question: "Why did that command fail?" }
+/fusion-ask wrk_... What are you doing?
+/fusion-ask inq_... What remains?
+```
+
+Each `inq_...` is a separate persistent side-chat thread. Every question rebases
+that thread over a point-in-time snapshot of the worker's completed history and
+bounded public live telemetry (visible response, tool names/arguments/output,
+phase, and queued follow-ups). Inquiry calls use the worker's executor model
+with no tools, run concurrently with the worker, and return asynchronously as a
+`fusion-inquiry-result`. `fusion_status` accepts both `inq_...` and `iqt_...`.
+
+**The main worker never sees or remembers inquiry questions or answers.** The
+side chat is observational only and is never merged into worker history. If the
+answer should change the work, the Lead must send a separate `fusion_followup`.
+Private thinking is stripped from the snapshot and never exposed; questions
+about unobservable intent are answered as unknown or clearly labeled inference.
+The result also reports when the worker advanced after the captured snapshot.
 
 ## Live status line (v0.11)
 

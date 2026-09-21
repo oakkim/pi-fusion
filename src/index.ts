@@ -568,7 +568,7 @@ export default function (pi: ExtensionAPI) {
           display: true,
           details: { worker_id: workerId, turn_id: turnId, status },
         },
-        { deliverAs: "nextTurn" },
+        { deliverAs: "followUp", triggerTurn: true },
       );
     } catch {
       // The extension runtime may have been invalidated during session replacement.
@@ -608,13 +608,13 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Start a PERSISTENT sidekick worker asynchronously (cheap executor, own session).",
       "Returns worker_id (wrk_...) + turn_id (trn_...) immediately while the turn continues in the background.",
-      "Completion is queued as a next-turn Fusion result; use fusion_status for an on-demand check, not a polling loop.",
+      "Completion is handed back automatically: it queues behind an active Lead turn or wakes an idle Lead. Use fusion_status for an on-demand check, not a polling loop.",
       "Use fusion_followup with the SAME worker_id for corrections — it keeps context.",
       "Pass worktree for write work: the sidekick gets an isolated checkout+branch (pi-fusion/<name>), merged later with fusion_merge.",
     ].join(" "),
     promptGuidelines: [
       "Use fusion_spawn for well-specified mechanical work: exact files, exact changes, constraints, verification to run.",
-      "fusion_spawn is non-blocking: after it returns the IDs, continue the user conversation or other Lead work. Do not busy-poll fusion_status; completion arrives as a next-turn Fusion result.",
+      "fusion_spawn is non-blocking: after it returns the IDs, continue the user conversation or other Lead work. Do not busy-poll fusion_status; completion automatically hands control back to the Lead.",
       "When the result arrives, personally inspect the actual diff and relevant code before approval; the sidekick's report is evidence, not a substitute for Lead review.",
       "Send corrections via fusion_followup on the same worker_id instead of silently rewriting delegated work.",
       "Spawn a new worker only for independent work; otherwise follow up on the existing worker.",
@@ -669,7 +669,7 @@ export default function (pi: ExtensionAPI) {
         generation: turn.generation,
         executor: worker.executorModelId,
         worktree: worker.worktree ? { name: worker.worktree.name, branch: worker.worktree.branch, path: worker.worktree.path } : undefined,
-        message: "Worker continues in the background. Continue the conversation; completion will be delivered as a next-turn Fusion result.",
+        message: "Worker continues in the background. Continue the conversation; the Lead will automatically resume when the result arrives.",
       };
       return { content: [{ type: "text", text: JSON.stringify(accepted, null, 2) }], details: accepted };
     },
@@ -681,7 +681,7 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Asynchronously continue the SAME persistent sidekick worker (wrk_...).",
       "Returns the new turn_id immediately; the worker keeps its session history and runs in the background.",
-      "Completion is queued as a next-turn Fusion result.",
+      "Completion automatically queues behind an active Lead turn or wakes an idle Lead.",
     ].join(" "),
     promptGuidelines: [
       "Prefer fusion_followup over fusion_spawn when correcting or extending a worker's previous result.",
@@ -729,7 +729,7 @@ export default function (pi: ExtensionAPI) {
         worker_id: worker.id,
         turn_id: turn.id,
         generation: turn.generation,
-        message: "Follow-up continues in the background. Continue the conversation; completion will be delivered as a next-turn Fusion result.",
+        message: "Follow-up continues in the background. Continue the conversation; the Lead will automatically resume when the result arrives.",
       };
       return { content: [{ type: "text", text: JSON.stringify(accepted, null, 2) }], details: accepted };
     },

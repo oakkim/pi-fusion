@@ -134,12 +134,14 @@ config-file consent is also loaded only from trusted projects.
 worker turn is accepted. The sidekick then runs independently from the Lead
 turn's abort signal. Use `fusion_interrupt` for explicit cancellation.
 
-When the worker finishes, pi-fusion shows a TUI notification and queues a small
-`fusion-result` custom message with the visible result for the next user turn
-(`deliverAs: "nextTurn"`). It never interrupts or triggers a Lead turn. This
-preserves the brief -> result -> feedback loop without blocking conversation or
-encouraging status polling. Session switch, reload, and shutdown interrupt
-active background workers and wait briefly for cleanup.
+When the worker finishes, pi-fusion shows a TUI notification and hands a small
+`fusion-result` custom message with the visible result back to the Lead
+(`deliverAs: "followUp", triggerTurn: true`). If the Lead is busy, the result
+waits behind the active turn without interrupting it; if idle, it starts a Lead
+turn immediately. This preserves the brief -> result -> review/feedback loop
+without blocking conversation or encouraging status polling. Session switch,
+reload, and shutdown interrupt active background workers and wait briefly for
+cleanup.
 
 ## Worker conversation pane (v0.9)
 

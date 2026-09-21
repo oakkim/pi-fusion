@@ -651,12 +651,12 @@ try {
   await waitForStatus(initial.details.turn_id as string, "completed");
   for (let i = 0; i < 50 && completionMessages.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 1));
   eq("spawn returns before background result", [initial.details.status, initial.details.asynchronous], ["running", true]);
-  eq("completion waits for next user turn", [
+  eq("completion automatically resumes Lead", [
     completionMessages[0]?.message.customType,
     completionMessages[0]?.message.content.includes("done"),
     completionMessages[0]?.options.deliverAs,
     completionMessages[0]?.options.triggerTurn,
-  ], ["fusion-result", true, "nextTurn", undefined]);
+  ], ["fusion-result", true, "followUp", true]);
   let executorSignal: AbortSignal | undefined;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });

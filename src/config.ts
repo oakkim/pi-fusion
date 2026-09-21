@@ -120,6 +120,11 @@ export interface ThinkingOverride {
   thinkingLevel?: ModelThinkingLevel;
 }
 
+/** Session override from /fusion-consent. */
+export interface ConsentOverride {
+  executorToolsConsent?: boolean;
+}
+
 /** Pure overlay: session override wins over file config (unit-tested). */
 export function applyOverride(base: FusionConfig, override: ExecutorOverride | undefined): FusionConfig {
   if (!override) return base;
@@ -131,6 +136,12 @@ export function applyOverride(base: FusionConfig, override: ExecutorOverride | u
 export function applyThinkingOverride(base: FusionConfig, override: ThinkingOverride | undefined): FusionConfig {
   if (!override?.thinkingLevel) return base;
   return { ...base, thinkingLevel: override.thinkingLevel };
+}
+
+/** Session consent wins over file config, including an explicit false. */
+export function applyConsentOverride(base: FusionConfig, override: ConsentOverride | undefined): FusionConfig {
+  if (!override || typeof override.executorToolsConsent !== "boolean") return base;
+  return { ...base, executorToolsConsent: override.executorToolsConsent };
 }
 
 export function applyDefaults(config: FusionConfig): ResolvedFusionConfig {

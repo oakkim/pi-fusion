@@ -114,6 +114,20 @@ cannot send an unsupported reasoning effort. Calls use Pi's provider-neutral
 The override is journaled as a `fusion-thinking` entry and applies to existing
 persistent workers on their next turn.
 
+## Executor tool consent
+
+```
+/fusion-consent                 -> choose allow, ask, or config default
+/fusion-consent allow           -> skip spawn/followup mutation prompts for this session
+/fusion-consent ask             -> require a prompt for every mutating executor turn
+/fusion-consent default         -> return to fusion.json (default: ask)
+/fusion-consent status          -> show the effective mode and source
+```
+
+Session consent is journaled as `fusion-consent` and affects both new workers
+and persistent-worker followups. `allow` is rejected for untrusted projects;
+config-file consent is also loaded only from trusted projects.
+
 ## Lead discipline (v0.7)
 
 Two layers, following what others found (opencode-fusion's systemic Main edit
@@ -178,6 +192,10 @@ pi install git:github.com/oakkim/pi-fusion
 `executorTools`: `"none" | "readonly" | "all" | ["read","grep","find","ls","bash","edit","write"]`.
 
 `thinkingLevel`: `"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`.
+
+`executorToolsConsent`: set `true` to skip per-turn mutating-tool confirmation
+for every session in this trusted project, or use `/fusion-consent allow` for a
+session-scoped grant.
 
 ## Check
 

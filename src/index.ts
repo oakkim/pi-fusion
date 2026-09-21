@@ -14,12 +14,14 @@ import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/
 import type { Message } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import {
+  applyConsentOverride,
   applyDefaults,
   applyOverride,
   applyThinkingOverride,
   FUSION_THINKING_LEVELS,
   isFusionThinkingLevel,
   loadConfig,
+  type ConsentOverride,
   type ExecutorOverride,
   type ThinkingOverride,
 } from "./config.ts";
@@ -166,10 +168,35 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function restoreConsentOverride(ctx: ExtensionContext): ConsentOverride | undefined {
+    try {
+      const branch = ctx.sessionManager.getBranch() as unknown[];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const e = branch[i] as { type?: unknown; customType?: unknown; data?: unknown };
+        if (e?.type === "custom" && e?.customType === "fusion-consent" && e.data && typeof e.data === "object") {
+          const value = (e.data as { executorToolsConsent?: unknown }).executorToolsConsent;
+          return typeof value === "boolean" ? { executorToolsConsent: value } : {};
+        }
+      }
+    } catch {
+      // fall through
+    }
+    return undefined;
+  }
+
+  function persistConsentOverride(override: ConsentOverride): void {
+    try {
+      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-consent", { ...override, timestamp: Date.now() });
+    } catch {
+      // journal is best-effort
+    }
+  }
+
   /** Session command overrides win over fusion.json. */
   function effectiveConfig(ctx: ExtensionContext) {
     const modelConfig = applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx));
-    return applyDefaults(applyThinkingOverride(modelConfig, restoreThinkingOverride(ctx)));
+    const thinkingConfig = applyThinkingOverride(modelConfig, restoreThinkingOverride(ctx));
+    return applyDefaults(applyConsentOverride(thinkingConfig, restoreConsentOverride(ctx)));
   }
 
   function refreshStatus(ctx: ExtensionContext): void {
@@ -759,6 +786,81 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       apply({ thinkingLevel: arg }, arg, "session override");
+    },
+  });
+
+  pi.registerCommand("fusion-consent", {
+    description: "Set sidekick mutation consent: /fusion-consent [allow|ask|default|status]",
+    getArgumentCompletions: (prefix) => {
+      const normalized = prefix.trim().toLowerCase();
+      const values = ["allow", "ask", "default", "status"];
+      const matches = values.filter((value) => value.startsWith(normalized)).map((value) => ({ value, label: value }));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const tell = (text: string, level: "info" | "warning" | "error" = "info") => {
+        if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
+        else ctx.ui.notify(text, level);
+      };
+      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+      const override = restoreConsentOverride(ctx);
+      const source = typeof override?.executorToolsConsent === "boolean"
+        ? "session override"
+        : typeof fileConfig.executorToolsConsent === "boolean" ? "config file" : "default";
+      const current = effectiveConfig(ctx).executorToolsConsent;
+      const report = () => tell(`Fusion consent: ${current ? "allow" : "ask"} (${source})`);
+
+      const apply = (next: ConsentOverride, label: "allow" | "ask", nextSource: string) => {
+        persistConsentOverride(next);
+        tell(`Fusion consent: ${label} (${nextSource})`);
+      };
+      const setAllow = () => {
+        if (!ctx.isProjectTrusted()) {
+          tell("Fusion consent cannot be allowed in an untrusted project.", "error");
+          return;
+        }
+        apply({ executorToolsConsent: true }, "allow", "session override");
+      };
+      const setAsk = () => apply({ executorToolsConsent: false }, "ask", "session override");
+      const setDefault = () => {
+        const allowed = fileConfig.executorToolsConsent ?? false;
+        apply({}, allowed ? "allow" : "ask", "config/default");
+      };
+
+      const arg = args.trim().toLowerCase();
+      if (!arg) {
+        if (ctx.mode !== "tui") {
+          report();
+          return;
+        }
+        const choice = await ctx.ui.select(`Fusion consent (current: ${current ? "allow" : "ask"}):`, [
+          "allow (session)",
+          "ask (session)",
+          `default (${fileConfig.executorToolsConsent ? "allow" : "ask"})`,
+        ]);
+        if (!choice) return;
+        if (choice.startsWith("allow")) setAllow();
+        else if (choice.startsWith("ask")) setAsk();
+        else setDefault();
+        return;
+      }
+      if (arg === "status") {
+        report();
+        return;
+      }
+      if (arg === "allow" || arg === "on" || arg === "session") {
+        setAllow();
+        return;
+      }
+      if (arg === "ask" || arg === "off") {
+        setAsk();
+        return;
+      }
+      if (arg === "default" || arg === "clear") {
+        setDefault();
+        return;
+      }
+      tell(`Unknown consent mode: ${args.trim()}. Use allow, ask, default, or status.`, "error");
     },
   });
 

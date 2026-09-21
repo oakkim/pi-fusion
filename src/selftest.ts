@@ -314,7 +314,7 @@ const cfg2 = applyDefaults({ fallbackExecutors: ["p/pro", "p/pro", ""], maxEscal
 eq("config ladder", [cfg2.fallbackExecutors, cfg2.maxEscalations], [["p/pro"], 5]);
 
 // --- 9b. config override ---
-import { applyOverride, applyThinkingOverride, applyDefaults as _ad } from "../src/config.ts";
+import { applyConsentOverride, applyOverride, applyThinkingOverride, applyDefaults as _ad } from "../src/config.ts";
 eq("leadMutations default", _ad({}).leadMutations, "allow");
 eq("leadMutations delegate", _ad({ leadMutations: "delegate" }).leadMutations, "delegate");
 eq("leadMutations bogus", _ad({ leadMutations: "sometimes" as unknown as "allow" }).leadMutations, "allow");
@@ -325,6 +325,9 @@ eq("override none", applyOverride({ executor: "a/x" }, undefined), { executor: "
 eq("thinking config", [_ad({ thinkingLevel: "high" }).thinkingLevel, _ad({ thinkingLevel: "bogus" as never }).thinkingLevel], ["high", "off"]);
 eq("thinking override", applyThinkingOverride({ thinkingLevel: "low" }, { thinkingLevel: "xhigh" }), { thinkingLevel: "xhigh" });
 eq("thinking override clear", applyThinkingOverride({ thinkingLevel: "low" }, {}), { thinkingLevel: "low" });
+eq("consent override allow", applyConsentOverride({ executorToolsConsent: false }, { executorToolsConsent: true }), { executorToolsConsent: true });
+eq("consent override ask", applyConsentOverride({ executorToolsConsent: true }, { executorToolsConsent: false }), { executorToolsConsent: false });
+eq("consent override clear", applyConsentOverride({ executorToolsConsent: true }, {}), { executorToolsConsent: true });
 
 // --- 8b. cost accounting ---
 import { addUsage, zeroUsage } from "../src/cost.ts";
@@ -854,6 +857,39 @@ await commands.get("fusion-thinking")!.handler("high", {
 });
 const thinkingEntry = thinkingBranch.at(-1) as { customType: string; data: { thinkingLevel: string } };
 eq("fusion thinking command", [thinkingEntry.customType, thinkingEntry.data.thinkingLevel, thinkingNotice], ["fusion-thinking", "high", "Fusion thinking: high (session override)"]);
+
+// --- 12. /fusion-consent persists allow, ask, and clear overrides ---
+let consentNotice = "";
+const consentContext = {
+  cwd: "/tmp",
+  mode: "tui",
+  hasUI: true,
+  ui: {
+    notify: (text: string) => { consentNotice = text; },
+    setStatus: () => {},
+  },
+  sessionManager: { getBranch: () => thinkingBranch },
+  isProjectTrusted: () => true,
+  model: thinkingModel,
+  modelRegistry: {
+    getAll: () => [thinkingModel],
+    getAvailable: () => [thinkingModel],
+    hasConfiguredAuth: () => true,
+  },
+};
+await commands.get("fusion-consent")!.handler("allow", consentContext);
+const allowEntry = thinkingBranch.at(-1) as { customType: string; data: { executorToolsConsent?: boolean } };
+eq("fusion consent allow", [allowEntry.customType, allowEntry.data.executorToolsConsent, consentNotice], ["fusion-consent", true, "Fusion consent: allow (session override)"]);
+await commands.get("fusion-consent")!.handler("ask", consentContext);
+const askEntry = thinkingBranch.at(-1) as { customType: string; data: { executorToolsConsent?: boolean } };
+eq("fusion consent ask", [askEntry.customType, askEntry.data.executorToolsConsent, consentNotice], ["fusion-consent", false, "Fusion consent: ask (session override)"]);
+await commands.get("fusion-consent")!.handler("default", consentContext);
+const defaultEntry = thinkingBranch.at(-1) as { customType: string; data: { executorToolsConsent?: boolean } };
+eq("fusion consent default", [defaultEntry.customType, defaultEntry.data.executorToolsConsent, consentNotice], ["fusion-consent", undefined, "Fusion consent: ask (config/default)"]);
+await commands.get("fusion-consent")!.handler("status", consentContext);
+eq("fusion consent status", consentNotice, "Fusion consent: ask (default)");
+await commands.get("fusion-consent")!.handler("allow", { ...consentContext, isProjectTrusted: () => false });
+eq("fusion consent rejects untrusted", consentNotice, "Fusion consent cannot be allowed in an untrusted project.");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

@@ -9,7 +9,7 @@ import fusionExtension, { formatElapsedDuration, formatLiveStatusAction, formatT
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
-import { buildMonitorLaunchPlan, FusionMonitorPublisher, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, type MonitorSnapshot } from "../src/monitor.ts";
+import { buildMonitorLaunchPlan, FusionMonitorPublisher, isMonitorOwnerAlive, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, shouldTerminateMonitor, type MonitorSnapshot } from "../src/monitor.ts";
 
 let pass = 0;
 let fail = 0;
@@ -165,7 +165,7 @@ eq("latest user language sample", latestUserText([...entries, { type: "message",
 
 // --- 7. worktree cycle in a temp git repo ---
 import { execFile as _execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
@@ -1751,8 +1751,19 @@ const monitorWide = renderMonitorScreen(monitorSnapshot, 110, 28, { selectedWork
 const monitorNarrow = renderMonitorScreen(monitorSnapshot, 64, 20, { scroll: 0, follow: false });
 eq("monitor screen dimensions", [monitorWide.lines.length, monitorWide.lines.every((line) => visibleWidth(line) <= 110), monitorNarrow.lines.length, monitorNarrow.lines.every((line) => visibleWidth(line) <= 64)], [28, true, 20, true]);
 eq("monitor follows live tail", [monitorWide.selectedWorkerId, monitorWide.scroll, monitorWide.maxScroll, monitorWide.lines.some((line) => line.includes("bash"))], ["wrk_monitor", monitorWide.maxScroll, monitorWide.maxScroll, true]);
-eq("monitor strips injected terminal controls", [sanitizeMonitorText("safe\u001b]2;INJECTED\u0007"), monitorWide.lines.some((line) => line.includes("INJECTED"))], ["safe", false]);
+eq("monitor strips injected terminal controls", [
+  sanitizeMonitorText("safe\u001b]2;INJECTED\u0007"),
+  sanitizeMonitorText("safe\u009b2JINJECT").includes("\u009b"),
+  monitorWide.lines.some((line) => line.includes("INJECTED")),
+], ["safe", false, false]);
 eq("monitor parser rejects invalid snapshots", [parseMonitorSnapshot("{}"), parseMonitorSnapshot(JSON.stringify(monitorSnapshot))?.workers.length], [undefined, 1]);
+eq("monitor detects dead or stale publisher", [
+  isMonitorOwnerAlive(process.pid),
+  shouldTerminateMonitor(monitorSnapshot),
+  shouldTerminateMonitor({ ...monitorSnapshot, ownerPid: 2_147_483_647 }),
+  shouldTerminateMonitor({ ...monitorSnapshot, updatedAt: Date.now() - 60_000 }),
+  shouldTerminateMonitor({ ...monitorSnapshot, updatedAt: Date.now() - 60_000 }, Date.now(), undefined, Date.now()),
+], [true, false, true, true, false]);
 const ghosttyPlan = buildMonitorLaunchPlan("/pkg/monitor-cli.ts", "/tmp/snapshot.json", { platform: "darwin", ghostty: true, terminal: false });
 eq("monitor Ghostty launch plan", [ghosttyPlan?.kind, ghosttyPlan?.command, ghosttyPlan?.args.includes("-e"), ghosttyPlan?.args.at(-1)], ["ghostty", "/usr/bin/open", true, "/tmp/snapshot.json"]);
 eq("monitor has no unsupported launcher", buildMonitorLaunchPlan("script", "snapshot", { platform: "linux", ghostty: false, terminal: false }), undefined);
@@ -1785,6 +1796,18 @@ eq("monitor publisher refreshes atomically", [refreshedSnapshot?.connected, refr
 await publisher.close("test complete");
 const closedSnapshot = parseMonitorSnapshot(readFileSync(publishedPath, "utf8"));
 eq("monitor publisher closes sidecar", [publisher.active, closedSnapshot?.connected, closedSnapshot?.closed, closedSnapshot?.closeReason], [false, false, true, "test complete"]);
+const racingOpen = publisher.open("session/test", monitorFixture);
+const racingClose = publisher.close("racing close wins");
+await Promise.all([racingOpen, racingClose]);
+const raceClosedSnapshot = parseMonitorSnapshot(readFileSync(publishedPath, "utf8"));
+eq("monitor serializes open then close", [publisher.active, raceClosedSnapshot?.connected, raceClosedSnapshot?.closeReason], [false, false, "racing close wins"]);
+const racingCloseFirst = publisher.close("older close");
+const racingReopen = publisher.open("session/test", monitorFixture);
+await Promise.all([racingCloseFirst, racingReopen]);
+const raceOpenSnapshot = parseMonitorSnapshot(readFileSync(publishedPath, "utf8"));
+eq("monitor serializes close then open", [publisher.active, raceOpenSnapshot?.connected, raceOpenSnapshot?.closed], [true, true, undefined]);
+await publisher.close("race test complete");
+eq("monitor leaves no temporary snapshots", readdirSync(monitorFixture).filter((name) => name.endsWith(".tmp")), []);
 rmSync(monitorFixture, { recursive: true, force: true });
 
 console.log(`\n${pass} passed, ${fail} failed`);

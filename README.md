@@ -267,9 +267,10 @@ screen with a full-width worker list and scrollable detail view:
 The bridge is read-only and local: the extension atomically writes a bounded,
 owner-only (`0600`) session snapshot under the OS temporary directory, and the
 sidecar only reads it. No control socket or network listener is opened. Updates
-are throttled, and session shutdown marks the snapshot closed so the sidecar
-exits. The monitor improves observability; it does not change worker execution
-speed.
+are throttled and serialized. A lightweight heartbeat lets the sidecar exit if
+the owning Pi process dies or stops publishing; normal session shutdown marks
+the snapshot closed immediately. The monitor improves observability; it does
+not change worker execution speed.
 
 ## Optional worker conversation pane (v0.9)
 

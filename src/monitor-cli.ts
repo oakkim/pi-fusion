@@ -2,7 +2,7 @@
 
 import { readFile, stat } from "node:fs/promises";
 import { ProcessTerminal, TuiAltScreen, matchesKey, type Component, type TUI } from "@earendil-works/pi-tui";
-import { parseMonitorSnapshot, renderMonitorScreen, type MonitorSnapshot, type MonitorViewState } from "./monitor.ts";
+import { parseMonitorSnapshot, renderMonitorScreen, shouldTerminateMonitor, type MonitorSnapshot, type MonitorViewState } from "./monitor.ts";
 
 const snapshotPath = process.argv[2];
 if (!snapshotPath) {
@@ -119,12 +119,14 @@ let lastModified = -1;
 let lastContents = "";
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 let elapsedTimer: ReturnType<typeof setInterval> | undefined;
+let terminationTimer: ReturnType<typeof setTimeout> | undefined;
 
 const stop = (): void => {
   if (stopped) return;
   stopped = true;
   if (pollTimer) clearInterval(pollTimer);
   if (elapsedTimer) clearInterval(elapsedTimer);
+  if (terminationTimer) clearTimeout(terminationTimer);
   tui.stop();
   process.exit(0);
 };
@@ -133,24 +135,44 @@ const component = new MonitorComponent(() => { void reload(true); }, stop);
 tui.addChild(component);
 tui.setFocus(component);
 
+function scheduleTermination(snapshot: MonitorSnapshot): void {
+  if (!snapshot.closed) {
+    component.setSnapshot({
+      ...snapshot,
+      connected: false,
+      closed: true,
+      closeReason: "Publisher exited or heartbeat became stale.",
+    });
+  }
+  if (!terminationTimer) terminationTimer = setTimeout(stop, 700);
+}
+
 async function reload(force = false): Promise<void> {
   if (stopped) return;
   try {
     const info = await stat(snapshotPath);
-    if (!force && info.mtimeMs === lastModified) return;
+    if (!force && info.mtimeMs === lastModified) {
+      if (component.snapshot && shouldTerminateMonitor(component.snapshot, Date.now(), undefined, info.mtimeMs)) scheduleTermination(component.snapshot);
+      return;
+    }
     const contents = await readFile(snapshotPath, "utf8");
-    if (!force && contents === lastContents) return;
+    lastModified = info.mtimeMs;
+    if (!force && contents === lastContents) {
+      if (component.snapshot && shouldTerminateMonitor(component.snapshot, Date.now(), undefined, info.mtimeMs)) scheduleTermination(component.snapshot);
+      return;
+    }
     const snapshot = parseMonitorSnapshot(contents);
     if (!snapshot) return;
-    lastModified = info.mtimeMs;
     lastContents = contents;
     component.setSnapshot(snapshot);
-    if (snapshot.closed) setTimeout(stop, 700);
+    if (shouldTerminateMonitor(snapshot, Date.now(), undefined, info.mtimeMs)) scheduleTermination(snapshot);
   } catch {
-    // The publisher may be between its atomic rename steps or still starting.
+    // The publisher may still be starting; an established dead owner is final.
+    if (component.snapshot && shouldTerminateMonitor(component.snapshot, Date.now(), undefined, lastModified)) scheduleTermination(component.snapshot);
   }
 }
 
+process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
 process.once("SIGHUP", stop);
 process.once("uncaughtException", (error) => {

@@ -647,7 +647,7 @@ export default function (pi: ExtensionAPI) {
       pendingFollowups.clear();
       steeringInstructions.clear();
       closedSteeringTurns.clear();
-      await monitor.close("Pi session ended.");
+      await monitor.close("Pi session ended.").catch(() => undefined);
       pane.shutdown();
     }
     await stopBackgroundTurns();
@@ -2015,8 +2015,12 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (action === "close") {
-        await monitor.close("Closed by /fusion-monitor.");
-        tell("Fusion monitor closed.");
+        try {
+          await monitor.close("Closed by /fusion-monitor.");
+          tell("Fusion monitor closed.");
+        } catch (error) {
+          tell(`Could not close Fusion monitor cleanly: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
         return;
       }
       if (action !== "open") {

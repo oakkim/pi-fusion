@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { stripTerminalSequences, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
@@ -66,6 +66,8 @@ const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 const MAGENTA = "\x1b[35m";
 const SNAPSHOT_WRITE_DELAY_MS = 80;
+const MONITOR_HEARTBEAT_MS = 2_000;
+export const MONITOR_STALE_AFTER_MS = 30_000;
 const HISTORY_TEXT_MAX = 8_000;
 
 function style(code: string, text: string): string {
@@ -79,7 +81,7 @@ function clamp(value: number, min: number, max: number): number {
 /** Strip terminal controls before rendering data originating in tools/models. */
 export function sanitizeMonitorText(value: unknown, max = HISTORY_TEXT_MAX): string {
   const text = stripTerminalSequences(typeof value === "string" ? value : String(value ?? ""))
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
     .replace(/\r/g, "");
   return text.length > max ? `...${text.slice(-(max - 3))}` : text;
 }
@@ -290,6 +292,27 @@ export function parseMonitorSnapshot(raw: string): MonitorSnapshot | undefined {
   }
 }
 
+export function isMonitorOwnerAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export function shouldTerminateMonitor(
+  snapshot: MonitorSnapshot,
+  now = Date.now(),
+  staleAfterMs = MONITOR_STALE_AFTER_MS,
+  heartbeatAt = snapshot.updatedAt,
+): boolean {
+  if (snapshot.closed) return true;
+  if (!isMonitorOwnerAlive(snapshot.ownerPid)) return true;
+  return now - Math.max(snapshot.updatedAt, heartbeatAt) > staleAfterMs;
+}
+
 export function monitorSnapshotPath(sessionId: string, root = join(tmpdir(), "pi-fusion-monitor")): string {
   const safeSession = sessionId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 160) || "session";
   return join(root, `${safeSession}.json`);
@@ -300,9 +323,10 @@ export class FusionMonitorPublisher {
   readonly #getPayload: () => MonitorSnapshotPayload;
   #active = false;
   #snapshotPath?: string;
-  #timer?: ReturnType<typeof setTimeout>;
-  #inflight?: Promise<void>;
-  #dirty = false;
+  #refreshTimer?: ReturnType<typeof setTimeout>;
+  #heartbeatTimer?: ReturnType<typeof setInterval>;
+  #writeQueue: Promise<void> = Promise.resolve();
+  #lifecycleGeneration = 0;
   #lastPayload?: MonitorSnapshotPayload;
   #lastError?: string;
 
@@ -323,83 +347,127 @@ export class FusionMonitorPublisher {
   }
 
   async open(sessionId: string, root?: string): Promise<string> {
-    this.#snapshotPath = monitorSnapshotPath(sessionId, root);
+    const lifecycleGeneration = ++this.#lifecycleGeneration;
+    const snapshotPath = monitorSnapshotPath(sessionId, root);
+    this.#snapshotPath = snapshotPath;
     this.#active = true;
-    this.#dirty = true;
-    await this.#flushNow();
-    if (this.#lastError) {
+    this.#startHeartbeat();
+    const payload = this.#capturePayload();
+    if (!payload) {
       this.#active = false;
-      throw new Error(this.#lastError);
+      this.#stopTimers();
+      throw new Error(this.#lastError ?? "Could not build Fusion monitor snapshot.");
     }
-    return this.#snapshotPath;
+    try {
+      await this.#enqueueWrite(snapshotPath, {
+        ...payload,
+        updatedAt: Date.now(),
+        connected: true,
+        ownerPid: process.pid,
+      });
+      this.#lastError = undefined;
+    } catch (error) {
+      this.#lastError = error instanceof Error ? error.message : String(error);
+      if (this.#lifecycleGeneration === lifecycleGeneration && this.#snapshotPath === snapshotPath) {
+        this.#active = false;
+        this.#stopTimers();
+      }
+      throw error;
+    }
+    return snapshotPath;
   }
 
   refresh(): void {
-    if (!this.#active) return;
-    this.#dirty = true;
-    if (this.#timer || this.#inflight) return;
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      void this.#flushNow();
+    if (!this.#active || this.#refreshTimer) return;
+    this.#refreshTimer = setTimeout(() => {
+      this.#refreshTimer = undefined;
+      if (!this.#active || !this.#snapshotPath) return;
+      const payload = this.#capturePayload();
+      if (!payload) return;
+      const operation = this.#enqueueWrite(this.#snapshotPath, {
+        ...payload,
+        updatedAt: Date.now(),
+        connected: true,
+        ownerPid: process.pid,
+      });
+      void operation.then(
+        () => { this.#lastError = undefined; },
+        (error) => { this.#lastError = error instanceof Error ? error.message : String(error); },
+      );
     }, SNAPSHOT_WRITE_DELAY_MS);
   }
 
   async close(reason = "closed by Lead"): Promise<void> {
-    if (!this.#snapshotPath) return;
+    this.#lifecycleGeneration += 1;
+    const snapshotPath = this.#snapshotPath;
+    if (!snapshotPath) return;
     this.#active = false;
-    this.#dirty = false;
-    if (this.#timer) clearTimeout(this.#timer);
-    this.#timer = undefined;
-    if (this.#inflight) await this.#inflight.catch(() => undefined);
-    let payload = this.#lastPayload;
-    try {
-      payload = this.#getPayload();
-      this.#lastPayload = payload;
-    } catch {
-      // Preserve the last valid public snapshot during teardown.
-    }
+    this.#stopTimers();
+    const payload = this.#capturePayload();
     if (!payload) return;
-    await this.#write({ ...payload, updatedAt: Date.now(), connected: false, closed: true, closeReason: reason, ownerPid: process.pid });
-  }
-
-  async #flushNow(): Promise<void> {
-    if (!this.#active || !this.#snapshotPath) return;
-    if (this.#inflight) {
-      this.#dirty = true;
-      await this.#inflight.catch(() => undefined);
-      return;
-    }
-    this.#dirty = false;
-    let payload: MonitorSnapshotPayload;
     try {
-      payload = this.#getPayload();
-      this.#lastPayload = payload;
-    } catch (error) {
-      this.#lastError = error instanceof Error ? error.message : String(error);
-      return;
-    }
-    this.#inflight = this.#write({ ...payload, updatedAt: Date.now(), connected: true, ownerPid: process.pid });
-    try {
-      await this.#inflight;
+      await this.#enqueueWrite(snapshotPath, {
+        ...payload,
+        updatedAt: Date.now(),
+        connected: false,
+        closed: true,
+        closeReason: reason,
+        ownerPid: process.pid,
+      });
       this.#lastError = undefined;
     } catch (error) {
       this.#lastError = error instanceof Error ? error.message : String(error);
-    } finally {
-      this.#inflight = undefined;
-      if (this.#active && this.#dirty) this.refresh();
+      throw error;
     }
   }
 
-  async #write(snapshot: MonitorSnapshot): Promise<void> {
-    const snapshotPath = this.#snapshotPath;
-    if (!snapshotPath) return;
+  #capturePayload(): MonitorSnapshotPayload | undefined {
+    try {
+      const payload = this.#getPayload();
+      this.#lastPayload = payload;
+      return payload;
+    } catch (error) {
+      this.#lastError = error instanceof Error ? error.message : String(error);
+      return this.#lastPayload;
+    }
+  }
+
+  #startHeartbeat(): void {
+    if (this.#heartbeatTimer) return;
+    this.#heartbeatTimer = setInterval(() => {
+      const snapshotPath = this.#snapshotPath;
+      if (!this.#active || !snapshotPath) return;
+      const now = new Date();
+      void utimes(snapshotPath, now, now).catch(() => undefined);
+    }, MONITOR_HEARTBEAT_MS);
+    this.#heartbeatTimer.unref?.();
+  }
+
+  #stopTimers(): void {
+    if (this.#refreshTimer) clearTimeout(this.#refreshTimer);
+    if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
+    this.#refreshTimer = undefined;
+    this.#heartbeatTimer = undefined;
+  }
+
+  #enqueueWrite(snapshotPath: string, snapshot: MonitorSnapshot): Promise<void> {
+    const operation = this.#writeQueue.then(() => this.#write(snapshotPath, snapshot));
+    this.#writeQueue = operation.catch(() => undefined);
+    return operation;
+  }
+
+  async #write(snapshotPath: string, snapshot: MonitorSnapshot): Promise<void> {
     const directory = dirname(snapshotPath);
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700).catch(() => undefined);
-    const temporary = `${snapshotPath}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(snapshot)}\n`, { encoding: "utf8", mode: 0o600 });
-    await chmod(temporary, 0o600).catch(() => undefined);
-    await rename(temporary, snapshotPath);
+    const temporary = `${snapshotPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, `${JSON.stringify(snapshot)}\n`, { encoding: "utf8", mode: 0o600 });
+      await chmod(temporary, 0o600).catch(() => undefined);
+      await rename(temporary, snapshotPath);
+    } finally {
+      await unlink(temporary).catch(() => undefined);
+    }
   }
 }
 

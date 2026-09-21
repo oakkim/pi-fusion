@@ -25,6 +25,8 @@ interface CompleteOptions {
   maxTokens: number;
   temperature?: number;
   reasoning?: ThinkingLevel;
+  /** OpenAI priority service tier (the provider's fast mode). */
+  serviceTier?: "priority";
   signal: AbortSignal | undefined;
 }
 
@@ -45,11 +47,17 @@ function opencodeSessionHeaders(model: Model<Api>, sessionId: string | undefined
   return { "x-opencode-session": sessionId, "x-opencode-client": "pi" };
 }
 
+export function supportsOpenAIFastMode(model: Model<Api>): boolean {
+  return (model.provider === "openai" || model.provider === "openai-codex")
+    && (model.api === "openai-responses" || model.api === "openai-codex-responses");
+}
+
 function buildCompleteOptions(
   model: Model<Api>,
   maxTokens: number,
   temperature: number,
   thinkingLevel: ModelThinkingLevel,
+  fastMode: boolean,
   signal: AbortSignal | undefined,
   ctx: ExtensionContext,
 ): CompleteOptions {
@@ -61,6 +69,7 @@ function buildCompleteOptions(
   };
   if (getSupportsTemperature(model)) options.temperature = temperature;
   if (thinkingLevel !== "off") options.reasoning = thinkingLevel;
+  if (fastMode && supportsOpenAIFastMode(model)) options.serviceTier = "priority";
   return options;
 }
 
@@ -87,8 +96,10 @@ export async function runExecutorTurn(
   ctx: ExtensionContext,
   thinkingLevel: ModelThinkingLevel = "off",
   onProgress?: (progress: LiveProgress) => void,
+  takeSteeringMessages?: (finalCheckpoint?: boolean) => Message[],
+  fastMode = false,
 ): Promise<ToolLoopResult> {
-  const options = buildCompleteOptions(model, maxTokens, temperature, thinkingLevel, signal, ctx);
+  const options = buildCompleteOptions(model, maxTokens, temperature, thinkingLevel, fastMode, signal, ctx);
   const tools: Tool[] = toolDefs.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }));
   const byName = new Map(toolDefs.map((d) => [d.name, d]));
 
@@ -102,12 +113,33 @@ export async function runExecutorTurn(
   let repeatRun = 0;
   let errorStreak = 0;
 
+  const takeSteering = (finalCheckpoint = false): Message[] => takeSteeringMessages?.(finalCheckpoint) ?? [];
+  const appendSteering = (steering: Message[]): void => {
+    if (steering.length === 0) return;
+    messages.push(...steering);
+    added.push(...steering);
+  };
+
   while (true) {
+    appendSteering(takeSteering());
     const resp = await runComplete(registry, model, { systemPrompt, messages, tools }, options, onProgress);
     turns++;
     usage = addUsage(usage, resp.usage);
     const calls = resp.content.filter((c): c is ToolCall => c.type === "toolCall");
     if (resp.stopReason !== "toolUse" || calls.length === 0) {
+      const steering = takeSteering(true);
+      if (steering.length > 0) {
+        // The response completed while a related update was arriving. Preserve
+        // it as an intermediate answer, inject the update, and let the same
+        // worker turn revise its work instead of scheduling another turn.
+        messages.push(resp);
+        added.push(resp);
+        appendSteering(steering);
+        repeatRun = 0;
+        errorStreak = 0;
+        lastKey = undefined;
+        continue;
+      }
       added.push(resp);
       return { message: resp, added, turns, toolCalls, cappedOut: false, usage };
     }
@@ -138,13 +170,39 @@ export async function runExecutorTurn(
       if (repeatRun >= 3 || errorStreak >= 3) forceFinalize = true;
     }
 
+    const steeringAfterTools = takeSteering();
+    appendSteering(steeringAfterTools);
+    if (steeringAfterTools.length > 0 && used < maxToolCalls) {
+      // A new Lead instruction can legitimately redirect a repeated/failing
+      // tool loop. Give the revised plan a fresh cycle while preserving the
+      // hard total tool-call budget.
+      forceFinalize = false;
+      repeatRun = 0;
+      errorStreak = 0;
+      lastKey = undefined;
+    }
+
     if (forceFinalize || used >= maxToolCalls) {
+      // No more tools are available, so close the cooperative steering mailbox
+      // before the final no-tools request. A later update is safer as a queued
+      // turn than as an instruction the worker cannot execute.
+      const preFinalSteering = takeSteering(true);
+      appendSteering(preFinalSteering);
+      if (preFinalSteering.length > 0) takeSteering(true);
       const finalSystem = `${systemPrompt}\n\nYou have reached the tool-call limit. Write your complete final answer now using only what you have already gathered — do not request any more tools.`;
-      const finalMsg = await runComplete(registry, model, { systemPrompt: finalSystem, messages }, options, onProgress);
-      turns++;
-      usage = addUsage(usage, finalMsg.usage);
-      added.push(finalMsg);
-      return { message: finalMsg, added, turns, toolCalls, cappedOut: true, usage };
+      while (true) {
+        const finalMsg = await runComplete(registry, model, { systemPrompt: finalSystem, messages }, options, onProgress);
+        turns++;
+        usage = addUsage(usage, finalMsg.usage);
+        const steering = takeSteering(true);
+        if (steering.length === 0) {
+          added.push(finalMsg);
+          return { message: finalMsg, added, turns, toolCalls, cappedOut: true, usage };
+        }
+        messages.push(finalMsg);
+        added.push(finalMsg);
+        appendSteering(steering);
+      }
     }
   }
 }
@@ -163,18 +221,29 @@ async function runComplete(
 ): Promise<AssistantMessage> {
   options.signal?.throwIfAborted();
   const compatibleRegistry = registry as unknown as {
+    stream?: (model: Model<Api>, context: StreamContext, options: CompleteOptions & { reasoningEffort?: ThinkingLevel }) => CompatibleStream;
     streamSimple?: (model: Model<Api>, context: StreamContext, options: CompleteOptions) => CompatibleStream;
   };
-  if (options.reasoning && !compatibleRegistry.streamSimple) {
+  if (options.reasoning && !compatibleRegistry.streamSimple && !options.serviceTier) {
     throw new Error("Fusion thinking requires pi 0.86 or newer.");
   }
 
   onProgress?.({ kind: "phase", phase: "waiting", replaceText: true });
-  let resp: AssistantMessage;
-  if (!compatibleRegistry.streamSimple) {
-    resp = await registry.complete(model, context, options);
+  let resp: AssistantMessage | undefined;
+  let stream: CompatibleStream | undefined;
+  if (options.serviceTier) {
+    // streamSimple intentionally exposes only provider-neutral options and
+    // drops serviceTier. Use the full OpenAI API path so priority processing,
+    // reasoning effort, and provider-side cost accounting all stay intact.
+    const providerOptions = { ...options, reasoningEffort: options.reasoning };
+    if (compatibleRegistry.stream) stream = compatibleRegistry.stream(model, context, providerOptions);
+    else resp = await registry.complete(model, context, providerOptions as never);
+  } else if (compatibleRegistry.streamSimple) {
+    stream = compatibleRegistry.streamSimple(model, context, options);
   } else {
-    const stream = compatibleRegistry.streamSimple(model, context, options);
+    resp = await registry.complete(model, context, options);
+  }
+  if (stream) {
     if (isAsyncEventStream(stream)) {
       const pendingTools = new Map<number, PendingToolProgress>();
       for await (const event of stream) {
@@ -185,6 +254,7 @@ async function runComplete(
     // that expose only the result promise.
     resp = await stream.result();
   }
+  if (!resp) throw new Error("Fusion executor produced no response.");
 
   if (resp.stopReason === "error" || resp.stopReason === "aborted") {
     throw new Error(resp.errorMessage ?? `Model stopped with reason: ${resp.stopReason}`);

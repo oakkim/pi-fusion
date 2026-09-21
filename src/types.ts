@@ -27,6 +27,8 @@ export interface FusionConfig {
   temperature?: number;
   /** Sidekick reasoning effort. Default "off". */
   thinkingLevel?: ModelThinkingLevel;
+  /** Request OpenAI priority processing for the sidekick. Default false. */
+  fastMode?: boolean;
   /** Skip consent prompt for mutating tools (trusted projects only). Default false. */
   executorToolsConsent?: boolean;
   /** Max turns of sidekick history kept before compaction. Default 40 messages. */
@@ -51,6 +53,7 @@ export interface ResolvedFusionConfig {
   maxExecutorOutputTokens: number;
   temperature: number;
   thinkingLevel: ModelThinkingLevel;
+  fastMode: boolean;
   executorToolsConsent: boolean;
   maxHistoryMessages: number;
   fallbackExecutors: string[];

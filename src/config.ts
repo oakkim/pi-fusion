@@ -57,6 +57,7 @@ function normalizeConfig(raw: unknown): FusionConfig {
     out.temperature = input.temperature;
   }
   if (isFusionThinkingLevel(input.thinkingLevel)) out.thinkingLevel = input.thinkingLevel;
+  if (typeof input.fastMode === "boolean") out.fastMode = input.fastMode;
   if (typeof input.executorToolsConsent === "boolean") out.executorToolsConsent = input.executorToolsConsent;
   if (typeof input.maxHistoryMessages === "number" && input.maxHistoryMessages >= 4) {
     out.maxHistoryMessages = Math.min(200, Math.floor(input.maxHistoryMessages));
@@ -120,6 +121,11 @@ export interface ThinkingOverride {
   thinkingLevel?: ModelThinkingLevel;
 }
 
+/** Session override from /fusion-fast. */
+export interface FastModeOverride {
+  fastMode?: boolean;
+}
+
 /** Session override from /fusion-consent. */
 export interface ConsentOverride {
   executorToolsConsent?: boolean;
@@ -138,6 +144,12 @@ export function applyThinkingOverride(base: FusionConfig, override: ThinkingOver
   return { ...base, thinkingLevel: override.thinkingLevel };
 }
 
+/** Session fast-mode choice wins over file config, including an explicit false. */
+export function applyFastModeOverride(base: FusionConfig, override: FastModeOverride | undefined): FusionConfig {
+  if (!override || typeof override.fastMode !== "boolean") return base;
+  return { ...base, fastMode: override.fastMode };
+}
+
 /** Session consent wins over file config, including an explicit false. */
 export function applyConsentOverride(base: FusionConfig, override: ConsentOverride | undefined): FusionConfig {
   if (!override || typeof override.executorToolsConsent !== "boolean") return base;
@@ -153,6 +165,7 @@ export function applyDefaults(config: FusionConfig): ResolvedFusionConfig {
     maxExecutorOutputTokens: n.maxExecutorOutputTokens ?? DEFAULT_MAX_TOKENS,
     temperature: n.temperature ?? DEFAULT_TEMPERATURE,
     thinkingLevel: n.thinkingLevel ?? "off",
+    fastMode: n.fastMode ?? false,
     executorToolsConsent: n.executorToolsConsent ?? false,
     maxHistoryMessages: n.maxHistoryMessages ?? DEFAULT_MAX_HISTORY,
     fallbackExecutors: n.fallbackExecutors ?? [],

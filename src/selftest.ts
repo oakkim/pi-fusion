@@ -151,7 +151,7 @@ eq("handoff carries latest user language sample", [localizedHandoff.includes("�
 
 // --- 5. config defaults ---
 const cfg = applyDefaults({});
-eq("defaults", [cfg.executorTools, cfg.maxToolCalls, cfg.maxExecutorOutputTokens, cfg.temperature, cfg.thinkingLevel, cfg.maxHistoryMessages], ["all", 1024, 4096, 0.2, "off", 40]);
+eq("defaults", [cfg.executorTools, cfg.maxToolCalls, cfg.maxExecutorOutputTokens, cfg.temperature, cfg.thinkingLevel, cfg.fastMode, cfg.maxHistoryMessages], ["all", 1024, 4096, 0.2, "off", false, 40]);
 
 // --- 6. recent context builder ---
 const entries = [
@@ -336,11 +336,11 @@ rt3.finishTurn(rt3.followup(s3.worker.id, { role: "user", content: "t3", timesta
 eq("success resets", rt3.getWorker(s3.worker.id)?.failures, 0);
 
 // config new keys
-const cfg2 = applyDefaults({ fallbackExecutors: ["p/pro", "p/pro", ""], maxEscalations: 99 });
-eq("config ladder", [cfg2.fallbackExecutors, cfg2.maxEscalations], [["p/pro"], 5]);
+const cfg2 = applyDefaults({ fallbackExecutors: ["p/pro", "p/pro", ""], maxEscalations: 99, fastMode: true });
+eq("config ladder and fast mode", [cfg2.fallbackExecutors, cfg2.maxEscalations, cfg2.fastMode], [["p/pro"], 5, true]);
 
 // --- 9b. config override ---
-import { applyConsentOverride, applyOverride, applyThinkingOverride, applyDefaults as _ad } from "../src/config.ts";
+import { applyConsentOverride, applyFastModeOverride, applyOverride, applyThinkingOverride, applyDefaults as _ad } from "../src/config.ts";
 eq("leadMutations default", _ad({}).leadMutations, "allow");
 eq("leadMutations delegate", _ad({ leadMutations: "delegate" }).leadMutations, "delegate");
 eq("leadMutations bogus", _ad({ leadMutations: "sometimes" as unknown as "allow" }).leadMutations, "allow");
@@ -351,6 +351,9 @@ eq("override none", applyOverride({ executor: "a/x" }, undefined), { executor: "
 eq("thinking config", [_ad({ thinkingLevel: "high" }).thinkingLevel, _ad({ thinkingLevel: "bogus" as never }).thinkingLevel], ["high", "off"]);
 eq("thinking override", applyThinkingOverride({ thinkingLevel: "low" }, { thinkingLevel: "xhigh" }), { thinkingLevel: "xhigh" });
 eq("thinking override clear", applyThinkingOverride({ thinkingLevel: "low" }, {}), { thinkingLevel: "low" });
+eq("fast override on", applyFastModeOverride({ fastMode: false }, { fastMode: true }), { fastMode: true });
+eq("fast override off", applyFastModeOverride({ fastMode: true }, { fastMode: false }), { fastMode: false });
+eq("fast override clear", applyFastModeOverride({ fastMode: true }, {}), { fastMode: true });
 eq("consent override allow", applyConsentOverride({ executorToolsConsent: false }, { executorToolsConsent: true }), { executorToolsConsent: true });
 eq("consent override ask", applyConsentOverride({ executorToolsConsent: true }, { executorToolsConsent: false }), { executorToolsConsent: false });
 eq("consent override clear", applyConsentOverride({ executorToolsConsent: true }, {}), { executorToolsConsent: true });
@@ -364,13 +367,19 @@ const c3 = addUsage(c2, undefined);
 eq("usage sum", c3, { input: 13, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: 3 });
 
 // --- 8c. executor dispatches through the configured model registry ---
-import { getSupportsTemperature, runExecutorTurn } from "../src/llm.ts";
+import { getSupportsTemperature, runExecutorTurn, supportsOpenAIFastMode } from "../src/llm.ts";
 eq("temperature compatibility", [
   getSupportsTemperature({ api: "openai-codex-responses", reasoning: false } as never),
   getSupportsTemperature({ api: "openai-responses", reasoning: true } as never),
   getSupportsTemperature({ api: "openai-responses", reasoning: false } as never),
   getSupportsTemperature({ api: "anthropic-messages", reasoning: false, compat: { supportsTemperature: false } } as never),
 ], [false, false, true, false]);
+eq("OpenAI fast-mode support", [
+  supportsOpenAIFastMode({ provider: "openai-codex", api: "openai-codex-responses" } as never),
+  supportsOpenAIFastMode({ provider: "openai", api: "openai-responses" } as never),
+  supportsOpenAIFastMode({ provider: "github-copilot", api: "openai-responses" } as never),
+  supportsOpenAIFastMode({ provider: "openai", api: "openai-completions" } as never),
+], [true, true, false, false]);
 const resultStream = (result: unknown | Promise<unknown>) => ({ result: () => Promise.resolve(result) });
 let registryCompleteCalls = 0;
 let registryCall: { model?: unknown; options?: Record<string, unknown> } = {};
@@ -399,6 +408,9 @@ const registryResult = await runExecutorTurn(
   1,
   { sessionManager: { getSessionId: () => "session-test" } } as never,
   "high",
+  undefined,
+  undefined,
+  true,
 );
 eq("registry streamSimple dispatch", [
   registryCompleteCalls,
@@ -407,12 +419,89 @@ eq("registry streamSimple dispatch", [
   registryCall.options?.maxTokens,
   registryCall.options?.temperature,
   registryCall.options?.reasoning,
+  registryCall.options?.serviceTier === undefined,
   registryCall.options?.headers,
   registryResult.message.content,
-], [1, true, true, 128, undefined, "high", {
+], [1, true, true, 128, undefined, "high", true, {
   "x-opencode-session": "session-test",
   "x-opencode-client": "pi",
 }, [{ type: "text", text: "registry ok" }]]);
+
+let fastStreamCalls = 0;
+let fastSimpleCalls = 0;
+let fastRequestOptions: Record<string, unknown> = {};
+let fastRequestContext: { tools?: Array<{ name: string }> } = {};
+const fastModel = { provider: "openai-codex", id: "gpt-5.6-luna", api: "openai-codex-responses", input: ["text"], reasoning: true };
+const fastResult = await runExecutorTurn(
+  {
+    stream: (_model: unknown, completeContext: { tools?: Array<{ name: string }> }, options: Record<string, unknown>) => {
+      fastStreamCalls++;
+      fastRequestContext = completeContext;
+      fastRequestOptions = options;
+      return resultStream({
+        role: "assistant",
+        content: [{ type: "text", text: "fast response" }],
+        stopReason: "stop",
+        timestamp: Date.now(),
+      });
+    },
+    streamSimple: () => {
+      fastSimpleCalls++;
+      throw new Error("fast mode must use the full provider stream");
+    },
+  } as never,
+  fastModel as never,
+  "system",
+  [{ role: "user", content: "task", timestamp: 0 }] as never,
+  128,
+  0.2,
+  registrySignal,
+  [{ name: "probe", description: "probe", parameters: {}, execute: async () => ({ content: [{ type: "text", text: "unused" }] }) }] as never,
+  1,
+  { sessionManager: { getSessionId: () => undefined } } as never,
+  "high",
+  undefined,
+  undefined,
+  true,
+);
+eq("fast mode uses OpenAI priority stream", [
+  fastStreamCalls,
+  fastSimpleCalls,
+  fastRequestOptions.serviceTier,
+  fastRequestOptions.reasoningEffort,
+  fastRequestOptions.reasoning,
+  fastRequestContext.tools?.map((tool) => tool.name),
+  fastResult.message.content,
+], [1, 0, "priority", "high", "high", ["probe"], [{ type: "text", text: "fast response" }]]);
+
+let fastCompleteOptions: Record<string, unknown> = {};
+await runExecutorTurn(
+  {
+    complete: async (_model: unknown, _context: unknown, options: Record<string, unknown>) => {
+      fastCompleteOptions = options;
+      return {
+        role: "assistant",
+        content: [{ type: "text", text: "legacy fast response" }],
+        stopReason: "stop",
+        timestamp: Date.now(),
+      };
+    },
+  } as never,
+  fastModel as never,
+  "system",
+  [{ role: "user", content: "task", timestamp: 0 }] as never,
+  128,
+  0.2,
+  registrySignal,
+  [],
+  1,
+  { sessionManager: { getSessionId: () => undefined } } as never,
+  "high",
+  undefined,
+  undefined,
+  true,
+);
+eq("fast mode complete fallback keeps provider options", [fastCompleteOptions.serviceTier, fastCompleteOptions.reasoningEffort], ["priority", "high"]);
 
 const streamAssistant = (content: unknown[], stopReason = "pending") => ({
   role: "assistant",
@@ -513,6 +602,91 @@ eq("live tool lifecycle", [
   toolProgress.some((progress) => progress.kind === "tool_update" && progress.output === "partial output"),
   toolProgress.some((progress) => progress.kind === "tool_end" && progress.toolId === "call-1" && progress.ok && progress.output === "final output"),
 ], [[{ type: "text", text: "finished" }], true, true, true]);
+
+let steeringToolRan = false;
+let steeringDelivered = false;
+let steeringModelCalls = 0;
+let steeringSeenByModel = false;
+const steeringResult = await runExecutorTurn(
+  {
+    streamSimple: (_model: unknown, context: unknown) => {
+      steeringModelCalls++;
+      if (steeringModelCalls === 1) {
+        return resultStream(streamAssistant([{ type: "toolCall", id: "steer-tool", name: "probe", arguments: {} }], "toolUse"));
+      }
+      steeringSeenByModel = JSON.stringify(context).includes("change target to bravo");
+      return resultStream(streamAssistant([{ type: "text", text: "integrated update" }], "stop"));
+    },
+  } as never,
+  registryModel as never,
+  "system",
+  [{ role: "user", content: "initial task", timestamp: 0 }] as never,
+  128,
+  0.2,
+  registrySignal,
+  [{
+    name: "probe", description: "probe", parameters: {},
+    execute: async () => {
+      steeringToolRan = true;
+      return { content: [{ type: "text", text: "probe done" }], isError: false };
+    },
+  }] as never,
+  2,
+  { sessionManager: { getSessionId: () => undefined } } as never,
+  "off",
+  undefined,
+  () => {
+    if (!steeringToolRan || steeringDelivered) return [];
+    steeringDelivered = true;
+    return [{ role: "user", content: "change target to bravo", timestamp: Date.now() }] as never;
+  },
+);
+eq("steering injects after tool batch", [
+  steeringModelCalls,
+  steeringSeenByModel,
+  steeringResult.added.map((message) => message.role),
+  steeringResult.message.content,
+], [2, true, ["assistant", "toolResult", "user", "assistant"], [{ type: "text", text: "integrated update" }]]);
+
+let lateSteeringCalls = 0;
+let firstFinalReturned = false;
+let lateSteeringDelivered = false;
+let lateSteeringSeen = false;
+const lateSteeringResult = await runExecutorTurn(
+  {
+    streamSimple: (_model: unknown, context: unknown) => {
+      lateSteeringCalls++;
+      if (lateSteeringCalls === 1) {
+        firstFinalReturned = true;
+        return resultStream(streamAssistant([{ type: "text", text: "old final" }], "stop"));
+      }
+      lateSteeringSeen = JSON.stringify(context).includes("add regression test");
+      return resultStream(streamAssistant([{ type: "text", text: "revised final" }], "stop"));
+    },
+  } as never,
+  registryModel as never,
+  "system",
+  [{ role: "user", content: "initial task", timestamp: 0 }] as never,
+  128,
+  0.2,
+  registrySignal,
+  [],
+  2,
+  { sessionManager: { getSessionId: () => undefined } } as never,
+  "off",
+  undefined,
+  () => {
+    if (!firstFinalReturned || lateSteeringDelivered) return [];
+    lateSteeringDelivered = true;
+    return [{ role: "user", content: "add regression test", timestamp: Date.now() }] as never;
+  },
+);
+eq("steering revises a just-finished response", [
+  lateSteeringCalls,
+  lateSteeringSeen,
+  lateSteeringResult.added.map((message) => message.role),
+  lateSteeringResult.message.content,
+], [2, true, ["assistant", "user", "assistant"], [{ type: "text", text: "revised final" }]]);
 
 const toolAbort = new AbortController();
 let secondToolRuns = 0;
@@ -689,6 +863,59 @@ try {
     completionMessages[0]?.options.triggerTurn,
   ], ["fusion-result", true, "followUp", true]);
 
+  let releaseSteerFirst!: (message: unknown) => void;
+  let releaseSteerSecond!: (message: unknown) => void;
+  let markSteerFirstStarted!: () => void;
+  let markSteerSecondStarted!: () => void;
+  const steerFirstStarted = new Promise<void>((resolve) => { markSteerFirstStarted = resolve; });
+  const steerSecondStarted = new Promise<void>((resolve) => { markSteerSecondStarted = resolve; });
+  let steerProviderCalls = 0;
+  let steeredContext = "";
+  completeImpl = async (_model, completeContext) => {
+    steerProviderCalls++;
+    if (steerProviderCalls === 1) {
+      markSteerFirstStarted();
+      return new Promise((resolve) => { releaseSteerFirst = resolve; });
+    }
+    steeredContext = JSON.stringify(completeContext);
+    markSteerSecondStarted();
+    return new Promise((resolve) => { releaseSteerSecond = resolve; });
+  };
+  const activeBeforeSteer = await followup.execute("steer-active", { worker_id: workerId, message: "prepare the current draft" }, undefined, undefined, context);
+  await steerFirstStarted;
+  const steeredCorrection = await followup.execute("steer-correction", { worker_id: workerId, message: "also add the regression test" }, undefined, undefined, context);
+  const steeredCorrection2 = await followup.execute("steer-correction-2", { worker_id: workerId, message: "keep the public API unchanged" }, undefined, undefined, context);
+  const pendingSteerStatus = await readStatus(workerId);
+  eq("busy followups steer and batch by default", [
+    steeredCorrection.details.status,
+    steeredCorrection.details.when_busy,
+    steeredCorrection.details.active_turn_id,
+    steeredCorrection.details.position,
+    steeredCorrection2.details.position,
+    pendingSteerStatus.steering_updates.map((entry: { status: string }) => entry.status),
+    pendingSteerStatus.queued_followups.length,
+    fusionStatusLine.includes("steer 2"),
+  ], ["steering", "steer", activeBeforeSteer.details.turn_id, 1, 2, ["pending", "pending"], 0, true]);
+  releaseSteerFirst({ role: "assistant", content: [{ type: "text", text: "old draft" }], stopReason: "stop", timestamp: Date.now() });
+  await steerSecondStarted;
+  const injectedSteerStatus = await readStatus(workerId);
+  eq("steering stays in the active turn", [
+    injectedSteerStatus.active_turn,
+    injectedSteerStatus.generation,
+    injectedSteerStatus.steering_updates[0]?.status,
+    steeredContext.includes("<fusion_steer"),
+    steeredContext.includes("also add the regression test"),
+    steeredContext.includes("keep the public API unchanged"),
+    steerProviderCalls,
+  ], [activeBeforeSteer.details.turn_id, activeBeforeSteer.details.generation, "injected", true, true, true, 2]);
+  releaseSteerSecond({ role: "assistant", content: [{ type: "text", text: "integrated draft" }], stopReason: "stop", timestamp: Date.now() });
+  await waitForStatus(activeBeforeSteer.details.turn_id as string, "completed");
+  const steeredCompletion = completionMessages.find((item) => item.message.details?.turn_id === activeBeforeSteer.details.turn_id);
+  eq("steering is durable worker history", [
+    steeredCompletion?.message.content.includes("steered 2"),
+    (await readStatus(workerId)).steering_updates.length,
+  ], [true, 0]);
+
   let releaseQueuedFirst!: (message: unknown) => void;
   let releaseQueuedSecond!: (message: unknown) => void;
   let markQueuedFirstStarted!: () => void;
@@ -696,9 +923,11 @@ try {
   const queuedFirstStarted = new Promise<void>((resolve) => { markQueuedFirstStarted = resolve; });
   const queuedSecondStarted = new Promise<void>((resolve) => { markQueuedSecondStarted = resolve; });
   let queuedProviderCalls = 0;
-  completeImpl = async () => {
+  let queuedFirstContext = "";
+  completeImpl = async (_model, completeContext) => {
     queuedProviderCalls++;
     if (queuedProviderCalls === 1) {
+      queuedFirstContext = JSON.stringify(completeContext);
       markQueuedFirstStarted();
       return new Promise((resolve) => { releaseQueuedFirst = resolve; });
     }
@@ -707,7 +936,7 @@ try {
   };
   const activeBeforeQueue = await followup.execute("queue-active", { worker_id: workerId, message: "continue current work" }, undefined, undefined, context);
   await queuedFirstStarted;
-  const queuedCorrection = await followup.execute("queue-correction", { worker_id: workerId, message: "change attendees to 2" }, undefined, undefined, context);
+  const queuedCorrection = await followup.execute("queue-correction", { worker_id: workerId, message: "change attendees to 2", when_busy: "queue" }, undefined, undefined, context);
   await new Promise((resolve) => setTimeout(resolve, 80));
   const queuedWorkerStatus = await readStatus(workerId);
   eq("busy followup queues without interrupting", [
@@ -717,7 +946,9 @@ try {
     queuedWorkerStatus.active_turn,
     queuedWorkerStatus.queued_followups.length,
     fusionStatusLine.includes("queued 1"),
-  ], ["queued", "queue", 1, activeBeforeQueue.details.turn_id, 1, true]);
+    queuedFirstContext.includes("also add the regression test"),
+    queuedFirstContext.includes("keep the public API unchanged"),
+  ], ["queued", "queue", 1, activeBeforeQueue.details.turn_id, 1, true, true, true]);
   releaseQueuedFirst({ role: "assistant", content: [{ type: "text", text: "first done" }], stopReason: "stop", timestamp: Date.now() });
   await queuedSecondStarted;
   const runningQueuedFollowup = await readStatus(workerId);
@@ -728,9 +959,47 @@ try {
     runningQueuedFollowup.queued_followups.length,
     firstCompletion?.message.details?.next_turn_id,
     firstCompletion?.message.content.includes("Do not resend it"),
-  ], [3, 0, queuedFollowupTurnId, true]);
+  ], [(activeBeforeQueue.details.generation as number) + 1, 0, queuedFollowupTurnId, true]);
   releaseQueuedSecond({ role: "assistant", content: [{ type: "text", text: "second done" }], stopReason: "stop", timestamp: Date.now() });
   await waitForStatus(queuedFollowupTurnId, "completed");
+
+  let rejectSteeredFailure!: (reason?: unknown) => void;
+  let releasePromotedRetry!: (message: unknown) => void;
+  let markSteeredFailureStarted!: () => void;
+  let markPromotedRetryStarted!: () => void;
+  const steeredFailureStarted = new Promise<void>((resolve) => { markSteeredFailureStarted = resolve; });
+  const promotedRetryStarted = new Promise<void>((resolve) => { markPromotedRetryStarted = resolve; });
+  let failureProviderCalls = 0;
+  let promotedRetryContext = "";
+  completeImpl = async (_model, completeContext) => {
+    failureProviderCalls++;
+    if (failureProviderCalls === 1) {
+      markSteeredFailureStarted();
+      return new Promise((_resolve, reject) => { rejectSteeredFailure = reject; });
+    }
+    promotedRetryContext = JSON.stringify(completeContext);
+    markPromotedRetryStarted();
+    return new Promise((resolve) => { releasePromotedRetry = resolve; });
+  };
+  const failureActive = await followup.execute("failure-active", { worker_id: workerId, message: "work that will hit a provider error" }, undefined, undefined, context);
+  await steeredFailureStarted;
+  const steerBeforeFailure = await followup.execute("failure-steer", { worker_id: workerId, message: "retain this accepted update" }, undefined, undefined, context);
+  rejectSteeredFailure(new Error("simulated provider failure"));
+  await promotedRetryStarted;
+  const promotedRetryStatus = await readStatus(workerId);
+  const promotedRetryTurnId = promotedRetryStatus.active_turn as string;
+  const failedCompletion = completionMessages.find((item) => item.message.details?.turn_id === failureActive.details.turn_id);
+  eq("provider failure promotes accepted steering update", [
+    steerBeforeFailure.details.status,
+    (await readStatus(failureActive.details.turn_id)).status,
+    promotedRetryTurnId !== failureActive.details.turn_id,
+    promotedRetryStatus.queued_followups.length,
+    promotedRetryContext.includes("retain this accepted update"),
+    promotedRetryContext.includes("ended before its live updates were durably completed"),
+    failedCompletion?.message.details?.next_turn_id,
+  ], ["steering", "failed", true, 0, true, true, promotedRetryTurnId]);
+  releasePromotedRetry({ role: "assistant", content: [{ type: "text", text: "promoted update done" }], stopReason: "stop", timestamp: Date.now() });
+  await waitForStatus(promotedRetryTurnId, "completed");
 
   let immediateSignal: AbortSignal | undefined;
   let rejectInterruptedCleanup!: (reason?: unknown) => void;
@@ -761,6 +1030,13 @@ try {
   };
   const interruptible = await followup.execute("interrupt-active", { worker_id: workerId, message: "keep doing the old plan" }, undefined, undefined, context);
   await interruptibleStarted;
+  const steerBeforeInterrupt = await followup.execute(
+    "steer-before-interrupt",
+    { worker_id: workerId, message: "preserve the existing public API" },
+    undefined,
+    undefined,
+    context,
+  );
   const immediateCorrection = await followup.execute(
     "interrupt-correction",
     { worker_id: workerId, message: "stop and use 2 attendees", when_busy: "interrupt" },
@@ -791,12 +1067,15 @@ try {
     immediateCorrection.details.status,
     immediateCorrection.details.when_busy,
     immediateCorrection.details.interrupted_turn_id,
+    immediateCorrection.details.absorbed_steers,
+    steerBeforeInterrupt.details.status,
     (await readStatus(interruptible.details.turn_id)).status,
     immediateTurnId !== interruptible.details.turn_id,
     afterImmediateStart.queued_followups.length,
     immediateContext.includes("Partial filesystem or command side effects may remain"),
+    immediateContext.includes("preserve the existing public API"),
     immediateContext.includes("stop and use 2 attendees"),
-  ], ["interrupting", "interrupt", interruptible.details.turn_id, "interrupted", true, 1, true, true]);
+  ], ["interrupting", "interrupt", interruptible.details.turn_id, 1, "steering", "interrupted", true, 1, true, true, true]);
   releaseImmediate({ role: "assistant", content: [{ type: "text", text: "immediate done" }], stopReason: "stop", timestamp: Date.now() });
   await afterCleanupStarted;
   const afterCleanupStatus = await readStatus(workerId);
@@ -893,6 +1172,13 @@ try {
     inquiryContexts[1]?.includes("private inquiry reasoning"),
   ], [inquiryId, 4, false, true, false]);
 
+  const steerToCancel = await followup.execute(
+    "steer-before-standalone-interrupt",
+    { worker_id: deferredWorkerId, message: "this pending update will be cancelled" },
+    undefined,
+    undefined,
+    context,
+  );
   hostController.abort();
   await new Promise((resolve) => setTimeout(resolve, 10));
   const detachedTurn = await readStatus(deferredTurnId);
@@ -905,11 +1191,19 @@ try {
     detachedWorker.consecutive_failures,
     executorSignal?.aborted,
   ], ["running", true, "running", deferredTurnId, 0, false]);
-  await interrupt.execute("interrupt", { worker_id: deferredWorkerId }, undefined, undefined, context);
+  const standaloneInterrupt = await interrupt.execute("interrupt", { worker_id: deferredWorkerId }, undefined, undefined, context);
   const deferredTurn = await waitForStatus(deferredTurnId, "interrupted");
   const deferredWorker = await readStatus(deferredWorkerId);
   await new Promise((resolve) => setTimeout(resolve, 80));
-  eq("explicit interrupt stops detached turn", [deferredTurn.status, deferredWorker.active_turn, executorSignal?.aborted, fusionStatusLine.includes("Fusion available")], ["interrupted", null, true, true]);
+  eq("explicit interrupt stops detached turn", [
+    steerToCancel.details.status,
+    standaloneInterrupt.details.steering_updates_cancelled,
+    deferredTurn.status,
+    deferredWorker.active_turn,
+    deferredWorker.steering_updates.length,
+    executorSignal?.aborted,
+    fusionStatusLine.includes("Fusion available"),
+  ], ["steering", 1, "interrupted", null, 0, true, true]);
 
   const worktreeSuffix = Date.now().toString(36);
   const preWorktree = `pre-cancel-${worktreeSuffix}`;
@@ -1141,10 +1435,18 @@ try {
   };
   const shutdownRun = await spawn.execute("shutdown", { task: "stop with session" }, undefined, undefined, context);
   await shutdownStarted;
+  const shutdownSteer = await followup.execute("shutdown-steer", { worker_id: shutdownRun.details.worker_id, message: "apply before shutdown" }, undefined, undefined, context);
   const messagesBeforeShutdown = completionMessages.length;
   await lifecycleHandlers.get("session_shutdown")?.({}, context);
   const shutdownTurn = await readStatus(shutdownRun.details.turn_id as string);
-  eq("session shutdown interrupts without stale completion", [shutdownTurn.status, shutdownSignal?.aborted, completionMessages.length], ["interrupted", true, messagesBeforeShutdown]);
+  const shutdownWorker = await readStatus(shutdownRun.details.worker_id as string);
+  eq("session shutdown interrupts without stale completion", [
+    shutdownSteer.details.status,
+    shutdownTurn.status,
+    shutdownSignal?.aborted,
+    shutdownWorker.steering_updates.length,
+    completionMessages.length,
+  ], ["steering", "interrupted", true, 0, messagesBeforeShutdown]);
 } finally {
   rmSync(fusionDir, { recursive: true, force: true });
 }
@@ -1217,7 +1519,51 @@ await commands.get("fusion-thinking")!.handler("high", {
 const thinkingEntry = thinkingBranch.at(-1) as { customType: string; data: { thinkingLevel: string } };
 eq("fusion thinking command", [thinkingEntry.customType, thinkingEntry.data.thinkingLevel, thinkingNotice], ["fusion-thinking", "high", "Fusion thinking: high (session override)"]);
 
-// --- 12. /fusion-consent persists allow, ask, and clear overrides ---
+// --- 12. /fusion-fast controls OpenAI priority processing ---
+const fastFixture = mkdtempSync(_join(tmpdir(), "fusion-fast-config-"));
+mkdirSync(_join(fastFixture, ".pi"));
+writeFileSync(_join(fastFixture, ".pi", "fusion.json"), JSON.stringify({ executor: "openai-codex/gpt-5.6-luna", fastMode: false }));
+const fastCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+const fastBranch: unknown[] = [];
+let fastNotice = "";
+fusionExtension({
+  on: () => {},
+  registerTool: () => {},
+  registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => fastCommands.set(name, command),
+  appendEntry: (customType: string, data: unknown) => fastBranch.push({ type: "custom", customType, data }),
+} as never);
+const fastCommandModel = { provider: "openai-codex", id: "gpt-5.6-luna", api: "openai-codex-responses", input: ["text"], reasoning: true };
+const fastCommandContext = {
+  cwd: fastFixture,
+  mode: "tui",
+  hasUI: true,
+  ui: {
+    notify: (text: string) => { fastNotice = text; },
+    setStatus: () => {},
+  },
+  sessionManager: { getBranch: () => fastBranch },
+  isProjectTrusted: () => true,
+  model: undefined,
+  modelRegistry: {
+    getAll: () => [fastCommandModel],
+    getAvailable: () => [fastCommandModel],
+    hasConfiguredAuth: () => true,
+  },
+};
+await fastCommands.get("fusion-fast")!.handler("status", fastCommandContext);
+eq("fusion fast off status", fastNotice, "Fusion fast mode: off (config file) • default provider service tier");
+await fastCommands.get("fusion-fast")!.handler("on", fastCommandContext);
+const fastOnEntry = fastBranch.at(-1) as { customType: string; data: { fastMode: boolean } };
+eq("fusion fast on", [fastOnEntry.customType, fastOnEntry.data.fastMode, fastNotice.includes("on (session override)"), fastNotice.includes("priority")], ["fusion-fast", true, true, true]);
+await fastCommands.get("fusion-fast")!.handler("off", fastCommandContext);
+const fastOffEntry = fastBranch.at(-1) as { customType: string; data: { fastMode: boolean } };
+eq("fusion fast off", [fastOffEntry.customType, fastOffEntry.data.fastMode, fastNotice], ["fusion-fast", false, "Fusion fast mode: off (session override) • default provider service tier"]);
+await fastCommands.get("fusion-fast")!.handler("default", fastCommandContext);
+const fastDefaultEntry = fastBranch.at(-1) as { customType: string; data: { fastMode?: boolean } };
+eq("fusion fast default", [fastDefaultEntry.customType, "fastMode" in fastDefaultEntry.data, fastNotice], ["fusion-fast", false, "Fusion fast mode: off (config/default) • default provider service tier"]);
+rmSync(fastFixture, { recursive: true, force: true });
+
+// --- 13. /fusion-consent persists allow, ask, and clear overrides ---
 const consentFixture = mkdtempSync(_join(tmpdir(), "fusion-consent-config-"));
 mkdirSync(_join(consentFixture, ".pi"));
 writeFileSync(_join(consentFixture, ".pi", "fusion.json"), JSON.stringify({ executorToolsConsent: false }));

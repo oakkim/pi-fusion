@@ -3,7 +3,7 @@
  *
  * Tools (planner calls these; executor never sees them):
  * - fusion_spawn   : start a persistent worker turn asynchronously (wrk_... + trn_...)
- * - fusion_followup: continue the SAME worker; queue or interrupt when it is busy
+ * - fusion_followup: continue the SAME worker; steer, queue, or interrupt when busy
  * - fusion_ask     : ask a read-only sidecar rooted in a worker's context
  * - fusion_status  : inspect worker, turn, inquiry, or inquiry turn without blocking
  * - fusion_interrupt: stop the active turn, keep the worker (no failure recorded)
@@ -17,6 +17,7 @@ import { Type } from "typebox";
 import {
   applyConsentOverride,
   applyDefaults,
+  applyFastModeOverride,
   applyOverride,
   applyThinkingOverride,
   FUSION_THINKING_LEVELS,
@@ -24,12 +25,13 @@ import {
   loadConfig,
   type ConsentOverride,
   type ExecutorOverride,
+  type FastModeOverride,
   type ThinkingOverride,
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
 import { SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
 import { FusionPaneController, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
-import { getTextContent, runExecutorTurn } from "./llm.ts";
+import { getTextContent, runExecutorTurn, supportsOpenAIFastMode } from "./llm.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
 import { WorkerRuntime, type WorkerRecord } from "./runtime.ts";
@@ -47,19 +49,29 @@ const SpawnParams = Type.Object({
   context_turns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, default: 4 })),
 });
 
-const FollowupBusyStrategy = Type.Union([Type.Literal("queue"), Type.Literal("interrupt")], {
-  default: "queue",
-  description: "Behavior when the worker is busy: queue safely after the current turn (default), or interrupt it and run this instruction after cleanup.",
+const FollowupBusyStrategy = Type.Union([Type.Literal("steer"), Type.Literal("queue"), Type.Literal("interrupt")], {
+  default: "steer",
+  description: "Behavior when busy: steer related updates into the active turn at its next safe checkpoint (default), queue a separate turn, or interrupt and restart after cleanup.",
 });
 
-type FollowupBusyStrategy = "queue" | "interrupt";
+type FollowupBusyStrategy = "steer" | "queue" | "interrupt";
+type DeferredFollowupStrategy = Exclude<FollowupBusyStrategy, "steer">;
 
 interface PendingFollowup {
   id: string;
   message: string;
   languageSample: string;
-  strategy: FollowupBusyStrategy;
+  strategy: DeferredFollowupStrategy;
   interruptedTurnId?: string;
+  enqueuedAt: number;
+}
+
+interface SteeringInstruction {
+  id: string; // str_...
+  workerId: string;
+  turnId: string;
+  message: string;
+  status: "pending" | "injected";
   enqueuedAt: number;
 }
 
@@ -90,7 +102,7 @@ const MergeParams = Type.Object({
 
 const InterruptParams = Type.Object({
   worker_id: Type.String({ description: "Worker ID (wrk_...) whose active turn to stop. The worker stays open; no failure is recorded." }),
-  cancel_queued: Type.Optional(Type.Boolean({ description: "Also cancel queued follow-ups. Default true." })),
+  cancel_queued: Type.Optional(Type.Boolean({ description: "Also cancel pending steering updates and queued follow-ups. Default true." })),
 });
 
 /** Serialize mutating executor runs to avoid clobbered writes (port of pi-devin-fusion). */
@@ -249,6 +261,10 @@ export default function (pi: ExtensionAPI) {
   const backgroundTurns = new Map<string, Promise<void>>();
   const backgroundInquiries = new Map<string, Promise<void>>();
   const pendingFollowups = new Map<string, PendingFollowup[]>();
+  const steeringInstructions = new Map<string, SteeringInstruction[]>();
+  // Close acceptance atomically at the final checkpoint so a late steer is
+  // queued instead of being acknowledged and then lost during finishTurn().
+  const closedSteeringTurns = new Set<string>();
   let activeContext: ExtensionContext | undefined;
   let sessionActive = true;
   let sessionEpoch = 0;
@@ -333,6 +349,30 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function restoreFastModeOverride(ctx: ExtensionContext): FastModeOverride | undefined {
+    try {
+      const branch = ctx.sessionManager.getBranch() as unknown[];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const e = branch[i] as { type?: unknown; customType?: unknown; data?: unknown };
+        if (e?.type === "custom" && e?.customType === "fusion-fast" && e.data && typeof e.data === "object") {
+          const fastMode = (e.data as { fastMode?: unknown }).fastMode;
+          return typeof fastMode === "boolean" ? { fastMode } : {};
+        }
+      }
+    } catch {
+      // fall through
+    }
+    return undefined;
+  }
+
+  function persistFastModeOverride(override: FastModeOverride): void {
+    try {
+      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-fast", { ...override, timestamp: Date.now() });
+    } catch {
+      // journal is best-effort
+    }
+  }
+
   function restoreConsentOverride(ctx: ExtensionContext): ConsentOverride | undefined {
     try {
       const branch = ctx.sessionManager.getBranch() as unknown[];
@@ -410,7 +450,79 @@ export default function (pi: ExtensionAPI) {
   function effectiveConfig(ctx: ExtensionContext) {
     const modelConfig = applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx));
     const thinkingConfig = applyThinkingOverride(modelConfig, restoreThinkingOverride(ctx));
-    return applyDefaults(applyConsentOverride(thinkingConfig, restoreConsentOverride(ctx)));
+    const fastConfig = applyFastModeOverride(thinkingConfig, restoreFastModeOverride(ctx));
+    return applyDefaults(applyConsentOverride(fastConfig, restoreConsentOverride(ctx)));
+  }
+
+  function steeringFor(workerId: string, turnId?: string): SteeringInstruction[] {
+    const entries = steeringInstructions.get(workerId) ?? [];
+    return turnId ? entries.filter((entry) => entry.turnId === turnId) : entries;
+  }
+
+  function drainSteeringMessages(workerId: string, turnId: string, finalCheckpoint = false): Message[] {
+    const pending = steeringFor(workerId, turnId).filter((entry) => entry.status === "pending");
+    if (pending.length === 0) {
+      if (finalCheckpoint) closedSteeringTurns.add(turnId);
+      return [];
+    }
+    closedSteeringTurns.delete(turnId);
+    for (const entry of pending) entry.status = "injected";
+    return [userMsg([
+      `<fusion_steer turn="${turnId}">`,
+      "The Lead supplied these related updates while this turn was running. Incorporate them into the current work before final validation and reporting. Later instructions take precedence when they conflict.",
+      JSON.stringify(pending.map((entry) => ({ steer_id: entry.id, instruction: entry.message })), null, 2),
+      "</fusion_steer>",
+    ].join("\n"))];
+  }
+
+  function clearSteering(workerId: string, turnId?: string): SteeringInstruction[] {
+    const entries = steeringInstructions.get(workerId) ?? [];
+    const removed = turnId ? entries.filter((entry) => entry.turnId === turnId) : entries;
+    const keep = turnId ? entries.filter((entry) => entry.turnId !== turnId) : [];
+    if (keep.length > 0) steeringInstructions.set(workerId, keep);
+    else steeringInstructions.delete(workerId);
+    if (turnId) closedSteeringTurns.delete(turnId);
+    else {
+      const activeTurnId = runtime.getWorker(workerId)?.activeTurnId;
+      const settlingTurnId = unsettledTurnId(workerId);
+      if (activeTurnId) closedSteeringTurns.delete(activeTurnId);
+      if (settlingTurnId) closedSteeringTurns.delete(settlingTurnId);
+      for (const entry of removed) closedSteeringTurns.delete(entry.turnId);
+    }
+    return removed;
+  }
+
+  function absorbSteering(workerId: string, turnId: string | undefined, interruptMessage: string): { message: string; count: number } {
+    const accepted = clearSteering(workerId, turnId);
+    if (accepted.length === 0) return { message: interruptMessage, count: 0 };
+    return {
+      message: [
+        "The previous turn accepted the following related updates before it was interrupted. Inspect current state because some may already be partially applied, then satisfy all non-conflicting updates. The latest interrupting instruction takes precedence on conflict.",
+        JSON.stringify(accepted.map((entry) => ({ steer_id: entry.id, instruction: entry.message })), null, 2),
+        "",
+        "Latest interrupting instruction:",
+        interruptMessage,
+      ].join("\n"),
+      count: accepted.length,
+    };
+  }
+
+  function promoteSteeringToQueue(workerId: string, turnId: string, reason: string): number {
+    const accepted = clearSteering(workerId, turnId);
+    if (accepted.length === 0) return 0;
+    const queue = pendingFollowups.get(workerId) ?? [];
+    if (!pendingFollowups.has(workerId)) pendingFollowups.set(workerId, queue);
+    queue.unshift({
+      id: `qfu_${crypto.randomUUID()}`,
+      message: [
+        `The previous turn ended before its live updates were durably completed (${reason}). Inspect current state, then apply these accepted updates:`,
+        JSON.stringify(accepted.map((entry) => ({ steer_id: entry.id, instruction: entry.message })), null, 2),
+      ].join("\n"),
+      languageSample: accepted.at(-1)?.message ?? "",
+      strategy: "queue",
+      enqueuedAt: Date.now(),
+    });
+    return accepted.length;
   }
 
   function refreshStatus(ctx: ExtensionContext): void {
@@ -428,8 +540,14 @@ export default function (pi: ExtensionAPI) {
         const more = active.length > 1 ? ` • +${active.length - 1}` : "";
         const queued = pendingFollowups.get(worker.id)?.length ?? 0;
         const queuedText = queued > 0 ? ` • queued ${queued}` : "";
+        const steers = steeringFor(worker.id, worker.activeTurnId ?? undefined);
+        const pendingSteers = steers.filter((entry) => entry.status === "pending").length;
+        const injectedSteers = steers.length - pendingSteers;
+        const steerText = pendingSteers > 0
+          ? ` • steer ${pendingSteers}`
+          : injectedSteers > 0 ? ` • updates ${injectedSteers}` : "";
         const action = worker.status === "running" ? formatLiveStatusAction(activity) : "settling";
-        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${action} • ${elapsed}${queuedText}${more}`);
+        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${action} • ${elapsed}${steerText}${queuedText}${more}`);
         return;
       }
       const mode = restoreMode(ctx);
@@ -438,7 +556,10 @@ export default function (pi: ExtensionAPI) {
       const resolved = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
       const execLabel = resolved ? modelDisplay(resolved) : "unset";
       const thinkingLevel = resolved ? clampThinkingLevel(resolved, cfg.thinkingLevel) : "off";
-      ctx.ui.setStatus("fusion", `${modeLabel(mode)} • executor ${execLabel} • thinking ${thinkingLevel}`);
+      const fastLabel = resolved && supportsOpenAIFastMode(resolved)
+        ? ` • fast ${cfg.fastMode ? "on" : "off"}`
+        : cfg.fastMode ? " • fast n/a" : "";
+      ctx.ui.setStatus("fusion", `${modeLabel(mode)} • executor ${execLabel} • thinking ${thinkingLevel}${fastLabel}`);
     } catch {
       // status is cosmetic
     }
@@ -472,6 +593,8 @@ export default function (pi: ExtensionAPI) {
       sessionActive = false;
       sessionEpoch += 1;
       pendingFollowups.clear();
+      steeringInstructions.clear();
+      closedSteeringTurns.clear();
       pane.shutdown();
     }
     await stopBackgroundTurns();
@@ -605,6 +728,7 @@ export default function (pi: ExtensionAPI) {
     };
     const interruptedResult = () => {
       if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
+      clearSteering(workerId, turnId);
       runtime.untrackController(turnId);
       clearLive();
       persistCurrent();
@@ -633,6 +757,7 @@ export default function (pi: ExtensionAPI) {
     const rung = rungFor(worker.failures, ladder.length);
     const executor = ladder[rung]!;
     const thinkingLevel = clampThinkingLevel(executor, cfg.thinkingLevel);
+    const fastMode = cfg.fastMode && supportsOpenAIFastMode(executor);
 
     const execCwd = worker.worktree ? execDirOf(worker.worktree) : ctx.cwd;
     const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
@@ -655,6 +780,8 @@ export default function (pi: ExtensionAPI) {
         ctx,
         thinkingLevel,
         (progress) => pane.updateLive(workerId, progress, liveToken),
+        (finalCheckpoint) => drainSteeringMessages(workerId, turnId, finalCheckpoint),
+        fastMode,
       );
     };
 
@@ -667,12 +794,14 @@ export default function (pi: ExtensionAPI) {
         const status = worker.status === "closed"
           ? "closed"
           : runtime.getTurn(turnId)?.status === "interrupted" ? "interrupted" : "stale";
+        clearSteering(workerId, turnId);
         persistCurrent();
         return {
           text: JSON.stringify({ status, worker_id: workerId, turn_id: turnId }, null, 2),
           details: { status, worker_id: workerId, turn_id: turnId },
         };
       }
+      const steeredInstructions = clearSteering(workerId, turnId).length;
       // Independent compaction per worker (fusion-ref): the ladder rung is
       // re-evaluated from failures every turn, so a compaction boundary also
       // re-routes for free.
@@ -686,16 +815,19 @@ export default function (pi: ExtensionAPI) {
           generation: turn.generation,
           executor: modelDisplay(executor),
           thinking_level: thinkingLevel,
+          fast_mode: fastMode,
+          service_tier: fastMode ? "priority" : "default",
           rung,
           usage: result.usage,
           turns: result.turns,
           tool_calls: result.toolCalls.length,
+          steered_instructions: steeredInstructions,
           timestamp: Date.now(),
         });
       } catch {
         // cost journal is best-effort
       }
-      const header = `[fusion ${worker.id} | turn ${turnId} | generation ${turn.generation} | executor ${modelDisplay(executor)} | thinking ${thinkingLevel}${rung > 0 ? ` | escalated rung ${rung}` : ""}]`;
+      const header = `[fusion ${worker.id} | turn ${turnId} | generation ${turn.generation} | executor ${modelDisplay(executor)} | thinking ${thinkingLevel}${fastMode ? " | fast priority" : ""}${rung > 0 ? ` | escalated rung ${rung}` : ""}${steeredInstructions > 0 ? ` | steered ${steeredInstructions}` : ""}]`;
       return {
         text: `${header}\n\n${output}`,
         details: {
@@ -705,6 +837,8 @@ export default function (pi: ExtensionAPI) {
           generation: turn.generation,
           executor_model: modelDisplay(executor),
           thinking_level: thinkingLevel,
+          fast_mode: fastMode,
+          service_tier: fastMode ? "priority" : "default",
           rung,
           escalated: rung > 0,
           ladder: ladder.map(modelDisplay),
@@ -712,6 +846,7 @@ export default function (pi: ExtensionAPI) {
           turns: result.turns,
           tool_calls: result.toolCalls,
           capped: result.cappedOut,
+          steered_instructions: steeredInstructions,
           compacted,
           warnings,
         },
@@ -725,11 +860,12 @@ export default function (pi: ExtensionAPI) {
       }
       const message = err instanceof Error ? err.message : String(err);
       runtime.failTurn(turnId, message);
+      const promotedSteers = promoteSteeringToQueue(workerId, turnId, message);
       persistCurrent();
       pane.refresh();
       return {
-        text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message, consecutive_failures: worker.failures, next_rung: rungFor(worker.failures, ladder.length) }, null, 2),
-        details: { status: "error", worker_id: workerId, turn_id: turnId, error: message },
+        text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message, consecutive_failures: worker.failures, next_rung: rungFor(worker.failures, ladder.length), promoted_steers: promotedSteers }, null, 2),
+        details: { status: "error", worker_id: workerId, turn_id: turnId, error: message, promoted_steers: promotedSteers },
       };
     } finally {
       runtime.untrackController(turnId);
@@ -829,11 +965,12 @@ export default function (pi: ExtensionAPI) {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         if (runtime.getTurn(turnId)?.status === "running") runtime.failTurn(turnId, message);
+        const promotedSteers = promoteSteeringToQueue(workerId, turnId, message);
         pane.clearLive(workerId);
         if (sessionActive && sessionEpoch === epoch) persist(ctx, workerId);
         outcome = {
-          text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message }, null, 2),
-          details: { status: "error", worker_id: workerId, turn_id: turnId, error: message },
+          text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message, promoted_steers: promotedSteers }, null, 2),
+          details: { status: "error", worker_id: workerId, turn_id: turnId, error: message, promoted_steers: promotedSteers },
         };
       }
       // Remove the settled task before dispatching the next queued turn. This
@@ -850,6 +987,7 @@ export default function (pi: ExtensionAPI) {
   function inquiryObservation(worker: WorkerRecord, capturedAt: number): string {
     const activity = pane.getLive(worker.id);
     const queued = pendingFollowups.get(worker.id) ?? [];
+    const steers = steeringFor(worker.id, worker.activeTurnId ?? undefined);
     return JSON.stringify({
       captured_at: new Date(capturedAt).toISOString(),
       private_thinking_available: false,
@@ -873,6 +1011,11 @@ export default function (pi: ExtensionAPI) {
           output: tool.output.slice(-2_000),
         })),
       } : null,
+      steering_updates: steers.map((item) => ({
+        steer_id: item.id,
+        status: item.status,
+        message: item.message.slice(0, 2_000),
+      })),
       queued_followups: queued.map((item) => ({
         queue_id: item.id,
         strategy: item.strategy,
@@ -946,6 +1089,7 @@ export default function (pi: ExtensionAPI) {
       try {
         const cfg = effectiveConfig(ctx);
         const thinkingLevel = clampThinkingLevel(executor, cfg.thinkingLevel);
+        const fastMode = cfg.fastMode && supportsOpenAIFastMode(executor);
         const result = await runExecutorTurn(
           ctx.modelRegistry,
           executor,
@@ -958,6 +1102,9 @@ export default function (pi: ExtensionAPI) {
           1,
           ctx,
           thinkingLevel,
+          undefined,
+          undefined,
+          fastMode,
         );
         controller.signal.throwIfAborted();
         const answer = getTextContent(result.message).trim() || "No visible answer was returned.";
@@ -976,6 +1123,8 @@ export default function (pi: ExtensionAPI) {
             worker_id: thread.workerId,
             executor: modelDisplay(executor),
             thinking_level: thinkingLevel,
+            fast_mode: fastMode,
+            service_tier: fastMode ? "priority" : "default",
             usage: result.usage,
             turns: result.turns,
             timestamp: Date.now(),
@@ -1069,6 +1218,8 @@ export default function (pi: ExtensionAPI) {
       worker_turn_id: turn.workerTurnId,
       captured_at: turn.capturedAt,
       executor: modelDisplay(executor),
+      fast_mode: cfg.fastMode && supportsOpenAIFastMode(executor),
+      service_tier: cfg.fastMode && supportsOpenAIFastMode(executor) ? "priority" : "default",
       worker_remembers_inquiry: false,
       message: "Read-only side inquiry continues in the background and will automatically return to the Lead. The main worker cannot see or remember this inquiry."
     };
@@ -1143,6 +1294,8 @@ export default function (pi: ExtensionAPI) {
         turn_id: turn.id,
         generation: turn.generation,
         executor: worker.executorModelId,
+        fast_mode: cfg.fastMode && supportsOpenAIFastMode(executor),
+        service_tier: cfg.fastMode && supportsOpenAIFastMode(executor) ? "priority" : "default",
         worktree: worker.worktree ? { name: worker.worktree.name, branch: worker.worktree.branch, path: worker.worktree.path } : undefined,
         message: "Worker continues in the background. Continue the conversation; the Lead will automatically resume when the result arrives.",
       };
@@ -1156,14 +1309,16 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Asynchronously continue the SAME persistent sidekick worker (wrk_...).",
       "If the worker is idle, returns a new turn_id and starts immediately.",
-      "If busy, when_busy=queue (default) runs the instruction after the current turn; when_busy=interrupt aborts the active turn and starts the new instruction as soon as cleanup settles.",
+      "If busy, when_busy=steer (default) injects a related update into the active turn at its next safe checkpoint; queue waits for a separate turn; interrupt aborts and restarts after cleanup.",
       "Completion automatically queues behind an active Lead turn or wakes an idle Lead.",
     ].join(" "),
     promptGuidelines: [
       "Prefer fusion_followup over fusion_spawn when correcting or extending a worker's previous result.",
       "Include what was wrong and the exact correction; the worker already knows the prior context.",
-      "Busy workers accept queued follow-ups by default; do not wait or retry manually. Use when_busy=interrupt only when allowing the current work to continue is unsafe or wasteful, because partial tool side effects are not rolled back.",
-      "fusion_followup is non-blocking. Continue the conversation instead of polling; personally review the correction when its completion result arrives.",
+      "Choose when_busy deliberately: use steer (default) for related refinements that should share the active turn's context and final validation; use queue only for work that must begin after the current result as a distinct turn; use interrupt only when the current direction is invalid, unsafe, or wasteful because partial tool side effects are not rolled back.",
+      "Examples: adding a test or constraint to the current implementation => steer; benchmarking or follow-on work that requires the completed result => queue; stopping work in the wrong repo or on a destructive path => interrupt.",
+      "Steering is cooperative, not mid-call injection: the worker receives updates after the current model response or tool batch completes. A long-running tool must return before the update is visible.",
+      "fusion_followup is non-blocking. Continue the conversation instead of polling; personally review the final integrated result when it arrives.",
       "Provider failures auto-escalate the worker one rung up the fallback ladder (and de-escalate on success) — retry via followup before taking over.",
     ],
     parameters: FollowupParams,
@@ -1186,12 +1341,45 @@ export default function (pi: ExtensionAPI) {
       const existingQueue = pendingFollowups.get(worker.id);
       const settlingTurnId = unsettledTurnId(worker.id);
       if (worker.activeTurnId || settlingTurnId || (existingQueue?.length ?? 0) > 0) {
-        const strategy: FollowupBusyStrategy = params.when_busy ?? "queue";
+        const requestedStrategy: FollowupBusyStrategy = params.when_busy ?? "steer";
         const activeTurnId = worker.activeTurnId;
+
+        if (requestedStrategy === "steer" && activeTurnId && !closedSteeringTurns.has(activeTurnId)) {
+          const steer: SteeringInstruction = {
+            id: `str_${crypto.randomUUID()}`,
+            workerId: worker.id,
+            turnId: activeTurnId,
+            message: params.message,
+            status: "pending",
+            enqueuedAt: Date.now(),
+          };
+          const entries = steeringInstructions.get(worker.id) ?? [];
+          if (!steeringInstructions.has(worker.id)) steeringInstructions.set(worker.id, entries);
+          entries.push(steer);
+          pane.refresh();
+          refreshStatus(ctx);
+          const accepted = {
+            status: "steering",
+            asynchronous: true,
+            worker_id: worker.id,
+            active_turn_id: activeTurnId,
+            steer_id: steer.id,
+            position: entries.filter((entry) => entry.turnId === activeTurnId && entry.status === "pending").length,
+            when_busy: "steer",
+            message: "The related update will be injected into the active turn at its next safe checkpoint; do not resend it.",
+          };
+          onUpdate?.({ content: [{ type: "text", text: accepted.message }], details: accepted });
+          return { content: [{ type: "text", text: JSON.stringify(accepted, null, 2) }], details: accepted };
+        }
+
+        const strategy: DeferredFollowupStrategy = requestedStrategy === "steer" ? "queue" : requestedStrategy;
         const precedingTurnId = activeTurnId ?? settlingTurnId;
+        const absorbed = strategy === "interrupt"
+          ? absorbSteering(worker.id, precedingTurnId, params.message)
+          : { message: params.message, count: 0 };
         const pending: PendingFollowup = {
           id: `qfu_${crypto.randomUUID()}`,
-          message: params.message,
+          message: absorbed.message,
           languageSample: userLanguageSample,
           strategy,
           ...(strategy === "interrupt" && precedingTurnId ? { interruptedTurnId: precedingTurnId } : {}),
@@ -1221,21 +1409,22 @@ export default function (pi: ExtensionAPI) {
           worker_id: worker.id,
           queue_id: pending.id,
           position,
-          when_busy: strategy,
+          when_busy: requestedStrategy,
+          effective_when_busy: strategy,
+          absorbed_steers: absorbed.count,
           ...(activeTurnId ? { active_turn_id: activeTurnId } : {}),
           ...(!activeTurnId && settlingTurnId ? { settling_turn_id: settlingTurnId } : {}),
           ...(interruptedTurnId ? { interrupted_turn_id: interruptedTurnId } : {}),
           ...(started ? { started_turn_id: started.turnId } : {}),
           message: started?.queueId === pending.id
-            ? "The queued instruction started in the background."
+            ? "The deferred instruction started in the background."
             : interruptedTurnId
               ? "The active turn was interrupted. This instruction will start automatically after cleanup settles."
-              : "The instruction is queued and will start automatically; do not retry or poll.",
+              : requestedStrategy === "steer"
+                ? "The active turn had already passed its steering boundary, so the instruction was safely queued for the next turn."
+                : "The instruction is queued and will start automatically; do not retry or poll.",
         };
-        onUpdate?.({
-          content: [{ type: "text", text: accepted.message }],
-          details: accepted,
-        });
+        onUpdate?.({ content: [{ type: "text", text: accepted.message }], details: accepted });
         return { content: [{ type: "text", text: JSON.stringify(accepted, null, 2) }], details: accepted };
       }
       const taskText = handoffTaskText(worker.generation + 1, params.message, undefined, worker.label, userLanguageSample);
@@ -1278,7 +1467,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Use fusion_ask when the user asks what an active worker is doing, why an observable action occurred, or what remains, without steering or interrupting it.",
       "Treat inquiry answers as read-only snapshot evidence. The worker does not see or remember them, and private reasoning is unavailable.",
-      "If an inquiry reveals that work must change, send a separate fusion_followup (queue by default or interrupt only when necessary).",
+      "If an inquiry reveals that work must change, send a separate fusion_followup: steer related updates into the active turn, queue only distinct sequential work, or interrupt only when continuing is unsafe or wasteful.",
       "Continue a side conversation with thread_id; do not create a new inquiry thread for every follow-up question.",
     ],
     parameters: AskParams,
@@ -1306,6 +1495,7 @@ export default function (pi: ExtensionAPI) {
         const w = runtime.getWorker(params.id);
         if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.id} was not found.` }) }], details: { status: "error" } };
         const queued = pendingFollowups.get(w.id) ?? [];
+        const steers = steeringFor(w.id, w.activeTurnId ?? undefined);
         return {
           content: [{ type: "text", text: JSON.stringify({
             type: "worker",
@@ -1315,12 +1505,13 @@ export default function (pi: ExtensionAPI) {
             generation: w.generation,
             history_messages: w.history.length,
             consecutive_failures: w.failures,
+            steering_updates: steers.map((item) => ({ steer_id: item.id, turn_id: item.turnId, status: item.status, enqueued_at: item.enqueuedAt })),
             queued_followups: queued.map((item) => ({ queue_id: item.id, strategy: item.strategy, enqueued_at: item.enqueuedAt })),
             label: w.label,
             executor: w.executorModelId,
             worktree: w.worktree ? { name: w.worktree.name, branch: w.worktree.branch, path: w.worktree.path } : undefined,
           }, null, 2) }],
-          details: { status: w.status, queued_followups: queued.length },
+          details: { status: w.status, steering_updates: steers.length, queued_followups: queued.length },
         };
       }
       if (params.id.startsWith("trn_")) {
@@ -1383,8 +1574,9 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
-      runtime.close(params.worker_id);
       const cancelledQueued = pendingFollowups.get(params.worker_id)?.length ?? 0;
+      const cancelledSteers = clearSteering(params.worker_id).length;
+      runtime.close(params.worker_id);
       pendingFollowups.delete(params.worker_id);
       pane.clearLive(params.worker_id);
       let worktreeRemoved = false;
@@ -1400,8 +1592,8 @@ export default function (pi: ExtensionAPI) {
       persist(ctx, params.worker_id);
       pane.refresh();
       return {
-        content: [{ type: "text", text: JSON.stringify({ worker_id: params.worker_id, status: "closed", queued_followups_cancelled: cancelledQueued, worktree_removed: worktreeRemoved, ...(removeError ? { remove_error: removeError } : {}) }) }],
-        details: { status: "closed", queued_followups_cancelled: cancelledQueued },
+        content: [{ type: "text", text: JSON.stringify({ worker_id: params.worker_id, status: "closed", steering_updates_cancelled: cancelledSteers, queued_followups_cancelled: cancelledQueued, worktree_removed: worktreeRemoved, ...(removeError ? { remove_error: removeError } : {}) }) }],
+        details: { status: "closed", steering_updates_cancelled: cancelledSteers, queued_followups_cancelled: cancelledQueued },
       };
     },
   });
@@ -1451,15 +1643,20 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "fusion_interrupt",
     label: "Fusion Interrupt",
-    description: "Stop a worker's active turn but keep the worker open. No failure is recorded. Queued follow-ups are cancelled by default.",
+    description: "Stop a worker's active turn but keep the worker open. No failure is recorded. Pending steering updates and queued follow-ups are cancelled by default.",
     parameters: InterruptParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
-      const interruptedTurnId = runtime.interrupt(params.worker_id);
+      const activeTurnId = w.activeTurnId;
       const cancelQueued = params.cancel_queued !== false;
       const cancelledQueued = cancelQueued ? pendingFollowups.get(params.worker_id)?.length ?? 0 : 0;
+      const cancelledSteers = cancelQueued ? clearSteering(params.worker_id, activeTurnId ?? undefined).length : 0;
+      const promotedSteers = !cancelQueued && activeTurnId
+        ? promoteSteeringToQueue(params.worker_id, activeTurnId, "interrupted by Lead")
+        : 0;
       if (cancelQueued) pendingFollowups.delete(params.worker_id);
+      const interruptedTurnId = runtime.interrupt(params.worker_id);
       pane.clearLive(params.worker_id);
       const started = !cancelQueued && !interruptedTurnId
         ? startNextQueuedFollowup(ctx, params.worker_id, sessionEpoch)
@@ -1472,10 +1669,12 @@ export default function (pi: ExtensionAPI) {
           worker_id: w.id,
           status: w.status,
           interrupted_turn: interruptedTurnId ?? null,
+          steering_updates_cancelled: cancelledSteers,
+          steering_updates_promoted: promotedSteers,
           queued_followups_cancelled: cancelledQueued,
           ...(started ? { started_turn: started.turnId } : {}),
         }) }],
-        details: { status: w.status, queued_followups_cancelled: cancelledQueued },
+        details: { status: w.status, steering_updates_cancelled: cancelledSteers, steering_updates_promoted: promotedSteers, queued_followups_cancelled: cancelledQueued },
       };
     },
   });
@@ -1667,6 +1866,81 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("fusion-fast", {
+    description: "Set OpenAI sidekick priority processing: /fusion-fast [on|off|default|status]",
+    getArgumentCompletions: (prefix) => {
+      const normalized = prefix.trim().toLowerCase();
+      const values = ["on", "off", "default", "status"];
+      const matches = values.filter((value) => value.startsWith(normalized)).map((value) => ({ value, label: value }));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const tell = (text: string, level: "info" | "warning" | "error" = "info") => {
+        if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
+        else ctx.ui.notify(text, level);
+      };
+      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+      const override = restoreFastModeOverride(ctx);
+      const cfg = effectiveConfig(ctx);
+      const warnings: string[] = [];
+      const executor = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
+      const supported = executor ? supportsOpenAIFastMode(executor) : false;
+      const source = typeof override?.fastMode === "boolean"
+        ? "session override"
+        : typeof fileConfig.fastMode === "boolean" ? "config file" : "default";
+      const enabledNote = supported
+        ? "OpenAI priority service tier; higher cost/plan usage"
+        : `not applied to current executor ${executor ? modelDisplay(executor) : "unset"}`;
+      const report = () => tell(`Fusion fast mode: ${cfg.fastMode ? "on" : "off"} (${source}) • ${cfg.fastMode ? enabledNote : "default provider service tier"}`);
+
+      const apply = (next: FastModeOverride, enabled: boolean, nextSource: string) => {
+        persistFastModeOverride(next);
+        refreshStatus(ctx);
+        const level = enabled && !supported ? "warning" : "info";
+        tell(`Fusion fast mode: ${enabled ? "on" : "off"} (${nextSource}) • ${enabled ? enabledNote : "default provider service tier"}`, level);
+      };
+      const setDefault = () => {
+        const configured = fileConfig.fastMode ?? false;
+        apply({}, configured, "config/default");
+      };
+
+      const arg = args.trim().toLowerCase();
+      if (!arg) {
+        if (ctx.mode !== "tui") {
+          report();
+          return;
+        }
+        const choice = await ctx.ui.select(`Fusion fast mode (current: ${cfg.fastMode ? "on" : "off"}):`, [
+          "on (OpenAI priority tier)",
+          "off (provider default)",
+          `default (${fileConfig.fastMode ? "on" : "off"})`,
+        ]);
+        if (!choice) return;
+        if (choice.startsWith("on")) apply({ fastMode: true }, true, "session override");
+        else if (choice.startsWith("off")) apply({ fastMode: false }, false, "session override");
+        else setDefault();
+        return;
+      }
+      if (arg === "status") {
+        report();
+        return;
+      }
+      if (arg === "on" || arg === "fast" || arg === "priority") {
+        apply({ fastMode: true }, true, "session override");
+        return;
+      }
+      if (arg === "off") {
+        apply({ fastMode: false }, false, "session override");
+        return;
+      }
+      if (arg === "default" || arg === "clear") {
+        setDefault();
+        return;
+      }
+      tell(`Unknown fast mode: ${args.trim()}. Use on, off, default, or status.`, "error");
+    },
+  });
+
   pi.registerCommand("fusion-pane", {
     description: "Show optional detailed sidekick pane: /fusion-pane [open|close|toggle|wrk_...]",
     getArgumentCompletions: (prefix) => {
@@ -1812,9 +2086,17 @@ export default function (pi: ExtensionAPI) {
       const warnings: string[] = [];
       const exec = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
       const thinkingLevel = exec ? clampThinkingLevel(exec, cfg.thinkingLevel) : "off";
-      const head = `${modeLabel(restoreMode(ctx))} • executor ${exec ? modelDisplay(exec) : "unset"} • thinking ${thinkingLevel}${cfg.fallbackExecutors.length ? ` • fallbacks ${cfg.fallbackExecutors.join(",")}` : ""}`;
+      const fastLabel = exec && supportsOpenAIFastMode(exec)
+        ? ` • fast ${cfg.fastMode ? "on" : "off"}`
+        : cfg.fastMode ? " • fast n/a" : "";
+      const head = `${modeLabel(restoreMode(ctx))} • executor ${exec ? modelDisplay(exec) : "unset"} • thinking ${thinkingLevel}${fastLabel}${cfg.fallbackExecutors.length ? ` • fallbacks ${cfg.fallbackExecutors.join(",")}` : ""}`;
       const body = workers.length
-        ? workers.map((w) => `${w.id} [${w.status}] g${w.generation} msgs=${w.history.length}${w.worktree ? ` wt=${w.worktree.name}:${w.worktree.branch}` : ""} ${w.label ?? ""} (${w.executorModelId})`).join("\n")
+        ? workers.map((w) => {
+          const steerCount = steeringFor(w.id, w.activeTurnId ?? undefined).length;
+          const queuedCount = pendingFollowups.get(w.id)?.length ?? 0;
+          const activity = `${w.activeTurnId ? ` active=${w.activeTurnId}` : ""}${steerCount ? ` steer=${steerCount}` : ""}${queuedCount ? ` queued=${queuedCount}` : ""}`;
+          return `${w.id} [${w.status}] g${w.generation} msgs=${w.history.length}${activity}${w.worktree ? ` wt=${w.worktree.name}:${w.worktree.branch}` : ""} ${w.label ?? ""} (${w.executorModelId})`;
+        }).join("\n")
         : "No fusion workers yet. The lead can spawn one with fusion_spawn.";
       const inquiryBody = inquiryThreads.length
         ? `\nInquiries (worker does not remember these):\n${inquiryThreads.map((thread) => `${thread.id} [${thread.activeTurnId ? "running" : "idle"}] worker=${thread.workerId} g${thread.generation} msgs=${thread.history.length}`).join("\n")}`

@@ -347,17 +347,15 @@ export class FusionMonitorPublisher {
   }
 
   async open(sessionId: string, root?: string): Promise<string> {
+    // A new session must never inherit the previous session's cached payload.
+    // Capture fresh data before mutating the active path/lifecycle state.
+    const payload = this.#capturePayload(false);
+    if (!payload) throw new Error(this.#lastError ?? "Could not build Fusion monitor snapshot.");
     const lifecycleGeneration = ++this.#lifecycleGeneration;
     const snapshotPath = monitorSnapshotPath(sessionId, root);
     this.#snapshotPath = snapshotPath;
     this.#active = true;
     this.#startHeartbeat();
-    const payload = this.#capturePayload();
-    if (!payload) {
-      this.#active = false;
-      this.#stopTimers();
-      throw new Error(this.#lastError ?? "Could not build Fusion monitor snapshot.");
-    }
     try {
       await this.#enqueueWrite(snapshotPath, {
         ...payload,
@@ -421,14 +419,14 @@ export class FusionMonitorPublisher {
     }
   }
 
-  #capturePayload(): MonitorSnapshotPayload | undefined {
+  #capturePayload(allowLastPayload = true): MonitorSnapshotPayload | undefined {
     try {
       const payload = this.#getPayload();
       this.#lastPayload = payload;
       return payload;
     } catch (error) {
       this.#lastError = error instanceof Error ? error.message : String(error);
-      return this.#lastPayload;
+      return allowLastPayload ? this.#lastPayload : undefined;
     }
   }
 

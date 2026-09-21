@@ -1807,6 +1807,33 @@ await Promise.all([racingCloseFirst, racingReopen]);
 const raceOpenSnapshot = parseMonitorSnapshot(readFileSync(publishedPath, "utf8"));
 eq("monitor serializes close then open", [publisher.active, raceOpenSnapshot?.connected, raceOpenSnapshot?.closed], [true, true, undefined]);
 await publisher.close("race test complete");
+let strictPayload: typeof publishedPayload | undefined = { ...publishedPayload, sessionId: "session-A" };
+const strictPublisher = new FusionMonitorPublisher(() => {
+  if (!strictPayload) throw new Error("payload unavailable");
+  return {
+    schemaVersion: 1,
+    sessionId: strictPayload.sessionId,
+    cwd: strictPayload.cwd,
+    selectedWorkerId: strictPayload.selectedWorkerId,
+    workers: strictPayload.workers,
+  };
+});
+const sessionAPath = await strictPublisher.open("session-A", monitorFixture);
+strictPayload = undefined;
+let sessionBError = "";
+try {
+  await strictPublisher.open("session-B", monitorFixture);
+} catch (error) {
+  sessionBError = error instanceof Error ? error.message : String(error);
+}
+eq("monitor never reuses prior session payload on open", [
+  sessionBError,
+  strictPublisher.active,
+  strictPublisher.path,
+  existsSync(_join(monitorFixture, "session-B.json")),
+  parseMonitorSnapshot(readFileSync(sessionAPath, "utf8"))?.sessionId,
+], ["payload unavailable", true, sessionAPath, false, "session-A"]);
+await strictPublisher.close("strict capture test complete");
 eq("monitor leaves no temporary snapshots", readdirSync(monitorFixture).filter((name) => name.endsWith(".tmp")), []);
 rmSync(monitorFixture, { recursive: true, force: true });
 

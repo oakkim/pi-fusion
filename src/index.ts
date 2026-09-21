@@ -27,6 +27,7 @@ import {
 } from "./config.ts";
 import { buildRecentContext } from "./utils.ts";
 import { SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
+import { FusionPaneController, type PaneState } from "./pane.ts";
 import { getTextContent, runExecutorTurn } from "./llm.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs, selectionLabel } from "./tools.ts";
@@ -93,6 +94,7 @@ function userMsg(text: string): Message {
 
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
+  const pane = new FusionPaneController((id) => runtime.getWorker(id));
 
   function restoreMode(ctx: ExtensionContext): FusionMode {
     try {
@@ -192,6 +194,54 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function restorePaneState(ctx: ExtensionContext): PaneState {
+    try {
+      const branch = ctx.sessionManager.getBranch() as unknown[];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const e = branch[i] as { type?: unknown; customType?: unknown; data?: unknown };
+        if (e?.type === "custom" && e?.customType === "fusion-pane" && e.data && typeof e.data === "object") {
+          const data = e.data as { visible?: unknown; workerId?: unknown };
+          return {
+            visible: data.visible === true,
+            ...(typeof data.workerId === "string" ? { workerId: data.workerId } : {}),
+          };
+        }
+      }
+    } catch {
+      // fall through
+    }
+    return { visible: false };
+  }
+
+  function persistPaneState(): void {
+    try {
+      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-pane", { ...pane.state, timestamp: Date.now() });
+    } catch {
+      // journal is best-effort
+    }
+  }
+
+  function latestWorkerId(): string | undefined {
+    const workers = runtime.list();
+    return [...workers].reverse().find((worker) => worker.status === "running")?.id ?? workers.at(-1)?.id;
+  }
+
+  function restorePane(ctx: ExtensionContext): void {
+    const state = restorePaneState(ctx);
+    const workerId = state.workerId && runtime.getWorker(state.workerId) ? state.workerId : latestWorkerId();
+    pane.restore({ ...state, ...(workerId ? { workerId } : {}) });
+    if (state.visible) pane.open(ctx, workerId);
+    else pane.close();
+    pane.refresh();
+  }
+
+  function openPaneForWorker(ctx: ExtensionContext, workerId: string): void {
+    if (ctx.mode !== "tui") return;
+    pane.open(ctx, workerId);
+    persistPaneState();
+    pane.refresh();
+  }
+
   /** Session command overrides win over fusion.json. */
   function effectiveConfig(ctx: ExtensionContext) {
     const modelConfig = applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx));
@@ -224,13 +274,16 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     restoreRuntime(ctx);
+    restorePane(ctx);
     refreshStatus(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     restoreRuntime(ctx);
+    restorePane(ctx);
     refreshStatus(ctx);
   });
+  pi.on("session_shutdown", async () => pane.close());
   pi.on("model_select", async (_event, ctx) => refreshStatus(ctx));
 
   // Off mode: fusion tools are mechanically disabled, not just discouraged.
@@ -303,6 +356,8 @@ export default function (pi: ExtensionAPI) {
   ): Promise<{ text: string; details: Record<string, unknown> }> {
     const worker = runtime.getWorker(workerId)!;
     const turn = runtime.getTurn(turnId)!;
+    pane.select(workerId);
+    pane.refresh();
     const controller = new AbortController();
     runtime.trackController(turnId, controller);
     const signal = hostSignal ? AbortSignal.any([controller.signal, hostSignal]) : controller.signal;
@@ -310,6 +365,7 @@ export default function (pi: ExtensionAPI) {
       if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
       runtime.untrackController(turnId);
       persist(ctx, workerId);
+      pane.refresh();
       return {
         text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
         details: { status: "interrupted", worker_id: workerId, turn_id: turnId },
@@ -323,6 +379,7 @@ export default function (pi: ExtensionAPI) {
     if (ladder.length === 0) {
       const error = "no authed text executor model available";
       runtime.failTurn(turnId, error);
+      pane.refresh();
       return { text: JSON.stringify({ status: "error", error }, null, 2), details: { status: "error", error } };
     }
     // Escalation: one rung per consecutive failure, auto-de-escalates on success
@@ -339,6 +396,7 @@ export default function (pi: ExtensionAPI) {
       content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | thinking ${thinkingLevel} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
       details: { phase: "executing", workerId, turnId },
     });
+    pane.refresh();
 
     const exec = () => {
       signal.throwIfAborted();
@@ -377,6 +435,7 @@ export default function (pi: ExtensionAPI) {
       // re-routes for free.
       const compacted = runtime.compactHistory(worker, cfg.maxHistoryMessages);
       persist(ctx, workerId);
+      pane.refresh();
       try {
         (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-cost", {
           worker_id: workerId,
@@ -424,12 +483,14 @@ export default function (pi: ExtensionAPI) {
       const message = err instanceof Error ? err.message : String(err);
       runtime.failTurn(turnId, message);
       persist(ctx, workerId);
+      pane.refresh();
       return {
         text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message, consecutive_failures: worker.failures, next_rung: rungFor(worker.failures, ladder.length) }, null, 2),
         details: { status: "error", worker_id: workerId, turn_id: turnId, error: message },
       };
     } finally {
       runtime.untrackController(turnId);
+      pane.refresh();
     }
   }
 
@@ -484,6 +545,7 @@ export default function (pi: ExtensionAPI) {
       const taskText = handoffTaskText(1, params.task, contextText, params.label);
       const { worker, turn } = runtime.spawn({ label: params.label, executorModelId: modelDisplay(executor), firstMessage: userMsg(taskText), worktree });
       persist(ctx, worker.id);
+      openPaneForWorker(ctx, worker.id);
       const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
       return { content: [{ type: "text", text: out.text }], details: out.details };
     },
@@ -529,6 +591,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: message }, null, 2) }], details: { status: "error", error: message } };
       }
       persist(ctx, worker.id);
+      openPaneForWorker(ctx, worker.id);
       const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
       return { content: [{ type: "text", text: out.text }], details: out.details };
     },
@@ -580,6 +643,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
       persist(ctx, params.worker_id);
+      pane.refresh();
       return {
         content: [{ type: "text", text: JSON.stringify({ worker_id: params.worker_id, status: "closed", worktree_removed: worktreeRemoved, ...(removeError ? { remove_error: removeError } : {}) }) }],
         details: { status: "closed" },
@@ -627,10 +691,12 @@ export default function (pi: ExtensionAPI) {
     label: "Fusion Interrupt",
     description: "Stop a worker's active turn but keep the worker open. No failure is recorded (no false escalation).",
     parameters: InterruptParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       const interruptedTurnId = runtime.interrupt(params.worker_id);
+      persist(ctx, params.worker_id);
+      pane.refresh();
       return {
         content: [{ type: "text", text: JSON.stringify({ worker_id: w.id, status: w.status, interrupted_turn: interruptedTurnId ?? null }) }],
         details: { status: w.status },
@@ -786,6 +852,67 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       apply({ thinkingLevel: arg }, arg, "session override");
+    },
+  });
+
+  pi.registerCommand("fusion-pane", {
+    description: "Show sidekick history: /fusion-pane [open|close|toggle|wrk_...]",
+    getArgumentCompletions: (prefix) => {
+      const normalized = prefix.trim().toLowerCase();
+      const values = ["open", "close", "toggle", ...runtime.list().map((worker) => worker.id)];
+      const matches = values.filter((value) => value.toLowerCase().startsWith(normalized)).map((value) => ({ value, label: value }));
+      return matches.length ? matches : null;
+    },
+    handler: async (args, ctx) => {
+      const tell = (text: string, level: "info" | "warning" | "error" = "info") => {
+        if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
+        else ctx.ui.notify(text, level);
+      };
+      if (ctx.mode !== "tui") {
+        tell("Fusion pane requires TUI mode.", "warning");
+        return;
+      }
+
+      const open = (workerId?: string) => {
+        const selected = workerId ?? (pane.state.workerId && runtime.getWorker(pane.state.workerId) ? pane.state.workerId : latestWorkerId());
+        if (!selected) {
+          tell("No Fusion workers are available to display.", "warning");
+          return;
+        }
+        pane.open(ctx, selected);
+        persistPaneState();
+        pane.refresh();
+        tell(`Fusion pane opened for ${selected}.`);
+      };
+      const close = () => {
+        pane.close();
+        persistPaneState();
+        tell("Fusion pane closed.");
+      };
+      const arg = args.trim();
+      const lower = arg.toLowerCase();
+      if (!arg || lower === "toggle") {
+        if (pane.state.visible) close();
+        else open();
+        return;
+      }
+      if (lower === "open") {
+        open();
+        return;
+      }
+      if (lower === "close") {
+        close();
+        return;
+      }
+      if (arg.startsWith("wrk_")) {
+        if (!runtime.getWorker(arg)) {
+          tell(`Worker ${arg} was not found.`, "error");
+          return;
+        }
+        open(arg);
+        return;
+      }
+      tell(`Unknown pane target: ${arg}. Use open, close, toggle, or a worker id.`, "error");
     },
   });
 

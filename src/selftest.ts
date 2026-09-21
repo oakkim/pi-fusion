@@ -5,6 +5,8 @@ import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext } from "../src/utils.ts";
 import fusionExtension from "../src/index.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane } from "../src/pane.ts";
 
 let pass = 0;
 let fail = 0;
@@ -890,6 +892,55 @@ await commands.get("fusion-consent")!.handler("status", consentContext);
 eq("fusion consent status", consentNotice, "Fusion consent: ask (default)");
 await commands.get("fusion-consent")!.handler("allow", { ...consentContext, isProjectTrusted: () => false });
 eq("fusion consent rejects untrusted", consentNotice, "Fusion consent cannot be allowed in an untrusted project.");
+
+// --- 13. worker pane keeps visible history bounded and excludes thinking ---
+const paneHistory = [
+  { role: "user", content: '<fusion_handoff generation="1"><task>Fix the parser</task></fusion_handoff>', timestamp: 1 },
+  {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "private chain of thought" },
+      { type: "text", text: "Inspecting files" },
+      { type: "toolCall", id: "call-1", name: "read", arguments: { path: "src/parser.ts" } },
+    ],
+    timestamp: 2,
+  },
+  { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "file contents" }], isError: false, timestamp: 3 },
+  { role: "assistant", content: [{ type: "text", text: "Done" }], timestamp: 4 },
+] as never;
+const paneItems = formatPaneHistory(paneHistory);
+eq("pane task extraction", extractHandoffTask((paneHistory[0] as { content: string }).content), "Fix the parser");
+eq("pane roles", paneItems.map((item) => item.role), ["LEAD", "SIDEKICK", "TOOL", "TOOL", "SIDEKICK"]);
+eq("pane excludes thinking", paneItems.some((item) => item.text.includes("private chain")), false);
+eq("pane shows tool call", paneItems[2], { role: "TOOL", text: 'call read {"path":"src/parser.ts"}' });
+eq("pane shows tool result", paneItems[3], { role: "TOOL", text: "read result: file contents" });
+const paneWorker = {
+  id: "wrk_test",
+  label: "parser",
+  executorModelId: "openai-codex/gpt-test",
+  history: paneHistory,
+  generation: 1,
+  status: "idle",
+  activeTurnId: null,
+  failures: 0,
+  createdAt: 1,
+} as never;
+const renderedPane = renderWorkerPane(paneWorker, 42, 2);
+eq("pane width bound", renderedPane.every((line) => visibleWidth(line) <= 42), true);
+eq("pane keeps newest output", renderedPane.some((line) => line.includes("Done")), true);
+eq("pane drops old output", renderedPane.some((line) => line.includes("Fix the parser")), false);
+const paneController = new FusionPaneController((id) => id === "wrk_test" ? paneWorker : undefined);
+paneController.restore({ visible: true, workerId: "wrk_test" });
+eq("pane restores state", paneController.state, { visible: true, workerId: "wrk_test" });
+paneController.close();
+eq("pane closes state", paneController.state, { visible: false, workerId: "wrk_test" });
+let paneNotice = "";
+await commands.get("fusion-pane")!.handler("open", {
+  ...consentContext,
+  mode: "rpc",
+  ui: { ...consentContext.ui, notify: (text: string) => { paneNotice = text; } },
+});
+eq("pane rejects non-tui", paneNotice, "Fusion pane requires TUI mode.");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

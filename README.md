@@ -128,6 +128,25 @@ Session consent is journaled as `fusion-consent` and affects both new workers
 and persistent-worker followups. `allow` is rejected for untrusted projects;
 config-file consent is also loaded only from trusted projects.
 
+## Worker conversation pane (v0.9)
+
+```
+/fusion-pane                 -> toggle the worker pane
+/fusion-pane open            -> show the latest/running worker
+/fusion-pane close           -> close the pane
+/fusion-pane wrk_...         -> show a specific worker
+```
+
+In TUI mode, spawning or following up a worker automatically opens a
+non-capturing right-side pane with recent LEAD, SIDEKICK, and TOOL messages.
+Thinking blocks are never displayed. The selected worker and visibility are
+journaled, the pane follows live status changes, and it automatically hides
+below 110 terminal columns.
+
+This is an overlay, not a true split: Pi's extension API cannot shrink or
+reflow the main transcript area. The overlay stays unfocused so the normal
+editor remains usable.
+
 ## Lead discipline (v0.7)
 
 Two layers, following what others found (opencode-fusion's systemic Main edit

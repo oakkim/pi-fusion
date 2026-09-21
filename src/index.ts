@@ -3,7 +3,7 @@
  *
  * Tools (planner calls these; executor never sees them):
  * - fusion_spawn   : start a persistent worker turn asynchronously (wrk_... + trn_...)
- * - fusion_followup: asynchronously continue the SAME worker (persistent context)
+ * - fusion_followup: continue the SAME worker; queue or interrupt when it is busy
  * - fusion_status  : inspect worker or turn without blocking
  * - fusion_interrupt: stop the active turn, keep the worker (no failure recorded)
  * - fusion_close   : retire a worker (interrupts active turn)
@@ -45,9 +45,26 @@ const SpawnParams = Type.Object({
   context_turns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10, default: 4 })),
 });
 
+const FollowupBusyStrategy = Type.Union([Type.Literal("queue"), Type.Literal("interrupt")], {
+  default: "queue",
+  description: "Behavior when the worker is busy: queue safely after the current turn (default), or interrupt it and run this instruction after cleanup.",
+});
+
+type FollowupBusyStrategy = "queue" | "interrupt";
+
+interface PendingFollowup {
+  id: string;
+  message: string;
+  languageSample: string;
+  strategy: FollowupBusyStrategy;
+  interruptedTurnId?: string;
+  enqueuedAt: number;
+}
+
 const FollowupParams = Type.Object({
   worker_id: Type.String({ description: "Worker ID (wrk_...) returned by fusion_spawn." }),
   message: Type.String({ description: "Follow-up instruction for the SAME persistent worker." }),
+  when_busy: Type.Optional(FollowupBusyStrategy),
 });
 
 const StatusParams = Type.Object({
@@ -65,6 +82,7 @@ const MergeParams = Type.Object({
 
 const InterruptParams = Type.Object({
   worker_id: Type.String({ description: "Worker ID (wrk_...) whose active turn to stop. The worker stays open; no failure is recorded." }),
+  cancel_queued: Type.Optional(Type.Boolean({ description: "Also cancel queued follow-ups. Default true." })),
 });
 
 /** Serialize mutating executor runs to avoid clobbered writes (port of pi-devin-fusion). */
@@ -205,6 +223,7 @@ export function formatLiveStatusAction(activity: LiveActivity | undefined): stri
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
   const backgroundTurns = new Map<string, Promise<void>>();
+  const pendingFollowups = new Map<string, PendingFollowup[]>();
   let activeContext: ExtensionContext | undefined;
   let sessionActive = true;
   let sessionEpoch = 0;
@@ -372,15 +391,20 @@ export default function (pi: ExtensionAPI) {
   function refreshStatus(ctx: ExtensionContext): void {
     try {
       if (!ctx.hasUI) return;
-      const running = runtime.list().filter((worker) => worker.status === "running");
-      if (running.length > 0) {
+      const active = runtime.list().filter(
+        (worker) => worker.status === "running" || (pendingFollowups.get(worker.id)?.length ?? 0) > 0,
+      );
+      if (active.length > 0) {
         const selected = pane.state.workerId;
-        const worker = running.find((item) => item.id === selected) ?? running.at(-1)!;
+        const worker = active.find((item) => item.id === selected) ?? active.at(-1)!;
         const activity = pane.getLive(worker.id);
         const label = clipStatus(worker.label || worker.id.slice(4, 12), 24);
         const elapsed = formatElapsedDuration(activity ? Date.now() - activity.startedAt : 0);
-        const more = running.length > 1 ? ` • +${running.length - 1}` : "";
-        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${formatLiveStatusAction(activity)} • ${elapsed}${more}`);
+        const more = active.length > 1 ? ` • +${active.length - 1}` : "";
+        const queued = pendingFollowups.get(worker.id)?.length ?? 0;
+        const queuedText = queued > 0 ? ` • queued ${queued}` : "";
+        const action = worker.status === "running" ? formatLiveStatusAction(activity) : "settling";
+        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${action} • ${elapsed}${queuedText}${more}`);
         return;
       }
       const mode = restoreMode(ctx);
@@ -419,6 +443,7 @@ export default function (pi: ExtensionAPI) {
     if (sessionActive) {
       sessionActive = false;
       sessionEpoch += 1;
+      pendingFollowups.clear();
       pane.shutdown();
     }
     await stopBackgroundTurns();
@@ -680,6 +705,7 @@ export default function (pi: ExtensionAPI) {
     turnId: string,
     epoch: number,
     outcome: { text: string; details: Record<string, unknown> },
+    next?: { queueId: string; turnId: string },
   ): void {
     if (!sessionActive || sessionEpoch !== epoch) return;
     const turn = runtime.getTurn(turnId);
@@ -688,9 +714,13 @@ export default function (pi: ExtensionAPI) {
     const bounded = outcome.text.length > maxContextChars
       ? `${outcome.text.slice(0, maxContextChars)}\n...[result truncated; use fusion_status for the stored turn]`
       : outcome.text;
+    const continuation = next
+      ? `A queued follow-up started automatically: ${next.turnId} (queue ${next.queueId}). Do not resend it or treat the current worker state as final.`
+      : undefined;
     const content = [
       `Fusion background turn finished (${status}): ${workerId} / ${turnId}.`,
       "The sidekick result follows. The Lead must personally inspect the actual diff and relevant code before approval or merge.",
+      ...(continuation ? [continuation] : []),
       "",
       bounded,
     ].join("\n");
@@ -700,7 +730,7 @@ export default function (pi: ExtensionAPI) {
           customType: "fusion-result",
           content,
           display: true,
-          details: { worker_id: workerId, turn_id: turnId, status },
+          details: { worker_id: workerId, turn_id: turnId, status, ...(next ? { next_turn_id: next.turnId, queue_id: next.queueId } : {}) },
         },
         { deliverAs: "followUp", triggerTurn: true },
       );
@@ -712,6 +742,43 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // Notification is cosmetic and the session message/status remain available.
     }
+  }
+
+  function unsettledTurnId(workerId: string): string | undefined {
+    return [...backgroundTurns.keys()].find(
+      (candidateTurnId) => runtime.getTurn(candidateTurnId)?.workerId === workerId,
+    );
+  }
+
+  function startNextQueuedFollowup(
+    ctx: ExtensionContext,
+    workerId: string,
+    epoch: number,
+  ): { queueId: string; turnId: string } | undefined {
+    if (!sessionActive || sessionEpoch !== epoch) return undefined;
+    const worker = runtime.getWorker(workerId);
+    if (!worker || worker.status === "closed" || worker.activeTurnId || unsettledTurnId(workerId)) return undefined;
+    const queue = pendingFollowups.get(workerId);
+    const pending = queue?.shift();
+    if (!pending) return undefined;
+    if (queue?.length === 0) pendingFollowups.delete(workerId);
+
+    const message = pending.interruptedTurnId
+      ? `The previous turn ${pending.interruptedTurnId} was interrupted to apply this instruction immediately. Partial filesystem or command side effects may remain; inspect the current state before editing or rerunning commands.\n\n${pending.message}`
+      : pending.message;
+    const taskText = handoffTaskText(worker.generation + 1, message, undefined, worker.label, pending.languageSample);
+    let turn;
+    try {
+      turn = runtime.followup(workerId, userMsg(taskText));
+    } catch {
+      // The worker may have been closed between completion and queue dispatch.
+      refreshStatus(ctx);
+      return undefined;
+    }
+    persist(ctx, workerId);
+    selectWorkerForActivity(ctx, workerId);
+    launchTurn(ctx, workerId, turn.id);
+    return { queueId: pending.id, turnId: turn.id };
   }
 
   function launchTurn(ctx: ExtensionContext, workerId: string, turnId: string): void {
@@ -730,7 +797,12 @@ export default function (pi: ExtensionAPI) {
           details: { status: "error", worker_id: workerId, turn_id: turnId, error: message },
         };
       }
-      enqueueTurnResult(ctx, workerId, turnId, epoch, outcome);
+      // Remove the settled task before dispatching the next queued turn. This
+      // prevents overlap while still allowing a fast next turn to drain more
+      // queued work without being blocked by this task's cleanup callback.
+      backgroundTurns.delete(turnId);
+      const next = startNextQueuedFollowup(ctx, workerId, epoch);
+      enqueueTurnResult(ctx, workerId, turnId, epoch, outcome, next);
     })();
     backgroundTurns.set(turnId, task);
     void task.then(() => backgroundTurns.delete(turnId));
@@ -816,12 +888,14 @@ export default function (pi: ExtensionAPI) {
     label: "Fusion Followup",
     description: [
       "Asynchronously continue the SAME persistent sidekick worker (wrk_...).",
-      "Returns the new turn_id immediately; the worker keeps its session history and runs in the background.",
+      "If the worker is idle, returns a new turn_id and starts immediately.",
+      "If busy, when_busy=queue (default) runs the instruction after the current turn; when_busy=interrupt aborts the active turn and starts the new instruction as soon as cleanup settles.",
       "Completion automatically queues behind an active Lead turn or wakes an idle Lead.",
     ].join(" "),
     promptGuidelines: [
       "Prefer fusion_followup over fusion_spawn when correcting or extending a worker's previous result.",
       "Include what was wrong and the exact correction; the worker already knows the prior context.",
+      "Busy workers accept queued follow-ups by default; do not wait or retry manually. Use when_busy=interrupt only when allowing the current work to continue is unsafe or wasteful, because partial tool side effects are not rolled back.",
       "fusion_followup is non-blocking. Continue the conversation instead of polling; personally review the correction when its completion result arrives.",
       "Provider failures auto-escalate the worker one rung up the fallback ladder (and de-escalate on success) — retry via followup before taking over.",
     ],
@@ -841,10 +915,62 @@ export default function (pi: ExtensionAPI) {
       if (worker.status === "closed") {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} is closed.` }, null, 2) }], details: { status: "error" } };
       }
-      if (worker.activeTurnId) {
-        return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} is busy (turn ${worker.activeTurnId}).` }, null, 2) }], details: { status: "error" } };
-      }
       const userLanguageSample = latestUserText(ctx.sessionManager.getBranch() as unknown[], params.message);
+      const existingQueue = pendingFollowups.get(worker.id);
+      const settlingTurnId = unsettledTurnId(worker.id);
+      if (worker.activeTurnId || settlingTurnId || (existingQueue?.length ?? 0) > 0) {
+        const strategy: FollowupBusyStrategy = params.when_busy ?? "queue";
+        const activeTurnId = worker.activeTurnId;
+        const precedingTurnId = activeTurnId ?? settlingTurnId;
+        const pending: PendingFollowup = {
+          id: `qfu_${crypto.randomUUID()}`,
+          message: params.message,
+          languageSample: userLanguageSample,
+          strategy,
+          ...(strategy === "interrupt" && precedingTurnId ? { interruptedTurnId: precedingTurnId } : {}),
+          enqueuedAt: Date.now(),
+        };
+        const queue = existingQueue ?? [];
+        if (!existingQueue) pendingFollowups.set(worker.id, queue);
+        if (strategy === "interrupt") queue.unshift(pending);
+        else queue.push(pending);
+
+        let interruptedTurnId: string | undefined;
+        if (strategy === "interrupt" && activeTurnId) {
+          interruptedTurnId = runtime.interrupt(worker.id);
+          persist(ctx, worker.id);
+        } else if (strategy === "interrupt" && settlingTurnId) {
+          interruptedTurnId = settlingTurnId;
+        }
+        const started = !worker.activeTurnId && !interruptedTurnId
+          ? startNextQueuedFollowup(ctx, worker.id, sessionEpoch)
+          : undefined;
+        pane.refresh();
+        refreshStatus(ctx);
+        const position = started?.queueId === pending.id ? 0 : queue.findIndex((item) => item.id === pending.id) + 1;
+        const accepted = {
+          status: started?.queueId === pending.id ? "running" : interruptedTurnId ? "interrupting" : "queued",
+          asynchronous: true,
+          worker_id: worker.id,
+          queue_id: pending.id,
+          position,
+          when_busy: strategy,
+          ...(activeTurnId ? { active_turn_id: activeTurnId } : {}),
+          ...(!activeTurnId && settlingTurnId ? { settling_turn_id: settlingTurnId } : {}),
+          ...(interruptedTurnId ? { interrupted_turn_id: interruptedTurnId } : {}),
+          ...(started ? { started_turn_id: started.turnId } : {}),
+          message: started?.queueId === pending.id
+            ? "The queued instruction started in the background."
+            : interruptedTurnId
+              ? "The active turn was interrupted. This instruction will start automatically after cleanup settles."
+              : "The instruction is queued and will start automatically; do not retry or poll.",
+        };
+        onUpdate?.({
+          content: [{ type: "text", text: accepted.message }],
+          details: accepted,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(accepted, null, 2) }], details: accepted };
+      }
       const taskText = handoffTaskText(worker.generation + 1, params.message, undefined, worker.label, userLanguageSample);
       let turn;
       try {
@@ -881,9 +1007,22 @@ export default function (pi: ExtensionAPI) {
       if (params.id.startsWith("wrk_")) {
         const w = runtime.getWorker(params.id);
         if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.id} was not found.` }) }], details: { status: "error" } };
+        const queued = pendingFollowups.get(w.id) ?? [];
         return {
-          content: [{ type: "text", text: JSON.stringify({ type: "worker", worker_id: w.id, status: w.status, active_turn: w.activeTurnId, generation: w.generation, history_messages: w.history.length, consecutive_failures: w.failures, label: w.label, executor: w.executorModelId, worktree: w.worktree ? { name: w.worktree.name, branch: w.worktree.branch, path: w.worktree.path } : undefined }, null, 2) }],
-          details: { status: w.status },
+          content: [{ type: "text", text: JSON.stringify({
+            type: "worker",
+            worker_id: w.id,
+            status: w.status,
+            active_turn: w.activeTurnId,
+            generation: w.generation,
+            history_messages: w.history.length,
+            consecutive_failures: w.failures,
+            queued_followups: queued.map((item) => ({ queue_id: item.id, strategy: item.strategy, enqueued_at: item.enqueuedAt })),
+            label: w.label,
+            executor: w.executorModelId,
+            worktree: w.worktree ? { name: w.worktree.name, branch: w.worktree.branch, path: w.worktree.path } : undefined,
+          }, null, 2) }],
+          details: { status: w.status, queued_followups: queued.length },
         };
       }
       if (params.id.startsWith("trn_")) {
@@ -907,6 +1046,8 @@ export default function (pi: ExtensionAPI) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       runtime.close(params.worker_id);
+      const cancelledQueued = pendingFollowups.get(params.worker_id)?.length ?? 0;
+      pendingFollowups.delete(params.worker_id);
       pane.clearLive(params.worker_id);
       let worktreeRemoved = false;
       let removeError: string | undefined;
@@ -921,8 +1062,8 @@ export default function (pi: ExtensionAPI) {
       persist(ctx, params.worker_id);
       pane.refresh();
       return {
-        content: [{ type: "text", text: JSON.stringify({ worker_id: params.worker_id, status: "closed", worktree_removed: worktreeRemoved, ...(removeError ? { remove_error: removeError } : {}) }) }],
-        details: { status: "closed" },
+        content: [{ type: "text", text: JSON.stringify({ worker_id: params.worker_id, status: "closed", queued_followups_cancelled: cancelledQueued, worktree_removed: worktreeRemoved, ...(removeError ? { remove_error: removeError } : {}) }) }],
+        details: { status: "closed", queued_followups_cancelled: cancelledQueued },
       };
     },
   });
@@ -946,8 +1087,15 @@ export default function (pi: ExtensionAPI) {
       if (!w.worktree) {
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} has no worktree; nothing to merge.` }) }], details: { status: "error" } };
       }
-      if (w.activeTurnId) {
-        return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} is busy (turn ${w.activeTurnId}); merge only idle workers.` }) }], details: { status: "error" } };
+      const queued = pendingFollowups.get(w.id)?.length ?? 0;
+      const settling = unsettledTurnId(w.id);
+      if (w.activeTurnId || settling || queued > 0) {
+        const reason = w.activeTurnId
+          ? `turn ${w.activeTurnId}`
+          : settling
+            ? `turn ${settling} is still settling`
+            : `${queued} queued follow-up${queued === 1 ? "" : "s"}`;
+        return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} is busy (${reason}); merge only idle workers.` }) }], details: { status: "error" } };
       }
       try {
         const result = await runSerialized(() => mergeWorktree(w.worktree!, w.label));
@@ -965,18 +1113,31 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "fusion_interrupt",
     label: "Fusion Interrupt",
-    description: "Stop a worker's active turn but keep the worker open. No failure is recorded (no false escalation).",
+    description: "Stop a worker's active turn but keep the worker open. No failure is recorded. Queued follow-ups are cancelled by default.",
     parameters: InterruptParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       const interruptedTurnId = runtime.interrupt(params.worker_id);
+      const cancelQueued = params.cancel_queued !== false;
+      const cancelledQueued = cancelQueued ? pendingFollowups.get(params.worker_id)?.length ?? 0 : 0;
+      if (cancelQueued) pendingFollowups.delete(params.worker_id);
       pane.clearLive(params.worker_id);
+      const started = !cancelQueued && !interruptedTurnId
+        ? startNextQueuedFollowup(ctx, params.worker_id, sessionEpoch)
+        : undefined;
       persist(ctx, params.worker_id);
       pane.refresh();
+      refreshStatus(ctx);
       return {
-        content: [{ type: "text", text: JSON.stringify({ worker_id: w.id, status: w.status, interrupted_turn: interruptedTurnId ?? null }) }],
-        details: { status: w.status },
+        content: [{ type: "text", text: JSON.stringify({
+          worker_id: w.id,
+          status: w.status,
+          interrupted_turn: interruptedTurnId ?? null,
+          queued_followups_cancelled: cancelledQueued,
+          ...(started ? { started_turn: started.turnId } : {}),
+        }) }],
+        details: { status: w.status, queued_followups_cancelled: cancelledQueued },
       };
     },
   });

@@ -668,6 +668,123 @@ try {
     completionMessages[0]?.options.deliverAs,
     completionMessages[0]?.options.triggerTurn,
   ], ["fusion-result", true, "followUp", true]);
+
+  let releaseQueuedFirst!: (message: unknown) => void;
+  let releaseQueuedSecond!: (message: unknown) => void;
+  let markQueuedFirstStarted!: () => void;
+  let markQueuedSecondStarted!: () => void;
+  const queuedFirstStarted = new Promise<void>((resolve) => { markQueuedFirstStarted = resolve; });
+  const queuedSecondStarted = new Promise<void>((resolve) => { markQueuedSecondStarted = resolve; });
+  let queuedProviderCalls = 0;
+  completeImpl = async () => {
+    queuedProviderCalls++;
+    if (queuedProviderCalls === 1) {
+      markQueuedFirstStarted();
+      return new Promise((resolve) => { releaseQueuedFirst = resolve; });
+    }
+    markQueuedSecondStarted();
+    return new Promise((resolve) => { releaseQueuedSecond = resolve; });
+  };
+  const activeBeforeQueue = await followup.execute("queue-active", { worker_id: workerId, message: "continue current work" }, undefined, undefined, context);
+  await queuedFirstStarted;
+  const queuedCorrection = await followup.execute("queue-correction", { worker_id: workerId, message: "change attendees to 2" }, undefined, undefined, context);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const queuedWorkerStatus = await readStatus(workerId);
+  eq("busy followup queues without interrupting", [
+    queuedCorrection.details.status,
+    queuedCorrection.details.when_busy,
+    queuedCorrection.details.position,
+    queuedWorkerStatus.active_turn,
+    queuedWorkerStatus.queued_followups.length,
+    fusionStatusLine.includes("queued 1"),
+  ], ["queued", "queue", 1, activeBeforeQueue.details.turn_id, 1, true]);
+  releaseQueuedFirst({ role: "assistant", content: [{ type: "text", text: "first done" }], stopReason: "stop", timestamp: Date.now() });
+  await queuedSecondStarted;
+  const runningQueuedFollowup = await readStatus(workerId);
+  const queuedFollowupTurnId = runningQueuedFollowup.active_turn as string;
+  const firstCompletion = completionMessages.find((item) => item.message.details?.turn_id === activeBeforeQueue.details.turn_id);
+  eq("queued followup starts automatically", [
+    runningQueuedFollowup.generation,
+    runningQueuedFollowup.queued_followups.length,
+    firstCompletion?.message.details?.next_turn_id,
+    firstCompletion?.message.content.includes("Do not resend it"),
+  ], [3, 0, queuedFollowupTurnId, true]);
+  releaseQueuedSecond({ role: "assistant", content: [{ type: "text", text: "second done" }], stopReason: "stop", timestamp: Date.now() });
+  await waitForStatus(queuedFollowupTurnId, "completed");
+
+  let immediateSignal: AbortSignal | undefined;
+  let rejectInterruptedCleanup!: (reason?: unknown) => void;
+  let releaseImmediate!: (message: unknown) => void;
+  let releaseAfterCleanup!: (message: unknown) => void;
+  let markInterruptibleStarted!: () => void;
+  let markImmediateStarted!: () => void;
+  let markAfterCleanupStarted!: () => void;
+  const interruptibleStarted = new Promise<void>((resolve) => { markInterruptibleStarted = resolve; });
+  const immediateStarted = new Promise<void>((resolve) => { markImmediateStarted = resolve; });
+  const afterCleanupStarted = new Promise<void>((resolve) => { markAfterCleanupStarted = resolve; });
+  let immediateProviderCalls = 0;
+  let immediateContext = "";
+  completeImpl = async (_model, completeContext, options) => {
+    immediateProviderCalls++;
+    if (immediateProviderCalls === 1) {
+      immediateSignal = options.signal;
+      markInterruptibleStarted();
+      return new Promise((_resolve, reject) => { rejectInterruptedCleanup = reject; });
+    }
+    if (immediateProviderCalls === 2) {
+      immediateContext = JSON.stringify(completeContext);
+      markImmediateStarted();
+      return new Promise((resolve) => { releaseImmediate = resolve; });
+    }
+    markAfterCleanupStarted();
+    return new Promise((resolve) => { releaseAfterCleanup = resolve; });
+  };
+  const interruptible = await followup.execute("interrupt-active", { worker_id: workerId, message: "keep doing the old plan" }, undefined, undefined, context);
+  await interruptibleStarted;
+  const immediateCorrection = await followup.execute(
+    "interrupt-correction",
+    { worker_id: workerId, message: "stop and use 2 attendees", when_busy: "interrupt" },
+    undefined,
+    undefined,
+    context,
+  );
+  const queuedDuringCleanup = await followup.execute(
+    "queue-during-cleanup",
+    { worker_id: workerId, message: "then verify the attendee count" },
+    undefined,
+    undefined,
+    context,
+  );
+  const duringCleanupStatus = await readStatus(workerId);
+  eq("interrupted cleanup blocks overlapping followups", [
+    queuedDuringCleanup.details.status,
+    queuedDuringCleanup.details.position,
+    duringCleanupStatus.queued_followups.length,
+    immediateProviderCalls,
+    immediateSignal?.aborted,
+  ], ["queued", 2, 2, 1, true]);
+  rejectInterruptedCleanup(immediateSignal?.reason);
+  await immediateStarted;
+  const afterImmediateStart = await readStatus(workerId);
+  const immediateTurnId = afterImmediateStart.active_turn as string;
+  eq("interrupting followup aborts and restarts", [
+    immediateCorrection.details.status,
+    immediateCorrection.details.when_busy,
+    immediateCorrection.details.interrupted_turn_id,
+    (await readStatus(interruptible.details.turn_id)).status,
+    immediateTurnId !== interruptible.details.turn_id,
+    afterImmediateStart.queued_followups.length,
+    immediateContext.includes("Partial filesystem or command side effects may remain"),
+    immediateContext.includes("stop and use 2 attendees"),
+  ], ["interrupting", "interrupt", interruptible.details.turn_id, "interrupted", true, 1, true, true]);
+  releaseImmediate({ role: "assistant", content: [{ type: "text", text: "immediate done" }], stopReason: "stop", timestamp: Date.now() });
+  await afterCleanupStarted;
+  const afterCleanupStatus = await readStatus(workerId);
+  const afterCleanupTurnId = afterCleanupStatus.active_turn as string;
+  eq("followup queued during cleanup runs afterward", [afterCleanupStatus.queued_followups.length, afterCleanupTurnId !== immediateTurnId], [0, true]);
+  releaseAfterCleanup({ role: "assistant", content: [{ type: "text", text: "verification done" }], stopReason: "stop", timestamp: Date.now() });
+  await waitForStatus(afterCleanupTurnId, "completed");
+
   let executorSignal: AbortSignal | undefined;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });

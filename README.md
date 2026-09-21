@@ -128,11 +128,22 @@ Session consent is journaled as `fusion-consent` and affects both new workers
 and persistent-worker followups. `allow` is rejected for untrusted projects;
 config-file consent is also loaded only from trusted projects.
 
-## Asynchronous turns (v0.10)
+## Asynchronous turns and busy-worker steering (v0.12)
 
-`fusion_spawn` and `fusion_followup` complete their tool call as soon as the
-worker turn is accepted. The sidekick then runs independently from the Lead
-turn's abort signal. Use `fusion_interrupt` for explicit cancellation.
+`fusion_spawn` and `fusion_followup` complete their tool call as soon as work is
+accepted. The sidekick then runs independently from the Lead turn's abort
+signal.
+
+A follow-up sent to a busy worker supports both steering modes:
+
+- `when_busy: "queue"` (default): keep the active turn running and dispatch the instruction FIFO immediately after it settles.
+- `when_busy: "interrupt"`: abort the active turn, wait for its background cleanup to settle, then dispatch the new instruction at the front of the queue. Filesystem and command side effects are not rolled back, so the sidekick is explicitly told to inspect current state first.
+
+Queued calls return a `qfu_...` ID instead of failing with `worker is busy`.
+The completion handoff identifies the automatically started turn so the Lead
+does not resend it. `fusion_status` reports queued entries and the status line
+shows `queued N`. Standalone `fusion_interrupt` cancels queued follow-ups by
+default; close, session switch, reload, and shutdown cancel them as well.
 
 When the worker finishes, pi-fusion shows a TUI notification and hands a small
 `fusion-result` custom message with the visible result back to the Lead
@@ -152,7 +163,7 @@ shows one compact view of its existing live stream:
 - tool state: `▶` running, `✓` succeeded, `✗` failed
 - visible response: the worker's latest visible words, unchanged
 - otherwise: `waiting`, `thinking`, or `starting`
-- elapsed time as `42s`, `3m 07s`, or `1h 02m 09s`, plus `+N` when other workers are also active
+- elapsed time as `42s`, `3m 07s`, or `1h 02m 09s`, plus `queued N` and `+N` when applicable
 
 Tool arguments are formatted locally by tool type; there is no extra model call
 or semantic summary. Visible response text is passed through directly, so the

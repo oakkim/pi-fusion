@@ -907,7 +907,7 @@ export default function (pi: ExtensionAPI) {
           display: true,
           details: { worker_id: workerId, turn_id: turnId, status, ...(next ? { next_turn_id: next.turnId, queue_id: next.queueId } : {}) },
         },
-        { deliverAs: "followUp", triggerTurn: true },
+        { deliverAs: "steer", triggerTurn: true },
       );
     } catch {
       // The extension runtime may have been invalidated during session replacement.
@@ -1054,7 +1054,7 @@ export default function (pi: ExtensionAPI) {
           worker_remembers_inquiry: false,
           captured_at: turn.capturedAt,
         },
-      }, { deliverAs: "followUp", triggerTurn: true });
+      }, { deliverAs: "steer", triggerTurn: true });
     } catch {
       // The extension runtime may have been invalidated during session replacement.
     }
@@ -1232,7 +1232,7 @@ export default function (pi: ExtensionAPI) {
     description: [
       "Start a PERSISTENT sidekick worker asynchronously (cheap executor, own session).",
       "Returns worker_id (wrk_...) + turn_id (trn_...) immediately while the turn continues in the background.",
-      "Completion is handed back automatically: it queues behind an active Lead turn or wakes an idle Lead. Use fusion_status for an on-demand check, not a polling loop.",
+      "Completion is handed back automatically: it is steered into an active Lead turn at the next safe checkpoint or wakes an idle Lead. Use fusion_status for an on-demand check, not a polling loop.",
       "Use fusion_followup with the SAME worker_id for corrections — it keeps context.",
       "Pass worktree for write work: the sidekick gets an isolated checkout+branch (pi-fusion/<name>), merged later with fusion_merge.",
     ].join(" "),
@@ -1310,7 +1310,7 @@ export default function (pi: ExtensionAPI) {
       "Asynchronously continue the SAME persistent sidekick worker (wrk_...).",
       "If the worker is idle, returns a new turn_id and starts immediately.",
       "If busy, when_busy=steer (default) injects a related update into the active turn at its next safe checkpoint; queue waits for a separate turn; interrupt aborts and restarts after cleanup.",
-      "Completion automatically queues behind an active Lead turn or wakes an idle Lead.",
+      "Completion is steered into an active Lead turn at the next safe checkpoint or wakes an idle Lead.",
     ].join(" "),
     promptGuidelines: [
       "Prefer fusion_followup over fusion_spawn when correcting or extending a worker's previous result.",

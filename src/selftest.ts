@@ -861,7 +861,7 @@ try {
     completionMessages[0]?.message.content.includes("done"),
     completionMessages[0]?.options.deliverAs,
     completionMessages[0]?.options.triggerTurn,
-  ], ["fusion-result", true, "followUp", true]);
+  ], ["fusion-result", true, "steer", true]);
 
   let releaseSteerFirst!: (message: unknown) => void;
   let releaseSteerSecond!: (message: unknown) => void;
@@ -1145,9 +1145,11 @@ try {
     inquiryAccepted.details.worker_remembers_inquiry,
     executorSignal?.aborted,
     inquiryCompletion?.message.customType,
+    inquiryCompletion?.options.deliverAs,
+    inquiryCompletion?.options.triggerTurn,
     inquiryCompletion?.message.details?.worker_remembers_inquiry,
     inquiryCompletion?.message.content.includes("will not remember this inquiry"),
-  ], ["running", true, true, "The worker is waiting in its active turn.", workerBeforeInquiry.active_turn, workerBeforeInquiry.generation, workerBeforeInquiry.history_messages, false, false, "fusion-inquiry-result", false, true]);
+  ], ["running", true, true, "The worker is waiting in its active turn.", workerBeforeInquiry.active_turn, workerBeforeInquiry.generation, workerBeforeInquiry.history_messages, false, false, "fusion-inquiry-result", "steer", true, false, true]);
   eq("inquiry receives safe public snapshot", [
     inquiryContexts[0]?.includes("What is the worker doing?"),
     inquiryContexts[0]?.includes("private_thinking_available"),

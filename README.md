@@ -187,12 +187,13 @@ as well.
 
 When the worker finishes, pi-fusion shows a TUI notification and hands a small
 `fusion-result` custom message with the visible result back to the Lead
-(`deliverAs: "followUp", triggerTurn: true`). If the Lead is busy, the result
-waits behind the active turn without interrupting it; if idle, it starts a Lead
-turn immediately. This preserves the brief -> result -> review/feedback loop
-without blocking conversation or encouraging status polling. Session switch,
-reload, and shutdown interrupt active background workers and inquiries, then
-wait briefly for cleanup.
+(`deliverAs: "steer", triggerTurn: true`). If the Lead is busy, the result is
+inserted at the next safe checkpoint after the current tool batch and before the
+next model call; it never cancels a running tool. If idle, it starts a Lead turn
+immediately. This preserves the brief -> result -> review/feedback loop without
+blocking conversation or encouraging status polling. Session switch, reload,
+and shutdown interrupt active background workers and inquiries, then wait
+briefly for cleanup.
 
 ## Read-only worker inquiries (v0.13)
 
@@ -210,7 +211,9 @@ that thread over a point-in-time snapshot of the worker's completed history and
 bounded public live telemetry (visible response, tool names/arguments/output,
 phase, steering updates, and queued follow-ups). Inquiry calls use the worker's executor model
 with no tools, run concurrently with the worker, and return asynchronously as a
-`fusion-inquiry-result`. `fusion_status` accepts both `inq_...` and `iqt_...`.
+`fusion-inquiry-result`. Inquiry results use the same safe-checkpoint `steer`
+delivery, so a completed answer does not wait behind the rest of an active Lead
+turn. `fusion_status` accepts both `inq_...` and `iqt_...`.
 
 **The main worker never sees or remembers inquiry questions or answers.** The
 side chat is observational only and is never merged into worker history. If the

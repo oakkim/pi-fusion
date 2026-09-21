@@ -788,5 +788,29 @@ eq("force idempotent-guard", isForcePrompt("just hello"), false);
 eq("completions", fusionArgumentCompletions("o")?.map((c) => c.value), ["on", "off"]);
 eq("modeLabel", [modeLabel("forced"), modeLabel("off"), modeLabel("available")], ["Fusion forced", "Fusion off", "Fusion available"]);
 
+// --- 10. Fusion augments the built-in footer instead of replacing it ---
+const sessionStartHandlers: Array<(event: unknown, ctx: any) => Promise<void>> = [];
+fusionExtension({
+  on: (event: string, handler: (event: unknown, ctx: any) => Promise<void>) => {
+    if (event === "session_start") sessionStartHandlers.push(handler);
+  },
+  registerTool: () => {},
+  registerCommand: () => {},
+} as never);
+let statusCall: [string, string] | undefined;
+let customFooterCalls = 0;
+await sessionStartHandlers[0]?.({}, {
+  hasUI: true,
+  ui: {
+    setStatus: (key: string, text: string) => { statusCall = [key, text]; },
+    setFooter: () => { customFooterCalls++; },
+  },
+  sessionManager: { getBranch: () => [] },
+  isProjectTrusted: () => false,
+  model: undefined,
+  modelRegistry: { getAll: () => [], getAvailable: () => [] },
+});
+eq("fusion preserves built-in footer", [statusCall?.[0], statusCall?.[1].includes("Fusion available"), customFooterCalls], ["fusion", true, 0]);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

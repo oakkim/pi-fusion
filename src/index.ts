@@ -137,21 +137,16 @@ export default function (pi: ExtensionAPI) {
     return applyDefaults(applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx)));
   }
 
-  function refreshFooter(ctx: ExtensionContext): void {
+  function refreshStatus(ctx: ExtensionContext): void {
     try {
       if (!ctx.hasUI) return;
       const mode = restoreMode(ctx);
       const warnings: string[] = [];
       const resolved = resolveExecutorModel(ctx.modelRegistry, ctx.model, effectiveConfig(ctx).executor, warnings);
       const execLabel = resolved ? modelDisplay(resolved) : "unset";
-      const text = `${modeLabel(mode)} • executor ${execLabel}`;
-      ctx.ui.setFooter(() => ({
-        dispose() {},
-        invalidate() {},
-        render: () => [text],
-      }));
+      ctx.ui.setStatus("fusion", `${modeLabel(mode)} • executor ${execLabel}`);
     } catch {
-      // footer is cosmetic
+      // status is cosmetic
     }
   }
 
@@ -165,14 +160,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     restoreRuntime(ctx);
-    refreshFooter(ctx);
+    refreshStatus(ctx);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     restoreRuntime(ctx);
-    refreshFooter(ctx);
+    refreshStatus(ctx);
   });
-  pi.on("model_select", async (_event, ctx) => refreshFooter(ctx));
+  pi.on("model_select", async (_event, ctx) => refreshStatus(ctx));
 
   // Off mode: fusion tools are mechanically disabled, not just discouraged.
   // Delegate enforcement (opencode-fusion style): when leadMutations is
@@ -587,7 +582,7 @@ export default function (pi: ExtensionAPI) {
       if (parsed.kind === "set" || parsed.kind === "toggle") {
         const next = parsed.kind === "set" ? parsed.mode : (restoreMode(ctx) === "forced" ? "available" : "forced");
         persistMode(next);
-        refreshFooter(ctx);
+        refreshStatus(ctx);
         tell(modeLabel(next));
         return;
       }
@@ -618,7 +613,7 @@ export default function (pi: ExtensionAPI) {
 
       const apply = (override: ExecutorOverride, label: string) => {
         persistExecutorOverride(override);
-        refreshFooter(ctx);
+        refreshStatus(ctx);
         tell(`Fusion executor: ${label}`);
       };
 

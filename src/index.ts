@@ -27,7 +27,7 @@ import {
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
 import { SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
-import { FusionPaneController, type LiveActivity, type PaneState } from "./pane.ts";
+import { FusionPaneController, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
 import { getTextContent, runExecutorTurn } from "./llm.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
@@ -118,13 +118,81 @@ export function formatElapsedDuration(elapsedMs: number): string {
   return `${hours}h ${String(minutes).padStart(2, "0")}m ${secondText}s`;
 }
 
+function parseStatusArguments(value: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function compactStatusPath(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const path = statusText(value);
+  if (path.length <= 40) return path;
+  const parts = path.split("/").filter(Boolean);
+  return parts.length >= 2 ? `…/${parts.slice(-2).join("/")}` : clipStatus(path, 40, true);
+}
+
+function quotedStatusValue(value: unknown): string {
+  return typeof value === "string" ? JSON.stringify(clipStatus(value, 34)) : "";
+}
+
+function toolStatusDetail(tool: LiveToolActivity): string {
+  const args = parseStatusArguments(tool.arguments);
+  if (!args) {
+    const raw = statusText(tool.arguments);
+    return raw && !raw.startsWith("{") ? clipStatus(raw, 56) : "";
+  }
+  switch (tool.name) {
+    case "bash":
+      return typeof args.command === "string" ? clipStatus(args.command, 56) : "";
+    case "read": {
+      const path = compactStatusPath(args.path);
+      const offset = typeof args.offset === "number" ? `:${args.offset}` : "";
+      return `${path}${offset}`;
+    }
+    case "write":
+      return compactStatusPath(args.path);
+    case "edit": {
+      const path = compactStatusPath(args.path);
+      const count = Array.isArray(args.edits) ? args.edits.length : 0;
+      return `${path}${count ? ` · ${count} edit${count === 1 ? "" : "s"}` : ""}`;
+    }
+    case "grep": {
+      const pattern = quotedStatusValue(args.pattern);
+      const path = compactStatusPath(args.path);
+      return [pattern, path].filter(Boolean).join(" · ");
+    }
+    case "find": {
+      const pattern = quotedStatusValue(args.pattern);
+      const path = compactStatusPath(args.path);
+      return [pattern, path].filter(Boolean).join(" · ");
+    }
+    case "ls":
+      return compactStatusPath(args.path) || ".";
+    default: {
+      const details = Object.entries(args)
+        .filter(([, value]) => typeof value === "string" || typeof value === "number" || typeof value === "boolean")
+        .slice(0, 2)
+        .map(([key, value]) => `${key}=${clipStatus(String(value), 24)}`);
+      return details.join(" · ");
+    }
+  }
+}
+
+export function formatToolStatusAction(tool: LiveToolActivity): string {
+  const marker = tool.status === "running" ? "▶" : tool.status === "success" ? "✓" : "✗";
+  const detail = toolStatusDetail(tool);
+  return clipStatus(`${marker} ${tool.name}${detail ? ` · ${detail}` : ""}`, 72);
+}
+
 export function formatLiveStatusAction(activity: LiveActivity | undefined): string {
   if (!activity) return "starting";
   if (activity.phase === "tool") {
     const tool = [...activity.tools].reverse().find((item) => item.status === "running") ?? activity.tools.at(-1);
-    if (!tool) return "tool";
-    const args = clipStatus(tool.arguments, 58);
-    return clipStatus(`${tool.name}${args ? ` ${args}` : ""}`, 72);
+    return tool ? formatToolStatusAction(tool) : "tool";
   }
   if (activity.phase === "responding") {
     // Show the worker's actual visible words. Its response language therefore

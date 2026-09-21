@@ -4,7 +4,7 @@ import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext, latestUserText } from "../src/utils.ts";
-import fusionExtension, { formatElapsedDuration, formatLiveStatusAction } from "../src/index.ts";
+import fusionExtension, { formatElapsedDuration, formatLiveStatusAction, formatToolStatusAction } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
@@ -1104,7 +1104,18 @@ eq("status line passes through visible worker activity", [
   formatLiveStatusAction({ phase: "responding", startedAt: 0, text: "한국어로 작업 결과를 설명 중", tools: [] }),
   formatLiveStatusAction({ phase: "tool", startedAt: 0, text: "", tools: [{ id: "1", name: "bash", arguments: '{"command":"git status"}', output: "", status: "running" }] }),
   formatLiveStatusAction(thinkingActivity),
-], ["한국어로 작업 결과를 설명 중", 'bash {"command":"git status"}', "thinking"]);
+], ["한국어로 작업 결과를 설명 중", "▶ bash · git status", "thinking"]);
+eq("status line formats tool calls cleanly", [
+  formatToolStatusAction({ id: "1", name: "read", arguments: '{"path":"src/index.ts","offset":10}', output: "", status: "running" }),
+  formatToolStatusAction({ id: "2", name: "edit", arguments: '{"path":"src/index.ts","edits":[{},{}]}', output: "", status: "success" }),
+  formatToolStatusAction({ id: "3", name: "grep", arguments: '{"pattern":"needle","path":"src"}', output: "", status: "error" }),
+  formatToolStatusAction({ id: "4", name: "bash", arguments: '{"command":"npm test"}', output: "", status: "success" }),
+], [
+  "▶ read · src/index.ts:10",
+  "✓ edit · src/index.ts · 2 edits",
+  '✗ grep · "needle" · src',
+  "✓ bash · npm test",
+]);
 eq("status elapsed uses h/m/s", [
   formatElapsedDuration(0),
   formatElapsedDuration(59_999),

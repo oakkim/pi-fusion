@@ -148,13 +148,15 @@ cleanup.
 The default TUI view stays unobstructed. While a worker runs, the Pi status line
 shows one compact view of its existing live stream:
 
-- tool call: the actual tool name and arguments
+- tool call: a compact deterministic view such as `▶ bash · npm test`, `▶ read · src/index.ts:40`, or `✓ edit · src/index.ts · 2 edits`
+- tool state: `▶` running, `✓` succeeded, `✗` failed
 - visible response: the worker's latest visible words, unchanged
 - otherwise: `waiting`, `thinking`, or `starting`
 - elapsed time as `42s`, `3m 07s`, or `1h 02m 09s`, plus `+N` when other workers are also active
 
-There is no extra summarization, translation, or model call. Because visible
-response text is passed through directly, the worker's conversation language
+Tool arguments are formatted locally by tool type; there is no extra model call
+or semantic summary. Visible response text is passed through directly, so the
+worker's conversation language
 naturally appears in the status line. Each handoff includes a bounded copy of
 the latest end-user message only as a language cue, so sidekick prose follows
 the current conversation while code, paths, commands, and raw output stay

@@ -19,7 +19,7 @@ export interface FusionConfig {
   executor?: string;
   /** Executor tool access: "none" | "readonly" | "all" | explicit list. Default "all". */
   executorTools?: ToolSelection;
-  /** Max tool calls per sidekick turn. Default 16, clamp 1-100. */
+  /** Emergency ceiling for tool calls per sidekick turn. Default 1024, clamp 1-1024. */
   maxToolCalls?: number;
   /** Max output tokens per sidekick turn. Default 4096. */
   maxExecutorOutputTokens?: number;

@@ -12,9 +12,9 @@ import type { FusionConfig, ResolvedFusionConfig, ToolSelection } from "./types.
 export const DEFAULT_MAX_TOKENS = 4096;
 export const MAX_TOKENS = 65_536;
 export const DEFAULT_TEMPERATURE = 0.2;
-export const DEFAULT_MAX_TOOL_CALLS = 16;
+export const DEFAULT_MAX_TOOL_CALLS = 1024;
 export const MIN_TOOL_CALLS = 1;
-export const MAX_TOOL_CALLS = 100;
+export const MAX_TOOL_CALLS = 1024;
 export const DEFAULT_MAX_HISTORY = 40;
 export const DEFAULT_MAX_ESCALATIONS = 2;
 export const MIN_ESCALATIONS = 0;

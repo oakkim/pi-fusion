@@ -199,7 +199,7 @@ pi install git:github.com/oakkim/pi-fusion
 {
   "executor": "openai/gpt-4.1-mini",
   "executorTools": "all",
-  "maxToolCalls": 16,
+  "maxToolCalls": 1024,
   "maxExecutorOutputTokens": 4096,
   "temperature": 0.2,
   "thinkingLevel": "off",
@@ -209,6 +209,10 @@ pi install git:github.com/oakkim/pi-fusion
 ```
 
 `executorTools`: `"none" | "readonly" | "all" | ["read","grep","find","ls","bash","edit","write"]`.
+
+`maxToolCalls` defaults to 1024 as an emergency ceiling rather than a normal
+working budget. Repeated identical calls and consecutive tool failures still
+stop after three attempts, and the lead can interrupt a running worker.
 
 `thinkingLevel`: `"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`.
 

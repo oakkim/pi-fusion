@@ -129,7 +129,7 @@ eq("handoff gen+task", h.includes('generation="2"') && h.includes("fix auth") &&
 
 // --- 5. config defaults ---
 const cfg = applyDefaults({});
-eq("defaults", [cfg.executorTools, cfg.maxToolCalls, cfg.maxExecutorOutputTokens, cfg.temperature, cfg.thinkingLevel, cfg.maxHistoryMessages], ["all", 16, 4096, 0.2, "off", 40]);
+eq("defaults", [cfg.executorTools, cfg.maxToolCalls, cfg.maxExecutorOutputTokens, cfg.temperature, cfg.thinkingLevel, cfg.maxHistoryMessages], ["all", 1024, 4096, 0.2, "off", 40]);
 
 // --- 6. recent context builder ---
 const entries = [
@@ -146,7 +146,8 @@ import { tmpdir } from "node:os";
 import { join as _join } from "node:path";
 import { promisify as _promisify } from "node:util";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree, validateWorktreeName } from "../src/worktree.ts";
-import { resolveToolDefs } from "../src/tools.ts";
+import { clampMaxToolCalls, resolveToolDefs } from "../src/tools.ts";
+eq("tool budget default and clamp", [clampMaxToolCalls(undefined), clampMaxToolCalls(2048), clampMaxToolCalls(0)], [1024, 1024, 1]);
 
 const sh = _promisify(_execFile);
 async function tgit(cwd: string, args: string[]): Promise<void> {

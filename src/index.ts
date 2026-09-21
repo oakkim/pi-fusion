@@ -2,8 +2,8 @@
  * pi-fusion entry: persistent Lead/Sidekick tools for pi.
  *
  * Tools (planner calls these; executor never sees them):
- * - fusion_spawn   : new persistent worker (wrk_...) + first turn (trn_...)
- * - fusion_followup: continue the SAME worker (persistent context)
+ * - fusion_spawn   : start a persistent worker turn asynchronously (wrk_... + trn_...)
+ * - fusion_followup: asynchronously continue the SAME worker (persistent context)
  * - fusion_status  : inspect worker or turn without blocking
  * - fusion_interrupt: stop the active turn, keep the worker (no failure recorded)
  * - fusion_close   : retire a worker (interrupts active turn)
@@ -30,7 +30,7 @@ import { SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
 import { FusionPaneController, type PaneState } from "./pane.ts";
 import { getTextContent, runExecutorTurn } from "./llm.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
-import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs, selectionLabel } from "./tools.ts";
+import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
 import { WorkerRuntime, type WorkerRecord } from "./runtime.ts";
 import { fusionArgumentCompletions, isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, parseFusionCommand, type FusionMode } from "./mode.ts";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree } from "./worktree.ts";
@@ -95,6 +95,9 @@ function userMsg(text: string): Message {
 export default function (pi: ExtensionAPI) {
   const runtime = new WorkerRuntime();
   const pane = new FusionPaneController((id) => runtime.getWorker(id));
+  const backgroundTurns = new Map<string, Promise<void>>();
+  let sessionActive = true;
+  let sessionEpoch = 0;
 
   function restoreMode(ctx: ExtensionContext): FusionMode {
     try {
@@ -272,18 +275,51 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function stopBackgroundTurns(): Promise<void> {
+    runtime.interruptAll();
+    const pending = [...backgroundTurns.values()];
+    if (pending.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(pending),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, 1_000); }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
+  async function suspendSession(): Promise<void> {
+    if (sessionActive) {
+      sessionActive = false;
+      sessionEpoch += 1;
+      pane.shutdown();
+    }
+    await stopBackgroundTurns();
+  }
+
   pi.on("session_start", async (_event, ctx) => {
+    sessionEpoch += 1;
+    sessionActive = true;
     restoreRuntime(ctx);
     restorePane(ctx);
     refreshStatus(ctx);
   });
 
+  // Stop workers while the old branch is still current so their final state
+  // cannot be journaled or delivered into the branch selected by /tree.
+  pi.on("session_before_tree", async () => {
+    await suspendSession();
+  });
   pi.on("session_tree", async (_event, ctx) => {
+    // Defensive for hosts that emit only the post-tree event.
+    await suspendSession();
     restoreRuntime(ctx);
+    sessionActive = true;
     restorePane(ctx);
     refreshStatus(ctx);
   });
-  pi.on("session_shutdown", async () => pane.close());
+  pi.on("session_shutdown", async () => {
+    await suspendSession();
+  });
   pi.on("model_select", async (_event, ctx) => refreshStatus(ctx));
 
   // Off mode: fusion tools are mechanically disabled, not just discouraged.
@@ -351,16 +387,20 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     workerId: string,
     turnId: string,
-    hostSignal?: AbortSignal,
-    onUpdate?: (partial: { content: Array<{ type: "text"; text: string }>; details: unknown }) => void,
+    epoch: number,
   ): Promise<{ text: string; details: Record<string, unknown> }> {
     const worker = runtime.getWorker(workerId)!;
     const turn = runtime.getTurn(turnId)!;
+    const persistCurrent = () => {
+      if (sessionActive && sessionEpoch === epoch) persist(ctx, workerId);
+    };
     pane.select(workerId);
     pane.refresh();
     const controller = new AbortController();
     runtime.trackController(turnId, controller);
-    const signal = hostSignal ? AbortSignal.any([controller.signal, hostSignal]) : controller.signal;
+    // The worker is detached from the lead tool-call signal. Once accepted,
+    // fusion_interrupt/session shutdown exclusively own cancellation.
+    const signal = controller.signal;
     let liveToken: number | undefined;
     const clearLive = () => {
       if (liveToken !== undefined) pane.clearLive(workerId, liveToken);
@@ -369,7 +409,7 @@ export default function (pi: ExtensionAPI) {
       if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
       runtime.untrackController(turnId);
       clearLive();
-      persist(ctx, workerId);
+      persistCurrent();
       pane.refresh();
       return {
         text: JSON.stringify({ status: "interrupted", worker_id: workerId, turn_id: turnId }, null, 2),
@@ -385,6 +425,7 @@ export default function (pi: ExtensionAPI) {
       const error = "no authed text executor model available";
       runtime.failTurn(turnId, error);
       clearLive();
+      persistCurrent();
       pane.refresh();
       return { text: JSON.stringify({ status: "error", error }, null, 2), details: { status: "error", error } };
     }
@@ -399,10 +440,6 @@ export default function (pi: ExtensionAPI) {
     const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
 
     liveToken = pane.beginLive(workerId);
-    onUpdate?.({
-      content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | thinking ${thinkingLevel} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
-      details: { phase: "executing", workerId, turnId },
-    });
     pane.refresh();
 
     const exec = () => {
@@ -432,7 +469,7 @@ export default function (pi: ExtensionAPI) {
         const status = worker.status === "closed"
           ? "closed"
           : runtime.getTurn(turnId)?.status === "interrupted" ? "interrupted" : "stale";
-        persist(ctx, workerId);
+        persistCurrent();
         return {
           text: JSON.stringify({ status, worker_id: workerId, turn_id: turnId }, null, 2),
           details: { status, worker_id: workerId, turn_id: turnId },
@@ -442,7 +479,7 @@ export default function (pi: ExtensionAPI) {
       // re-evaluated from failures every turn, so a compaction boundary also
       // re-routes for free.
       const compacted = runtime.compactHistory(worker, cfg.maxHistoryMessages);
-      persist(ctx, workerId);
+      persistCurrent();
       pane.refresh();
       try {
         (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-cost", {
@@ -490,7 +527,7 @@ export default function (pi: ExtensionAPI) {
       }
       const message = err instanceof Error ? err.message : String(err);
       runtime.failTurn(turnId, message);
-      persist(ctx, workerId);
+      persistCurrent();
       pane.refresh();
       return {
         text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message, consecutive_failures: worker.failures, next_rung: rungFor(worker.failures, ladder.length) }, null, 2),
@@ -503,22 +540,86 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function enqueueTurnResult(
+    ctx: ExtensionContext,
+    workerId: string,
+    turnId: string,
+    epoch: number,
+    outcome: { text: string; details: Record<string, unknown> },
+  ): void {
+    if (!sessionActive || sessionEpoch !== epoch) return;
+    const turn = runtime.getTurn(turnId);
+    const status = turn?.status ?? String(outcome.details.status ?? "unknown");
+    const maxContextChars = 12_000;
+    const bounded = outcome.text.length > maxContextChars
+      ? `${outcome.text.slice(0, maxContextChars)}\n...[result truncated; use fusion_status for the stored turn]`
+      : outcome.text;
+    const content = [
+      `Fusion background turn finished (${status}): ${workerId} / ${turnId}.`,
+      "The sidekick result follows. The Lead must personally inspect the actual diff and relevant code before approval or merge.",
+      "",
+      bounded,
+    ].join("\n");
+    try {
+      pi.sendMessage(
+        {
+          customType: "fusion-result",
+          content,
+          display: true,
+          details: { worker_id: workerId, turn_id: turnId, status },
+        },
+        { deliverAs: "nextTurn" },
+      );
+    } catch {
+      // The extension runtime may have been invalidated during session replacement.
+    }
+    try {
+      if (ctx.hasUI) ctx.ui.notify(`Fusion ${workerId} ${status} (${turnId})`, status === "failed" ? "error" : "info");
+    } catch {
+      // Notification is cosmetic and the session message/status remain available.
+    }
+  }
+
+  function launchTurn(ctx: ExtensionContext, workerId: string, turnId: string): void {
+    const epoch = sessionEpoch;
+    const task = (async () => {
+      let outcome: { text: string; details: Record<string, unknown> };
+      try {
+        outcome = await runTurn(ctx, workerId, turnId, epoch);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (runtime.getTurn(turnId)?.status === "running") runtime.failTurn(turnId, message);
+        pane.clearLive(workerId);
+        if (sessionActive && sessionEpoch === epoch) persist(ctx, workerId);
+        outcome = {
+          text: JSON.stringify({ status: "error", worker_id: workerId, turn_id: turnId, error: message }, null, 2),
+          details: { status: "error", worker_id: workerId, turn_id: turnId, error: message },
+        };
+      }
+      enqueueTurnResult(ctx, workerId, turnId, epoch, outcome);
+    })();
+    backgroundTurns.set(turnId, task);
+    void task.then(() => backgroundTurns.delete(turnId));
+  }
+
   pi.registerTool({
     name: "fusion_spawn",
     label: "Fusion Spawn",
     description: [
-      "Spawn a PERSISTENT sidekick worker (cheap executor, own session).",
-      "Returns worker_id (wrk_...) + turn_id (trn_...). Use fusion_followup with the SAME worker_id for corrections — it keeps context.",
-      "Use for implementation, refactors, test fixes, and repo exploration with a precise spec.",
+      "Start a PERSISTENT sidekick worker asynchronously (cheap executor, own session).",
+      "Returns worker_id (wrk_...) + turn_id (trn_...) immediately while the turn continues in the background.",
+      "Completion is queued as a next-turn Fusion result; use fusion_status for an on-demand check, not a polling loop.",
+      "Use fusion_followup with the SAME worker_id for corrections — it keeps context.",
       "Pass worktree for write work: the sidekick gets an isolated checkout+branch (pi-fusion/<name>), merged later with fusion_merge.",
     ].join(" "),
     promptGuidelines: [
       "Use fusion_spawn for well-specified mechanical work: exact files, exact changes, constraints, verification to run.",
-      "After spawn, review the result; send corrections via fusion_followup on the same worker_id, not by editing yourself.",
+      "fusion_spawn is non-blocking: after it returns the IDs, continue the user conversation or other Lead work. Do not busy-poll fusion_status; completion arrives as a next-turn Fusion result.",
+      "When the result arrives, personally inspect the actual diff and relevant code before approval; the sidekick's report is evidence, not a substitute for Lead review.",
+      "Send corrections via fusion_followup on the same worker_id instead of silently rewriting delegated work.",
       "Spawn a new worker only for independent work; otherwise follow up on the existing worker.",
       "Give overlapping write workers separate worktrees; never let two workers edit the same checkout.",
       "When lead mutation enforcement is on, the lead cannot run commands for you — write specs that are fully self-sufficient (files, exact changes, verification commands to run yourself).",
-
     ],
     parameters: SpawnParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -555,8 +656,22 @@ export default function (pi: ExtensionAPI) {
       const { worker, turn } = runtime.spawn({ label: params.label, executorModelId: modelDisplay(executor), firstMessage: userMsg(taskText), worktree });
       persist(ctx, worker.id);
       openPaneForWorker(ctx, worker.id);
-      const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
-      return { content: [{ type: "text", text: out.text }], details: out.details };
+      onUpdate?.({
+        content: [{ type: "text", text: `Starting Fusion worker ${worker.id} asynchronously...` }],
+        details: { status: "starting", worker_id: worker.id, turn_id: turn.id },
+      });
+      launchTurn(ctx, worker.id, turn.id);
+      const accepted = {
+        status: "running",
+        asynchronous: true,
+        worker_id: worker.id,
+        turn_id: turn.id,
+        generation: turn.generation,
+        executor: worker.executorModelId,
+        worktree: worker.worktree ? { name: worker.worktree.name, branch: worker.worktree.branch, path: worker.worktree.path } : undefined,
+        message: "Worker continues in the background. Continue the conversation; completion will be delivered as a next-turn Fusion result.",
+      };
+      return { content: [{ type: "text", text: JSON.stringify(accepted, null, 2) }], details: accepted };
     },
   });
 
@@ -564,13 +679,15 @@ export default function (pi: ExtensionAPI) {
     name: "fusion_followup",
     label: "Fusion Followup",
     description: [
-      "Continue the SAME persistent sidekick worker (wrk_...).",
-      "The worker keeps its session history; the follow-up is appended as the next handoff generation.",
+      "Asynchronously continue the SAME persistent sidekick worker (wrk_...).",
+      "Returns the new turn_id immediately; the worker keeps its session history and runs in the background.",
+      "Completion is queued as a next-turn Fusion result.",
     ].join(" "),
     promptGuidelines: [
       "Prefer fusion_followup over fusion_spawn when correcting or extending a worker's previous result.",
       "Include what was wrong and the exact correction; the worker already knows the prior context.",
-      "Provider failures auto-escalate the worker one rung up the fallback ladder (and de-escalate on success) — retry via followup before giving up on a worker.",
+      "fusion_followup is non-blocking. Continue the conversation instead of polling; personally review the correction when its completion result arrives.",
+      "Provider failures auto-escalate the worker one rung up the fallback ladder (and de-escalate on success) — retry via followup before taking over.",
     ],
     parameters: FollowupParams,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -601,8 +718,20 @@ export default function (pi: ExtensionAPI) {
       }
       persist(ctx, worker.id);
       openPaneForWorker(ctx, worker.id);
-      const out = await runTurn(ctx, worker.id, turn.id, signal, onUpdate);
-      return { content: [{ type: "text", text: out.text }], details: out.details };
+      onUpdate?.({
+        content: [{ type: "text", text: `Starting Fusion follow-up ${turn.id} asynchronously...` }],
+        details: { status: "starting", worker_id: worker.id, turn_id: turn.id },
+      });
+      launchTurn(ctx, worker.id, turn.id);
+      const accepted = {
+        status: "running",
+        asynchronous: true,
+        worker_id: worker.id,
+        turn_id: turn.id,
+        generation: turn.generation,
+        message: "Follow-up continues in the background. Continue the conversation; completion will be delivered as a next-turn Fusion result.",
+      };
+      return { content: [{ type: "text", text: JSON.stringify(accepted, null, 2) }], details: accepted };
     },
   });
 
@@ -624,7 +753,7 @@ export default function (pi: ExtensionAPI) {
         const t = runtime.getTurn(params.id);
         if (!t) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Turn ${params.id} was not found.` }) }], details: { status: "error" } };
         return {
-          content: [{ type: "text", text: JSON.stringify({ type: "turn", turn_id: t.id, worker_id: t.workerId, status: t.status, generation: t.generation, text: t.text?.slice(0, 4000), error: t.error }, null, 2) }],
+          content: [{ type: "text", text: JSON.stringify({ type: "turn", turn_id: t.id, worker_id: t.workerId, status: t.status, generation: t.generation, text: t.text?.slice(0, 12_000), text_truncated: (t.text?.length ?? 0) > 12_000, error: t.error }, null, 2) }],
           details: { status: t.status },
         };
       }

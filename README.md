@@ -16,8 +16,8 @@ Lineage (ideas ported, not forked):
 
 ```
 Lead (your model, planner/reviewer)
-  |-- fusion_spawn "precise spec"  -> wrk_abc, trn_1 (new persistent session)
-  |-- fusion_followup wrk_abc "..." -> trn_2, SAME session history
+  |-- fusion_spawn "precise spec"  -> wrk_abc, trn_1 immediately (runs in background)
+  |-- fusion_followup wrk_abc "..." -> trn_2 immediately, SAME session history
   |-- fusion_spawn worktree=parser ... -> wrk_def (isolated checkout pi-fusion/parser)
   |-- fusion_followup wrk_def ...   -> same worktree
   |-- fusion_merge wrk_def          -> commit + merge branch into project
@@ -26,8 +26,8 @@ Lead (your model, planner/reviewer)
   +-- /fusion-status (list workers)
 ```
 
-- Sidekick keeps **independent persistent history** per worker (`WorkerRuntime`), never merged into the lead transcript — only its final text returns.
-- Follow-ups append to the same history with bumped `generation` (`<fusion_handoff generation="N">`), mirroring fusion-ref's coordinator.
+- Sidekick keeps **independent persistent history** per worker (`WorkerRuntime`). Its final visible result is queued into the lead context only after completion; private thinking is never forwarded.
+- Spawn and follow-up return IDs immediately, so the Lead and user can keep talking while the worker runs. Follow-ups append to the same history with bumped `generation` (`<fusion_handoff generation="N">`).
 - Independent compaction per worker (`maxHistoryMessages`, default 40; keeps first + last N-1) with routing reconsidered at that boundary.
 - Mutating tools (bash/edit/write) require trusted project + consent, and mutating runs are serialized — same fail-closed posture as pi-devin-fusion.
 - Session journal: worker snapshots are appended as `fusion-worker` custom entries and restored on `session_start` (best-effort durable across `/resume`).
@@ -128,6 +128,19 @@ Session consent is journaled as `fusion-consent` and affects both new workers
 and persistent-worker followups. `allow` is rejected for untrusted projects;
 config-file consent is also loaded only from trusted projects.
 
+## Asynchronous turns (v0.10)
+
+`fusion_spawn` and `fusion_followup` complete their tool call as soon as the
+worker turn is accepted. The sidekick then runs independently from the Lead
+turn's abort signal. Use `fusion_interrupt` for explicit cancellation.
+
+When the worker finishes, pi-fusion shows a TUI notification and queues a small
+`fusion-result` custom message with the visible result for the next user turn
+(`deliverAs: "nextTurn"`). It never interrupts or triggers a Lead turn. This
+preserves the brief -> result -> feedback loop without blocking conversation or
+encouraging status polling. Session switch, reload, and shutdown interrupt
+active background workers and wait briefly for cleanup.
+
 ## Worker conversation pane (v0.9)
 
 ```
@@ -144,7 +157,9 @@ or `responding`), elapsed time, visible answer text, tool arguments, partial
 built-in tool output, and tool success/error. Private thinking text is never
 shown. Live activity is transient: it is not added to worker history or the
 session journal, and is cleared when a turn finishes, fails, is interrupted, or
-the pane closes. The selected worker and visibility remain journaled. The pane
+the session shuts down. Closing the pane only hides it, so reopening during an
+active turn restores the current live view. The selected worker and visibility
+remain journaled. The pane
 uses the available overlay height, is somewhat wider for readability, and
 automatically hides below 110 terminal columns.
 
@@ -157,14 +172,18 @@ editor remains usable.
 Two layers, following what others found (opencode-fusion's systemic Main edit
 ban beats prompt-only rules, which our bench showed the lead ignores):
 
-1. Stronger planner prompt: cost discipline, never re-read/re-implement
-   delegated work, corrections via followup.
+1. Planner prompt: delegate broad exploration and implementation, but require
+   the Lead to personally inspect the actual diff and relevant code before
+   approval. Sidekick reports are evidence, not a substitute for review.
+   Corrections use the same worker; repeated failure or judgment-heavy work can
+   trigger an explicit Lead takeover.
 2. `leadMutations: "allow" | "delegate"` (default allow). `"delegate"`
    mechanically blocks lead bash/edit/write at the tool_call hook — reads and
-   fusion_* stay open. Bench result: the block guarantees delegation but the
-   lead burns retry loops fighting it (suggest+enforce was the priciest arm);
-   telling it upfront (forced+enforce) halves the flailing. So: default allow,
-   enforce only where the guarantee matters. See `bench/results/manual-003.md`.
+   fusion_* stay open specifically so mandatory Lead review remains possible.
+   Bench result: the block guarantees delegation but the lead burns retry loops
+   fighting it (suggest+enforce was the priciest arm); telling it upfront
+   (forced+enforce) halves the flailing. So: default allow, enforce only where
+   the guarantee matters. See `bench/results/manual-003.md`.
 
 ## Cost harness (v0.6, `bench/`)
 
@@ -185,8 +204,9 @@ while python-subprocess or direct shell works — so the runner goes through
 ## What v0 does NOT do (deliberate)
 
 - No daemon/SQLite (opencode-agent has it; pi extension keeps in-memory + session journal).
-- No multi-model escalation lists (routing policy is wired in, but config exposes a single `executor`; lists come in v1).
-- No forced mode (`/devin on` style input transform) — lead decides via `promptGuidelines`.
+- No independent cache-warming daemon for sidekick sessions.
+- No automatic task-complexity classifier; the Lead decides when to delegate.
+- Background workers are asynchronous, but Pi does not run two interactive Lead transcripts at once.
 
 ## Install
 

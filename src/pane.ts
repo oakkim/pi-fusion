@@ -59,6 +59,12 @@ function boundText(value: string, max: number): string {
   return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 3))}...` : normalized;
 }
 
+/** Streaming text/output should keep the newest bytes, not freeze at the prefix. */
+function boundTailText(value: string, max: number): string {
+  const normalized = value.replace(/\r/g, "");
+  return normalized.length > max ? `...${normalized.slice(-Math.max(0, max - 3))}` : normalized;
+}
+
 function textParts(content: unknown): string[] {
   if (typeof content === "string") return content.trim() ? [content] : [];
   if (!Array.isArray(content)) return [];
@@ -129,20 +135,21 @@ function elapsedText(startedAt: number, now = Date.now()): string {
 }
 
 function liveLines(activity: LiveActivity, width: number, now = Date.now()): string[] {
-  const lines: string[] = [`[LIVE] ${activity.phase} | ${elapsedText(activity.startedAt, now)}`];
+  const statusLine = `[LIVE] ${activity.phase} | ${elapsedText(activity.startedAt, now)}`;
+  const detailLines: string[] = [];
   if (activity.text) {
-    const text = wrapTextWithAnsi(`[LIVE] ${boundText(activity.text, LIVE_TEXT_MAX)}`, width);
-    lines.push(...text.slice(-LIVE_TEXT_LINES));
+    const text = wrapTextWithAnsi(`[LIVE] ${boundTailText(activity.text, LIVE_TEXT_MAX)}`, width);
+    detailLines.push(...text.slice(-LIVE_TEXT_LINES));
   }
   for (const tool of activity.tools) {
     const args = tool.arguments ? ` ${tool.arguments}` : "";
-    lines.push(...wrapTextWithAnsi(`[TOOL] ${tool.name}${args} | ${tool.status}`, width));
+    detailLines.push(...wrapTextWithAnsi(`[TOOL] ${tool.name}${args} | ${tool.status}`, width));
     if (tool.output) {
-      const output = wrapTextWithAnsi(`[TOOL] > ${boundText(tool.output, LIVE_OUTPUT_MAX)}`, width);
-      lines.push(...output.slice(-LIVE_OUTPUT_LINES));
+      const output = wrapTextWithAnsi(`[TOOL] > ${boundTailText(tool.output, LIVE_OUTPUT_MAX)}`, width);
+      detailLines.push(...output.slice(-LIVE_OUTPUT_LINES));
     }
   }
-  return lines.slice(-LIVE_LINES_MAX);
+  return [statusLine, ...detailLines.slice(-(LIVE_LINES_MAX - 1))];
 }
 
 /** Pure deterministic renderer used by the TUI component and self-tests. */
@@ -170,15 +177,23 @@ export function renderWorkerPane(
     row(` ${"-".repeat(Math.max(0, innerWidth - 2))}`),
   );
   const availableWidth = Math.max(1, innerWidth - 2);
-  const currentLiveLines = live ? liveLines(live, availableWidth) : [];
+  const contentLimit = Number.isFinite(maxConversationLines)
+    ? Math.max(1, maxConversationLines)
+    : maxConversationLines;
+  let currentLiveLines = live ? liveLines(live, availableWidth) : [];
+  if (Number.isFinite(contentLimit) && currentLiveLines.length > contentLimit) {
+    currentLiveLines = contentLimit === 1
+      ? [currentLiveLines[0]!]
+      : [currentLiveLines[0]!, ...currentLiveLines.slice(-(contentLimit - 1))];
+  }
   for (const line of currentLiveLines) lines.push(row(` ${line}`));
 
-  const conversationLimit = Number.isFinite(maxConversationLines)
-    ? Math.max(1, maxConversationLines - currentLiveLines.length)
-    : maxConversationLines;
+  const conversationLimit = Number.isFinite(contentLimit)
+    ? Math.max(0, contentLimit - currentLiveLines.length)
+    : contentLimit;
   const conversation = historyLines(worker.history, availableWidth);
-  const recent = conversation.slice(-conversationLimit);
-  if (recent.length === 0) lines.push(row(" No visible messages."));
+  const recent = conversationLimit > 0 ? conversation.slice(-conversationLimit) : [];
+  if (recent.length === 0 && currentLiveLines.length === 0) lines.push(row(" No visible messages."));
   else for (const line of recent) lines.push(row(` ${line}`));
   lines.push(border);
   return lines;
@@ -252,16 +267,14 @@ export class FusionPaneController {
 
   beginLive(workerId: string, startedAt = Date.now()): number {
     const token = ++this.#liveSequence;
-    if (!this.#state.visible) return token;
     this.#liveTokens.set(workerId, token);
     this.#live.set(workerId, { phase: "waiting", startedAt, text: "", tools: [] });
-    this.#ensureElapsedTimer();
+    if (this.#state.visible) this.#ensureElapsedTimer();
     this.refresh();
     return token;
   }
 
   updateLive(workerId: string, progress: LiveProgress, token?: number): void {
-    if (!this.#state.visible) return;
     if (token !== undefined && this.#liveTokens.get(workerId) !== token) return;
     const activity = this.#live.get(workerId);
     if (!activity) return;
@@ -270,7 +283,7 @@ export class FusionPaneController {
       case "phase":
         activity.phase = progress.phase;
         if (progress.replaceText) activity.text = "";
-        if (progress.text !== undefined) activity.text = boundText(progress.text, LIVE_TEXT_MAX);
+        if (progress.text !== undefined) activity.text = boundTailText(progress.text, LIVE_TEXT_MAX);
         break;
       case "tool_start": {
         const existing = activity.tools.find((tool) => tool.id === progress.toolId);
@@ -294,14 +307,14 @@ export class FusionPaneController {
       }
       case "tool_update": {
         const tool = activity.tools.find((item) => item.id === progress.toolId);
-        if (tool) tool.output = boundText(progress.output, LIVE_OUTPUT_MAX);
+        if (tool) tool.output = boundTailText(progress.output, LIVE_OUTPUT_MAX);
         break;
       }
       case "tool_end": {
         const tool = activity.tools.find((item) => item.id === progress.toolId);
         if (tool) {
           tool.status = progress.ok ? "success" : "error";
-          if (progress.output !== undefined) tool.output = boundText(progress.output, LIVE_OUTPUT_MAX);
+          if (progress.output !== undefined) tool.output = boundTailText(progress.output, LIVE_OUTPUT_MAX);
         }
         break;
       }
@@ -321,6 +334,7 @@ export class FusionPaneController {
     if (workerId) this.#state.workerId = workerId;
     if (ctx.mode !== "tui") return false;
     this.#state.visible = true;
+    if (this.#live.size > 0) this.#ensureElapsedTimer();
     if (this.#finish) {
       this.refresh();
       return true;
@@ -357,21 +371,28 @@ export class FusionPaneController {
       this.#finish = undefined;
       this.#tui = undefined;
       this.#state.visible = false;
-      this.#clearLiveState();
+      this.#stopElapsedTimer();
       this.#clearRenderTimer();
     });
     return true;
   }
 
+  /** Hide the overlay without discarding an in-flight worker's transient state. */
   close(): void {
     this.#state.visible = false;
     const finish = this.#finish;
     this.#finish = undefined;
     this.#tui = undefined;
     this.#instance += 1;
-    this.#clearLiveState();
+    this.#stopElapsedTimer();
     this.#clearRenderTimer();
     finish?.();
+  }
+
+  /** Tear down all transient state when the owning session ends. */
+  shutdown(): void {
+    this.close();
+    this.#clearLiveState();
   }
 
   refresh(): void {

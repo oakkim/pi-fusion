@@ -1,6 +1,6 @@
 {
   "name": "pi-fusion",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Persistent Lead/Sidekick with isolated git worktrees (Devin Fusion pattern) for pi.",
   "type": "module",
   "main": "./src/index.ts",

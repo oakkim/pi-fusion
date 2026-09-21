@@ -451,7 +451,7 @@ const toolResult = await runExecutorTurn(
         return pushedStream([
           { type: "start", partial },
           { type: "toolcall_start", contentIndex: 0, partial },
-          { type: "toolcall_delta", contentIndex: 0, delta: '{"command":"echo hi"}', partial },
+          { type: "toolcall_delta", contentIndex: 0, delta: '{"command":"echo hi"}', partial: streamAssistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "echo hi" } }]) },
           { type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-1", name: "bash", arguments: { command: "echo hi" } }, partial },
           { type: "done", reason: "toolUse", message: streamAssistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "echo hi" } }], "toolUse") },
         ]);
@@ -482,9 +482,12 @@ const toolResult = await runExecutorTurn(
   "off",
   (progress) => toolProgress.push(progress),
 );
+const nonemptyStreamedToolArgs = toolProgress
+  .filter((progress): progress is Extract<LiveProgress, { kind: "tool_start" }> => progress.kind === "tool_start" && progress.arguments.length > 0)
+  .map((progress) => progress.arguments);
 eq("live tool lifecycle", [
   toolResult.message.content,
-  toolProgress.some((progress) => progress.kind === "tool_start" && progress.name === "bash" && progress.arguments.includes("echo hi")),
+  nonemptyStreamedToolArgs.length > 0 && nonemptyStreamedToolArgs.every((args) => args === '{"command":"echo hi"}'),
   toolProgress.some((progress) => progress.kind === "tool_update" && progress.output === "partial output"),
   toolProgress.some((progress) => progress.kind === "tool_end" && progress.toolId === "call-1" && progress.ok && progress.output === "final output"),
 ], [[{ type: "text", text: "finished" }], true, true, true]);
@@ -572,7 +575,7 @@ try {
 }
 eq("abort after last tool skips next model request", [lastToolAbortEscaped, modelRequestsAfterAbort], [true, 1]);
 
-// --- 8d. registered tools propagate host cancellation through runTurn ---
+// --- 8d. registered tools launch detached background turns safely ---
 const fusionDir = mkdtempSync(_join(tmpdir(), "fusion-cancel-"));
 try {
   mkdirSync(_join(fusionDir, ".pi"));
@@ -582,12 +585,15 @@ try {
   await tgit(fusionDir, ["add", "-A"]);
   await tgit(fusionDir, ["commit", "-m", "init"]);
   const registered = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const lifecycleHandlers = new Map<string, (...args: any[]) => Promise<void>>();
   const journalEntries: string[] = [];
+  const completionMessages: Array<{ message: any; options: any }> = [];
   fusionExtension({
-    on: () => {},
+    on: (event: string, handler: (...args: any[]) => Promise<void>) => lifecycleHandlers.set(event, handler),
     registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.set(tool.name, tool),
     registerCommand: () => {},
     appendEntry: (type: string) => journalEntries.push(type),
+    sendMessage: (message: any, options: any) => completionMessages.push({ message, options }),
   } as never);
 
   const executorModel = { provider: "test", id: "executor", input: ["text"] };
@@ -617,9 +623,18 @@ try {
   const spawn = registered.get("fusion_spawn")!;
   const followup = registered.get("fusion_followup")!;
   const status = registered.get("fusion_status")!;
+  const interrupt = registered.get("fusion_interrupt")!;
   const readStatus = async (id: string) => {
     const result = await status.execute("status", { id }, undefined, undefined, context);
     return JSON.parse(result.content[0].text);
+  };
+  const waitForStatus = async (id: string, expected: string) => {
+    for (let i = 0; i < 200; i++) {
+      const current = await readStatus(id);
+      if (current.status === expected) return current;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error(`Timed out waiting for ${id} to become ${expected}`);
   };
   const settlesPromptly = async (promise: Promise<unknown>) => {
     let timer: ReturnType<typeof setTimeout>;
@@ -633,6 +648,15 @@ try {
 
   const initial = await spawn.execute("initial", { task: "start" }, undefined, undefined, context);
   const workerId = initial.details.worker_id as string;
+  await waitForStatus(initial.details.turn_id as string, "completed");
+  for (let i = 0; i < 50 && completionMessages.length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 1));
+  eq("spawn returns before background result", [initial.details.status, initial.details.asynchronous], ["running", true]);
+  eq("completion waits for next user turn", [
+    completionMessages[0]?.message.customType,
+    completionMessages[0]?.message.content.includes("done"),
+    completionMessages[0]?.options.deliverAs,
+    completionMessages[0]?.options.triggerTurn,
+  ], ["fusion-result", true, "nextTurn", undefined]);
   let executorSignal: AbortSignal | undefined;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
@@ -649,21 +673,26 @@ try {
     });
   };
   const hostController = new AbortController();
-  const pendingSpawn = spawn.execute("deferred", { task: "wait" }, hostController.signal, undefined, context);
-  await started;
-  hostController.abort();
-  const deferred = await pendingSpawn;
+  const deferred = await spawn.execute("deferred", { task: "wait" }, hostController.signal, undefined, context);
   const deferredTurnId = deferred.details.turn_id as string;
   const deferredWorkerId = deferred.details.worker_id as string;
-  const deferredTurn = await readStatus(deferredTurnId);
-  const deferredWorker = await readStatus(deferredWorkerId);
-  eq("deferred host abort interrupts running turn", [
+  await started;
+  hostController.abort();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const detachedTurn = await readStatus(deferredTurnId);
+  const detachedWorker = await readStatus(deferredWorkerId);
+  eq("accepted turn is detached from lead tool abort", [
     deferred.details.status,
-    deferredTurn.status,
-    deferredWorker.active_turn,
-    deferredWorker.consecutive_failures,
+    deferred.details.asynchronous,
+    detachedTurn.status,
+    detachedWorker.active_turn,
+    detachedWorker.consecutive_failures,
     executorSignal?.aborted,
-  ], ["interrupted", "interrupted", null, 0, true]);
+  ], ["running", true, "running", deferredTurnId, 0, false]);
+  await interrupt.execute("interrupt", { worker_id: deferredWorkerId }, undefined, undefined, context);
+  const deferredTurn = await waitForStatus(deferredTurnId, "interrupted");
+  const deferredWorker = await readStatus(deferredWorkerId);
+  eq("explicit interrupt stops detached turn", [deferredTurn.status, deferredWorker.active_turn, executorSignal?.aborted], ["interrupted", null, true]);
 
   const worktreeSuffix = Date.now().toString(36);
   const preWorktree = `pre-cancel-${worktreeSuffix}`;
@@ -854,39 +883,51 @@ try {
       markFirstStarted();
     });
   };
-  let firstFinished = false;
-  const firstMutating = spawn.execute("queue-first", { task: "hold queue" }, undefined, undefined, context)
-    .finally(() => { firstFinished = true; });
+  const firstMutating = await spawn.execute("queue-first", { task: "hold queue" }, undefined, undefined, context);
   await firstStarted;
 
-  let markSecondQueued!: () => void;
-  const secondQueued = new Promise<void>((resolve) => { markSecondQueued = resolve; });
   const queuedController = new AbortController();
-  const secondMutating = spawn.execute(
+  const queuedResult = await spawn.execute(
     "queue-second",
-    { task: "cancel while queued" },
+    { task: "stay queued after lead turn ends" },
     queuedController.signal,
-    () => markSecondQueued(),
+    undefined,
     context,
   );
-  await secondQueued;
   queuedController.abort();
-  const queuedSettledPromptly = await settlesPromptly(secondMutating);
-  if (!queuedSettledPromptly) finishFirst(completedMessage);
-  const queuedResult = await secondMutating;
-  const queuedTurn = await readStatus(queuedResult.details.turn_id as string);
-  const queuedWorker = await readStatus(queuedResult.details.worker_id as string);
-  eq("queued mutating abort settles before active run", [
-    queuedSettledPromptly,
-    firstFinished,
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  const queuedTurnId = queuedResult.details.turn_id as string;
+  const queuedWorkerId = queuedResult.details.worker_id as string;
+  const queuedTurn = await readStatus(queuedTurnId);
+  const queuedWorker = await readStatus(queuedWorkerId);
+  eq("queued mutating turn returns immediately and stays detached", [
+    firstMutating.details.status,
     queuedResult.details.status,
+    queuedResult.details.asynchronous,
     queuedTurn.status,
     queuedWorker.active_turn,
     queuedWorker.consecutive_failures,
     providerCallsWhileQueued,
-  ], [true, false, "interrupted", "interrupted", null, 0, 1]);
+  ], ["running", "running", true, "running", queuedTurnId, 0, 1]);
   finishFirst(completedMessage);
-  await firstMutating;
+  await waitForStatus(firstMutating.details.turn_id as string, "completed");
+  await waitForStatus(queuedTurnId, "completed");
+  eq("serialized background turn runs after queue releases", providerCallsWhileQueued, 2);
+
+  let shutdownSignal: AbortSignal | undefined;
+  let markShutdownStarted!: () => void;
+  const shutdownStarted = new Promise<void>((resolve) => { markShutdownStarted = resolve; });
+  completeImpl = async (_model, _completeContext, options) => {
+    shutdownSignal = options.signal;
+    markShutdownStarted();
+    return new Promise((_resolve, reject) => options.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true }));
+  };
+  const shutdownRun = await spawn.execute("shutdown", { task: "stop with session" }, undefined, undefined, context);
+  await shutdownStarted;
+  const messagesBeforeShutdown = completionMessages.length;
+  await lifecycleHandlers.get("session_shutdown")?.({}, context);
+  const shutdownTurn = await readStatus(shutdownRun.details.turn_id as string);
+  eq("session shutdown interrupts without stale completion", [shutdownTurn.status, shutdownSignal?.aborted, completionMessages.length], ["interrupted", true, messagesBeforeShutdown]);
 } finally {
   rmSync(fusionDir, { recursive: true, force: true });
 }
@@ -1045,6 +1086,14 @@ eq("pane uses expanded line capacity", [expandedPane.some((line) => line.include
 const thinkingActivity: LiveActivity = { phase: "thinking", startedAt: Date.now() - 2_000, text: "", tools: [] };
 const thinkingPane = renderWorkerPane(paneWorker, 42, 20, thinkingActivity);
 eq("live thinking phase without private text", [thinkingPane.some((line) => line.includes("thinking")), thinkingPane.some((line) => line.includes("private chain of thought"))], [true, false]);
+const crowdedActivity: LiveActivity = {
+  phase: "tool",
+  startedAt: Date.now() - 2_000,
+  text: "streaming ".repeat(100),
+  tools: Array.from({ length: 8 }, (_, i) => ({ id: `tool-${i}`, name: "bash", arguments: `arg-${i}`, output: `output-${i} `.repeat(30), status: "running" as const })),
+};
+const crowdedPane = renderWorkerPane(paneWorker, 42, 10, crowdedActivity);
+eq("live pane respects available height", [crowdedPane.length <= 17, crowdedPane.some((line) => line.includes("[LIVE] tool"))], [true, true]);
 const paneController = new FusionPaneController((id) => id === "wrk_test" ? paneWorker : undefined);
 paneController.restore({ visible: true, workerId: "wrk_test" });
 const liveToken = paneController.beginLive("wrk_test", Date.now() - 3_000);
@@ -1060,8 +1109,16 @@ eq("pane live state is transient", [paneController.getLive("wrk_test") !== undef
 paneController.clearLive("wrk_test", liveToken);
 eq("pane live state clears", [paneController.getLive("wrk_test"), paneController.liveTimerActive], [undefined, false]);
 eq("pane restores state", paneController.state, { visible: true, workerId: "wrk_test" });
+const hiddenToken = paneController.beginLive("wrk_test");
+paneController.updateLive("wrk_test", { kind: "phase", phase: "responding", text: `${"old".repeat(1500)}LATEST` }, hiddenToken);
+paneController.updateLive("wrk_test", { kind: "tool_start", toolId: "tail", name: "bash", arguments: "{}" }, hiddenToken);
+paneController.updateLive("wrk_test", { kind: "tool_update", toolId: "tail", output: `${"old".repeat(1500)}OUTPUT-LATEST` }, hiddenToken);
+const boundedLive = paneController.getLive("wrk_test");
+eq("pane streaming bounds keep newest output", [boundedLive?.text.startsWith("..."), boundedLive?.text.endsWith("LATEST"), boundedLive?.tools[0]?.output.endsWith("OUTPUT-LATEST")], [true, true, true]);
 paneController.close();
-eq("pane closes state", [paneController.state, paneController.getLive("wrk_test"), paneController.liveTimerActive, paneController.renderTimerActive], [{ visible: false, workerId: "wrk_test" }, undefined, false, false]);
+eq("pane close preserves in-flight state", [paneController.state, paneController.getLive("wrk_test")?.phase, paneController.liveTimerActive, paneController.renderTimerActive], [{ visible: false, workerId: "wrk_test" }, "tool", false, false]);
+paneController.shutdown();
+eq("pane shutdown clears transient state", paneController.getLive("wrk_test"), undefined);
 let paneNotice = "";
 await commands.get("fusion-pane")!.handler("open", {
   ...consentContext,

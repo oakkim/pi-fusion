@@ -125,6 +125,16 @@ export class WorkerRuntime {
     return turnId;
   }
 
+  /** Interrupt every active worker, e.g. before session replacement or shutdown. */
+  interruptAll(): string[] {
+    const interrupted: string[] = [];
+    for (const worker of this.#workers.values()) {
+      const turnId = this.interrupt(worker.id);
+      if (turnId) interrupted.push(turnId);
+    }
+    return interrupted;
+  }
+
   close(workerId: string): void {
     this.interrupt(workerId);
     const worker = this.#workers.get(workerId);

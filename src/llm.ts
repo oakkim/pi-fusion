@@ -152,6 +152,7 @@ export async function runExecutorTurn(
 type ResultOnlyStream = { result(): Promise<AssistantMessage> };
 type CompatibleStream = AssistantMessageEventStream | ResultOnlyStream;
 type StreamContext = { systemPrompt: string; messages: Message[]; tools?: Tool[] };
+type PendingToolProgress = { id?: string; name?: string; arguments: string };
 
 async function runComplete(
   registry: ModelRegistry,
@@ -175,7 +176,7 @@ async function runComplete(
   } else {
     const stream = compatibleRegistry.streamSimple(model, context, options);
     if (isAsyncEventStream(stream)) {
-      const pendingTools = new Map<number, { id: string; name: string; arguments: string }>();
+      const pendingTools = new Map<number, PendingToolProgress>();
       for await (const event of stream) {
         consumeStreamEvent(event, pendingTools, onProgress);
       }
@@ -197,7 +198,7 @@ function isAsyncEventStream(stream: CompatibleStream): stream is AssistantMessag
 
 function consumeStreamEvent(
   event: AssistantMessageEvent,
-  pendingTools: Map<number, { id: string; name: string; arguments: string }>,
+  pendingTools: Map<number, PendingToolProgress>,
   onProgress: ((progress: LiveProgress) => void) | undefined,
 ): void {
   switch (event.type) {
@@ -221,39 +222,43 @@ function consumeStreamEvent(
       return;
     case "toolcall_start": {
       const call = partialToolCall(event.partial, event.contentIndex);
-      const tool = {
-        id: call?.id || `stream-tool-${event.contentIndex}`,
-        name: call?.name || "tool",
-        arguments: partialToolArguments(call?.arguments),
-      };
+      const tool: PendingToolProgress = { id: call?.id || undefined, name: call?.name || undefined, arguments: "" };
       pendingTools.set(event.contentIndex, tool);
       onProgress?.({ kind: "phase", phase: "tool" });
-      onProgress?.({ kind: "tool_start", toolId: tool.id, name: tool.name, arguments: tool.arguments });
+      if (tool.id && tool.name) {
+        onProgress?.({ kind: "tool_start", toolId: tool.id, name: tool.name, arguments: tool.arguments });
+      }
       return;
     }
     case "toolcall_delta": {
       const call = partialToolCall(event.partial, event.contentIndex);
       const previous = pendingTools.get(event.contentIndex);
-      const tool = {
-        id: previous?.id || call?.id || `stream-tool-${event.contentIndex}`,
-        name: previous?.name || call?.name || "tool",
-        arguments: `${previous?.arguments || partialToolArguments(call?.arguments)}${event.delta}`,
+      // event.delta is the raw argument fragment. event.partial may already
+      // contain parsed cumulative arguments, so combining both duplicates text.
+      const tool: PendingToolProgress = {
+        id: call?.id || previous?.id,
+        name: call?.name || previous?.name,
+        arguments: `${previous?.arguments ?? ""}${event.delta}`,
       };
       pendingTools.set(event.contentIndex, tool);
       onProgress?.({ kind: "phase", phase: "tool" });
-      onProgress?.({ kind: "tool_start", toolId: tool.id, name: tool.name, arguments: tool.arguments });
+      if (tool.id && tool.name) {
+        onProgress?.({ kind: "tool_start", toolId: tool.id, name: tool.name, arguments: tool.arguments });
+      }
       return;
     }
     case "toolcall_end": {
       const previous = pendingTools.get(event.contentIndex);
-      const tool = {
-        id: event.toolCall.id,
-        name: event.toolCall.name,
+      const tool: PendingToolProgress = {
+        id: event.toolCall.id || previous?.id,
+        name: event.toolCall.name || previous?.name,
         arguments: formatToolArguments(event.toolCall.arguments),
       };
       pendingTools.set(event.contentIndex, tool);
       onProgress?.({ kind: "phase", phase: "tool" });
-      onProgress?.({ kind: "tool_start", toolId: tool.id || previous?.id || `stream-tool-${event.contentIndex}`, name: tool.name, arguments: tool.arguments });
+      if (tool.id && tool.name) {
+        onProgress?.({ kind: "tool_start", toolId: tool.id, name: tool.name, arguments: tool.arguments });
+      }
       return;
     }
     case "done":
@@ -266,13 +271,6 @@ function consumeStreamEvent(
 function partialToolCall(message: AssistantMessage, contentIndex: number): ToolCall | undefined {
   const block = message.content[contentIndex];
   return block?.type === "toolCall" ? block : undefined;
-}
-
-function partialToolArguments(argumentsValue: unknown): string {
-  if (argumentsValue === undefined || argumentsValue === null) return "";
-  if (typeof argumentsValue === "string") return argumentsValue;
-  const text = formatToolArguments(argumentsValue);
-  return text === "{}" ? "" : text;
 }
 
 function formatToolArguments(argumentsValue: unknown): string {

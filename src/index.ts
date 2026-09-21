@@ -361,9 +361,14 @@ export default function (pi: ExtensionAPI) {
     const controller = new AbortController();
     runtime.trackController(turnId, controller);
     const signal = hostSignal ? AbortSignal.any([controller.signal, hostSignal]) : controller.signal;
+    let liveToken: number | undefined;
+    const clearLive = () => {
+      if (liveToken !== undefined) pane.clearLive(workerId, liveToken);
+    };
     const interruptedResult = () => {
       if (runtime.getTurn(turnId)?.status === "running") runtime.interrupt(workerId);
       runtime.untrackController(turnId);
+      clearLive();
       persist(ctx, workerId);
       pane.refresh();
       return {
@@ -379,6 +384,7 @@ export default function (pi: ExtensionAPI) {
     if (ladder.length === 0) {
       const error = "no authed text executor model available";
       runtime.failTurn(turnId, error);
+      clearLive();
       pane.refresh();
       return { text: JSON.stringify({ status: "error", error }, null, 2), details: { status: "error", error } };
     }
@@ -392,6 +398,7 @@ export default function (pi: ExtensionAPI) {
     const execCwd = worker.worktree ? execDirOf(worker.worktree) : ctx.cwd;
     const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
 
+    liveToken = pane.beginLive(workerId);
     onUpdate?.({
       content: [{ type: "text", text: `Sidekick ${modelDisplay(executor)} | thinking ${thinkingLevel} | ${worker.id} g${turn.generation}${worker.worktree ? ` | worktree ${worker.worktree.name}` : ""} | tools: ${selectionLabel(cfg.executorTools)}` }],
       details: { phase: "executing", workerId, turnId },
@@ -412,6 +419,7 @@ export default function (pi: ExtensionAPI) {
         clampMaxToolCalls(cfg.maxToolCalls),
         ctx,
         thinkingLevel,
+        (progress) => pane.updateLive(workerId, progress, liveToken),
       );
     };
 
@@ -490,6 +498,7 @@ export default function (pi: ExtensionAPI) {
       };
     } finally {
       runtime.untrackController(turnId);
+      clearLive();
       pane.refresh();
     }
   }
@@ -632,6 +641,7 @@ export default function (pi: ExtensionAPI) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       runtime.close(params.worker_id);
+      pane.clearLive(params.worker_id);
       let worktreeRemoved = false;
       let removeError: string | undefined;
       if (params.remove && w.worktree) {
@@ -695,6 +705,7 @@ export default function (pi: ExtensionAPI) {
       const w = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       const interruptedTurnId = runtime.interrupt(params.worker_id);
+      pane.clearLive(params.worker_id);
       persist(ctx, params.worker_id);
       pane.refresh();
       return {

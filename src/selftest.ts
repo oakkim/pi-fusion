@@ -5,8 +5,9 @@ import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext } from "../src/utils.ts";
 import fusionExtension from "../src/index.ts";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane } from "../src/pane.ts";
+import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
 
 let pass = 0;
 let fail = 0;
@@ -390,6 +391,103 @@ eq("registry streamSimple dispatch", [
   "x-opencode-session": "session-test",
   "x-opencode-client": "pi",
 }, [{ type: "text", text: "registry ok" }]]);
+
+const streamAssistant = (content: unknown[], stopReason = "pending") => ({
+  role: "assistant",
+  content,
+  stopReason,
+  timestamp: Date.now(),
+} as never);
+const pushedStream = (events: unknown[]) => {
+  const stream = createAssistantMessageEventStream();
+  queueMicrotask(() => {
+    for (const event of events) stream.push(event as never);
+  });
+  return stream;
+};
+const streamProgress: LiveProgress[] = [];
+const streamPartial = streamAssistant([{ type: "thinking", thinking: "private chain of thought" }, { type: "text", text: "" }]);
+const streamedResult = await runExecutorTurn(
+  {
+    streamSimple: () => pushedStream([
+      { type: "start", partial: streamPartial },
+      { type: "thinking_start", contentIndex: 0, partial: streamPartial },
+      { type: "thinking_delta", contentIndex: 0, delta: "private chain of thought", partial: streamPartial },
+      { type: "thinking_end", contentIndex: 0, content: "private chain of thought", partial: streamPartial },
+      { type: "text_start", contentIndex: 1, partial: streamPartial },
+      { type: "text_delta", contentIndex: 1, delta: "visible answer", partial: streamAssistant([{ type: "thinking", thinking: "private chain of thought" }, { type: "text", text: "visible answer" }]) },
+      { type: "text_end", contentIndex: 1, content: "visible answer", partial: streamAssistant([{ type: "thinking", thinking: "private chain of thought" }, { type: "text", text: "visible answer" }]) },
+      { type: "done", reason: "stop", message: streamAssistant([{ type: "thinking", thinking: "private chain of thought" }, { type: "text", text: "visible answer" }], "stop") },
+    ]),
+  } as never,
+  registryModel as never,
+  "system",
+  [{ role: "user", content: "task", timestamp: 0 }] as never,
+  128,
+  0.2,
+  registrySignal,
+  [],
+  1,
+  { sessionManager: { getSessionId: () => undefined } } as never,
+  "high",
+  (progress) => streamProgress.push(progress),
+);
+const streamProgressJson = JSON.stringify(streamProgress);
+eq("stream progress events", [
+  streamProgress.some((progress) => progress.kind === "phase" && progress.phase === "thinking"),
+  streamProgress.some((progress) => progress.kind === "phase" && progress.phase === "responding" && progress.text?.includes("visible answer")),
+  streamedResult.message.content,
+], [true, true, [{ type: "thinking", thinking: "private chain of thought" }, { type: "text", text: "visible answer" }]]);
+eq("stream thinking hidden", [streamProgressJson.includes("private chain of thought"), streamProgressJson.includes("visible answer")], [false, true]);
+
+let toolStreamCalls = 0;
+const toolProgress: LiveProgress[] = [];
+const toolResult = await runExecutorTurn(
+  {
+    streamSimple: () => {
+      toolStreamCalls++;
+      if (toolStreamCalls === 1) {
+        const partial = streamAssistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }]);
+        return pushedStream([
+          { type: "start", partial },
+          { type: "toolcall_start", contentIndex: 0, partial },
+          { type: "toolcall_delta", contentIndex: 0, delta: '{"command":"echo hi"}', partial },
+          { type: "toolcall_end", contentIndex: 0, toolCall: { type: "toolCall", id: "call-1", name: "bash", arguments: { command: "echo hi" } }, partial },
+          { type: "done", reason: "toolUse", message: streamAssistant([{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "echo hi" } }], "toolUse") },
+        ]);
+      }
+      return pushedStream([
+        { type: "start", partial: streamAssistant([]) },
+        { type: "text_start", contentIndex: 0, partial: streamAssistant([{ type: "text", text: "" }]) },
+        { type: "text_delta", contentIndex: 0, delta: "finished", partial: streamAssistant([{ type: "text", text: "finished" }]) },
+        { type: "done", reason: "stop", message: streamAssistant([{ type: "text", text: "finished" }], "stop") },
+      ]);
+    },
+  } as never,
+  registryModel as never,
+  "system",
+  [{ role: "user", content: "task", timestamp: 0 }] as never,
+  128,
+  0.2,
+  registrySignal,
+  [{
+    name: "bash", description: "bash", parameters: {},
+    execute: async (_id, _args, _signal, onUpdate) => {
+      onUpdate?.({ content: [{ type: "text", text: "partial output" }], details: undefined });
+      return { content: [{ type: "text", text: "final output" }], isError: false };
+    },
+  }],
+  2,
+  { sessionManager: { getSessionId: () => undefined } } as never,
+  "off",
+  (progress) => toolProgress.push(progress),
+);
+eq("live tool lifecycle", [
+  toolResult.message.content,
+  toolProgress.some((progress) => progress.kind === "tool_start" && progress.name === "bash" && progress.arguments.includes("echo hi")),
+  toolProgress.some((progress) => progress.kind === "tool_update" && progress.output === "partial output"),
+  toolProgress.some((progress) => progress.kind === "tool_end" && progress.toolId === "call-1" && progress.ok && progress.output === "final output"),
+], [[{ type: "text", text: "finished" }], true, true, true]);
 
 const toolAbort = new AbortController();
 let secondToolRuns = 0;
@@ -862,9 +960,12 @@ const thinkingEntry = thinkingBranch.at(-1) as { customType: string; data: { thi
 eq("fusion thinking command", [thinkingEntry.customType, thinkingEntry.data.thinkingLevel, thinkingNotice], ["fusion-thinking", "high", "Fusion thinking: high (session override)"]);
 
 // --- 12. /fusion-consent persists allow, ask, and clear overrides ---
+const consentFixture = mkdtempSync(_join(tmpdir(), "fusion-consent-config-"));
+mkdirSync(_join(consentFixture, ".pi"));
+writeFileSync(_join(consentFixture, ".pi", "fusion.json"), JSON.stringify({ executorToolsConsent: false }));
 let consentNotice = "";
 const consentContext = {
-  cwd: "/tmp",
+  cwd: consentFixture,
   mode: "tui",
   hasUI: true,
   ui: {
@@ -890,9 +991,10 @@ await commands.get("fusion-consent")!.handler("default", consentContext);
 const defaultEntry = thinkingBranch.at(-1) as { customType: string; data: { executorToolsConsent?: boolean } };
 eq("fusion consent default", [defaultEntry.customType, defaultEntry.data.executorToolsConsent, consentNotice], ["fusion-consent", undefined, "Fusion consent: ask (config/default)"]);
 await commands.get("fusion-consent")!.handler("status", consentContext);
-eq("fusion consent status", consentNotice, "Fusion consent: ask (default)");
+eq("fusion consent status", consentNotice, "Fusion consent: ask (config file)");
 await commands.get("fusion-consent")!.handler("allow", { ...consentContext, isProjectTrusted: () => false });
 eq("fusion consent rejects untrusted", consentNotice, "Fusion consent cannot be allowed in an untrusted project.");
+rmSync(consentFixture, { recursive: true, force: true });
 
 // --- 13. worker pane keeps visible history bounded and excludes thinking ---
 const paneHistory = [
@@ -930,11 +1032,36 @@ const renderedPane = renderWorkerPane(paneWorker, 42, 2);
 eq("pane width bound", renderedPane.every((line) => visibleWidth(line) <= 42), true);
 eq("pane keeps newest output", renderedPane.some((line) => line.includes("Done")), true);
 eq("pane drops old output", renderedPane.some((line) => line.includes("Fix the parser")), false);
+const expandedWorker = {
+  ...(paneWorker as object),
+  history: Array.from({ length: 60 }, (_, i) => ({
+    role: "assistant",
+    content: [{ type: "text", text: `history-${i}` }],
+    timestamp: i,
+  })),
+} as never;
+const expandedPane = renderWorkerPane(expandedWorker, 42, 100);
+eq("pane uses expanded line capacity", [expandedPane.some((line) => line.includes("history-0")), expandedPane.some((line) => line.includes("history-59")), expandedPane.every((line) => visibleWidth(line) <= 42)], [true, true, true]);
+const thinkingActivity: LiveActivity = { phase: "thinking", startedAt: Date.now() - 2_000, text: "", tools: [] };
+const thinkingPane = renderWorkerPane(paneWorker, 42, 20, thinkingActivity);
+eq("live thinking phase without private text", [thinkingPane.some((line) => line.includes("thinking")), thinkingPane.some((line) => line.includes("private chain of thought"))], [true, false]);
 const paneController = new FusionPaneController((id) => id === "wrk_test" ? paneWorker : undefined);
 paneController.restore({ visible: true, workerId: "wrk_test" });
+const liveToken = paneController.beginLive("wrk_test", Date.now() - 3_000);
+paneController.updateLive("wrk_test", { kind: "phase", phase: "thinking", replaceText: true }, liveToken);
+paneController.updateLive("wrk_test", { kind: "tool_start", toolId: "call-1", name: "bash", arguments: '{"command":"echo hi"}' }, liveToken);
+paneController.updateLive("wrk_test", { kind: "tool_update", toolId: "call-1", output: "partial output" }, liveToken);
+paneController.updateLive("wrk_test", { kind: "tool_end", toolId: "call-1", ok: true, output: "final output" }, liveToken);
+paneController.updateLive("wrk_test", { kind: "tool_start", toolId: "call-2", name: "read", arguments: '{"path":"missing"}' }, liveToken);
+paneController.updateLive("wrk_test", { kind: "tool_end", toolId: "call-2", ok: false, output: "failed" }, liveToken);
+const liveActivity = paneController.getLive("wrk_test");
+eq("pane live activity lifecycle", [liveActivity?.phase, liveActivity?.tools[0]?.name, liveActivity?.tools[0]?.output, liveActivity?.tools[0]?.status, liveActivity?.tools[1]?.status], ["tool", "bash", "final output", "success", "error"]);
+eq("pane live state is transient", [paneController.getLive("wrk_test") !== undefined, paneController.liveTimerActive], [true, true]);
+paneController.clearLive("wrk_test", liveToken);
+eq("pane live state clears", [paneController.getLive("wrk_test"), paneController.liveTimerActive], [undefined, false]);
 eq("pane restores state", paneController.state, { visible: true, workerId: "wrk_test" });
 paneController.close();
-eq("pane closes state", paneController.state, { visible: false, workerId: "wrk_test" });
+eq("pane closes state", [paneController.state, paneController.getLive("wrk_test"), paneController.liveTimerActive, paneController.renderTimerActive], [{ visible: false, workerId: "wrk_test" }, undefined, false, false]);
 let paneNotice = "";
 await commands.get("fusion-pane")!.handler("open", {
   ...consentContext,

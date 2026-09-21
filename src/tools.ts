@@ -14,6 +14,7 @@ import {
   createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
+import type { AgentToolUpdateCallback } from "@earendil-works/pi-coding-agent";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import { DEFAULT_MAX_TOOL_CALLS, MAX_TOOL_CALLS, MIN_TOOL_CALLS } from "./config.ts";
 import type { ToolSelection } from "./types.ts";
@@ -26,9 +27,9 @@ export interface ExecutorToolDef {
     toolCallId: string,
     args: Record<string, unknown>,
     signal: AbortSignal | undefined,
-    extra: unknown,
+    onUpdate: AgentToolUpdateCallback | undefined,
     ctx: unknown,
-  ): Promise<{ content: ToolResultMessage["content"]; isError: boolean }>;
+  ): Promise<{ content: ToolResultMessage["content"]; isError?: boolean }>;
 }
 
 export const READONLY_TOOL_NAMES = ["read", "grep", "find", "ls"] as const;
@@ -50,8 +51,8 @@ function build(name: ToolName, cwd: string): ExecutorToolDef {
   }
   return {
     ...def,
-    execute: (id, args, signal, extra, ctx) =>
-      def.execute(id, args, signal, extra, Object.create(ctx as object, { cwd: { value: cwd, enumerable: true } })),
+    execute: (id, args, signal, onUpdate, ctx) =>
+      def.execute(id, args, signal, onUpdate, Object.create(ctx as object, { cwd: { value: cwd, enumerable: true } })),
   };
 }
 

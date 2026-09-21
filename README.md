@@ -139,9 +139,14 @@ config-file consent is also loaded only from trusted projects.
 
 In TUI mode, spawning or following up a worker automatically opens a
 non-capturing right-side pane with recent LEAD, SIDEKICK, and TOOL messages.
-Thinking blocks are never displayed. The selected worker and visibility are
-journaled, the pane follows live status changes, and it automatically hides
-below 110 terminal columns.
+While a turn runs it also shows a throttled live phase (`waiting`, `thinking`,
+or `responding`), elapsed time, visible answer text, tool arguments, partial
+built-in tool output, and tool success/error. Private thinking text is never
+shown. Live activity is transient: it is not added to worker history or the
+session journal, and is cleared when a turn finishes, fails, is interrupted, or
+the pane closes. The selected worker and visibility remain journaled. The pane
+uses the available overlay height, is somewhat wider for readability, and
+automatically hides below 110 terminal columns.
 
 This is an overlay, not a true split: Pi's extension API cannot shrink or
 reflow the main transcript area. The overlay stays unfocused so the normal

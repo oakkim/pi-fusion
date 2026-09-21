@@ -10,8 +10,9 @@ import {
   type ToolCall,
   type ToolResultMessage,
 } from "@earendil-works/pi-ai/compat";
-import type { Api, Model, ModelThinkingLevel, ThinkingLevel } from "@earendil-works/pi-ai";
-import type { ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { Api, AssistantMessageEvent, AssistantMessageEventStream, Model, ModelThinkingLevel, ThinkingLevel } from "@earendil-works/pi-ai";
+import type { AgentToolUpdateCallback, ExtensionContext, ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { LiveProgress } from "./pane.ts";
 import { TOOL_OUTPUT_MAX_BYTES } from "./config.ts";
 import type { ExecutorToolDef } from "./tools.ts";
 import { addUsage, zeroUsage, type UsageSummary } from "./cost.ts";
@@ -85,6 +86,7 @@ export async function runExecutorTurn(
   maxToolCalls: number,
   ctx: ExtensionContext,
   thinkingLevel: ModelThinkingLevel = "off",
+  onProgress?: (progress: LiveProgress) => void,
 ): Promise<ToolLoopResult> {
   const options = buildCompleteOptions(model, maxTokens, temperature, thinkingLevel, signal, ctx);
   const tools: Tool[] = toolDefs.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }));
@@ -101,7 +103,7 @@ export async function runExecutorTurn(
   let errorStreak = 0;
 
   while (true) {
-    const resp = await runComplete(registry, model, { systemPrompt, messages, tools }, options);
+    const resp = await runComplete(registry, model, { systemPrompt, messages, tools }, options, onProgress);
     turns++;
     usage = addUsage(usage, resp.usage);
     const calls = resp.content.filter((c): c is ToolCall => c.type === "toolCall");
@@ -117,13 +119,16 @@ export async function runExecutorTurn(
     for (const tc of calls) {
       signal?.throwIfAborted();
       if (forceFinalize || used >= maxToolCalls) {
-        const syn = syntheticResult(tc, forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted");
+        const reason = forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted";
+        onProgress?.({ kind: "tool_start", toolId: tc.id, name: tc.name, arguments: formatToolArguments(tc.arguments) });
+        const syn = syntheticResult(tc, reason);
         messages.push(syn);
         added.push(syn);
+        onProgress?.({ kind: "tool_end", toolId: tc.id, ok: false, output: reason });
         toolCalls.push({ name: tc.name, ok: false });
         continue;
       }
-      const ok = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added);
+      const ok = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added, onProgress);
       used++;
       toolCalls.push({ name: tc.name, ok });
       const key = `${tc.name}:${JSON.stringify(tc.arguments)}`;
@@ -135,7 +140,7 @@ export async function runExecutorTurn(
 
     if (forceFinalize || used >= maxToolCalls) {
       const finalSystem = `${systemPrompt}\n\nYou have reached the tool-call limit. Write your complete final answer now using only what you have already gathered — do not request any more tools.`;
-      const finalMsg = await runComplete(registry, model, { systemPrompt: finalSystem, messages }, options);
+      const finalMsg = await runComplete(registry, model, { systemPrompt: finalSystem, messages }, options, onProgress);
       turns++;
       usage = addUsage(usage, finalMsg.usage);
       added.push(finalMsg);
@@ -144,31 +149,154 @@ export async function runExecutorTurn(
   }
 }
 
+type ResultOnlyStream = { result(): Promise<AssistantMessage> };
+type CompatibleStream = AssistantMessageEventStream | ResultOnlyStream;
+type StreamContext = { systemPrompt: string; messages: Message[]; tools?: Tool[] };
+
 async function runComplete(
   registry: ModelRegistry,
   model: Model<Api>,
-  context: { systemPrompt: string; messages: Message[]; tools?: Tool[] },
+  context: StreamContext,
   options: CompleteOptions,
+  onProgress?: (progress: LiveProgress) => void,
 ): Promise<AssistantMessage> {
   options.signal?.throwIfAborted();
   const compatibleRegistry = registry as unknown as {
-    streamSimple?: (
-      model: Model<Api>,
-      context: { systemPrompt: string; messages: Message[]; tools?: Tool[] },
-      options: CompleteOptions,
-    ) => { result(): Promise<AssistantMessage> };
+    streamSimple?: (model: Model<Api>, context: StreamContext, options: CompleteOptions) => CompatibleStream;
   };
   if (options.reasoning && !compatibleRegistry.streamSimple) {
     throw new Error("Fusion thinking requires pi 0.86 or newer.");
   }
-  const resp = compatibleRegistry.streamSimple
-    ? await compatibleRegistry.streamSimple(model, context, options).result()
-    : await registry.complete(model, context, options);
+
+  onProgress?.({ kind: "phase", phase: "waiting", replaceText: true });
+  let resp: AssistantMessage;
+  if (!compatibleRegistry.streamSimple) {
+    resp = await registry.complete(model, context, options);
+  } else {
+    const stream = compatibleRegistry.streamSimple(model, context, options);
+    if (isAsyncEventStream(stream)) {
+      const pendingTools = new Map<number, { id: string; name: string; arguments: string }>();
+      for await (const event of stream) {
+        consumeStreamEvent(event, pendingTools, onProgress);
+      }
+    }
+    // result() is retained for end(result) streams and old registry adapters
+    // that expose only the result promise.
+    resp = await stream.result();
+  }
 
   if (resp.stopReason === "error" || resp.stopReason === "aborted") {
     throw new Error(resp.errorMessage ?? `Model stopped with reason: ${resp.stopReason}`);
   }
   return resp;
+}
+
+function isAsyncEventStream(stream: CompatibleStream): stream is AssistantMessageEventStream {
+  return typeof (stream as Partial<AsyncIterable<AssistantMessageEvent>>)[Symbol.asyncIterator] === "function";
+}
+
+function consumeStreamEvent(
+  event: AssistantMessageEvent,
+  pendingTools: Map<number, { id: string; name: string; arguments: string }>,
+  onProgress: ((progress: LiveProgress) => void) | undefined,
+): void {
+  switch (event.type) {
+    case "start":
+      onProgress?.({ kind: "phase", phase: "waiting", replaceText: true });
+      return;
+    case "thinking_start":
+      onProgress?.({ kind: "phase", phase: "thinking", replaceText: true });
+      return;
+    case "thinking_delta":
+    case "thinking_end":
+      // Deliberately do not inspect or forward thinking text.
+      onProgress?.({ kind: "phase", phase: "thinking" });
+      return;
+    case "text_start":
+      onProgress?.({ kind: "phase", phase: "responding", text: "", replaceText: true });
+      return;
+    case "text_delta":
+    case "text_end":
+      onProgress?.({ kind: "phase", phase: "responding", text: visibleAssistantText(event.partial), replaceText: true });
+      return;
+    case "toolcall_start": {
+      const call = partialToolCall(event.partial, event.contentIndex);
+      const tool = {
+        id: call?.id || `stream-tool-${event.contentIndex}`,
+        name: call?.name || "tool",
+        arguments: partialToolArguments(call?.arguments),
+      };
+      pendingTools.set(event.contentIndex, tool);
+      onProgress?.({ kind: "phase", phase: "tool" });
+      onProgress?.({ kind: "tool_start", toolId: tool.id, name: tool.name, arguments: tool.arguments });
+      return;
+    }
+    case "toolcall_delta": {
+      const call = partialToolCall(event.partial, event.contentIndex);
+      const previous = pendingTools.get(event.contentIndex);
+      const tool = {
+        id: previous?.id || call?.id || `stream-tool-${event.contentIndex}`,
+        name: previous?.name || call?.name || "tool",
+        arguments: `${previous?.arguments || partialToolArguments(call?.arguments)}${event.delta}`,
+      };
+      pendingTools.set(event.contentIndex, tool);
+      onProgress?.({ kind: "phase", phase: "tool" });
+      onProgress?.({ kind: "tool_start", toolId: tool.id, name: tool.name, arguments: tool.arguments });
+      return;
+    }
+    case "toolcall_end": {
+      const previous = pendingTools.get(event.contentIndex);
+      const tool = {
+        id: event.toolCall.id,
+        name: event.toolCall.name,
+        arguments: formatToolArguments(event.toolCall.arguments),
+      };
+      pendingTools.set(event.contentIndex, tool);
+      onProgress?.({ kind: "phase", phase: "tool" });
+      onProgress?.({ kind: "tool_start", toolId: tool.id || previous?.id || `stream-tool-${event.contentIndex}`, name: tool.name, arguments: tool.arguments });
+      return;
+    }
+    case "done":
+      return;
+    case "error":
+      return;
+  }
+}
+
+function partialToolCall(message: AssistantMessage, contentIndex: number): ToolCall | undefined {
+  const block = message.content[contentIndex];
+  return block?.type === "toolCall" ? block : undefined;
+}
+
+function partialToolArguments(argumentsValue: unknown): string {
+  if (argumentsValue === undefined || argumentsValue === null) return "";
+  if (typeof argumentsValue === "string") return argumentsValue;
+  const text = formatToolArguments(argumentsValue);
+  return text === "{}" ? "" : text;
+}
+
+function formatToolArguments(argumentsValue: unknown): string {
+  if (argumentsValue === undefined || argumentsValue === null) return "";
+  if (typeof argumentsValue === "string") return argumentsValue;
+  try {
+    return JSON.stringify(argumentsValue);
+  } catch {
+    return String(argumentsValue);
+  }
+}
+
+function visibleAssistantText(message: AssistantMessage): string {
+  return message.content
+    .filter((content): content is { type: "text"; text: string } => content.type === "text")
+    .map((content) => content.text)
+    .join("\n");
+}
+
+function toolResultText(content: ToolContent): string {
+  return content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text")
+    .map((part) => part.text)
+    .join("\n");
 }
 
 async function executeToolCall(
@@ -178,33 +306,44 @@ async function executeToolCall(
   ctx: ExtensionContext,
   messages: Message[],
   added: Message[],
+  onProgress?: (progress: LiveProgress) => void,
 ): Promise<boolean> {
+  const argumentsText = formatToolArguments(tc.arguments);
+  onProgress?.({ kind: "tool_start", toolId: tc.id, name: tc.name, arguments: argumentsText });
   try {
     if (!def) throw new Error(`unknown tool: ${tc.name}`);
-    const out = await def.execute(tc.id, tc.arguments as Record<string, unknown>, signal, undefined, ctx);
+    const onUpdate: AgentToolUpdateCallback = (partial) => {
+      onProgress?.({ kind: "tool_update", toolId: tc.id, output: toolResultText(partial.content as ToolContent) });
+    };
+    const out = await def.execute(tc.id, tc.arguments as Record<string, unknown>, signal, onUpdate, ctx);
+    const isError = out.isError === true;
+    const content = truncateToolContent(sanitizeToolContent(out.content, isError));
     const msg: Message = {
       role: "toolResult",
       toolCallId: tc.id,
       toolName: tc.name,
-      content: truncateToolContent(sanitizeToolContent(out.content, out.isError)),
-      isError: out.isError,
+      content,
+      isError,
       timestamp: Date.now(),
     };
     messages.push(msg);
     added.push(msg);
-    return !out.isError;
+    onProgress?.({ kind: "tool_end", toolId: tc.id, ok: !isError, output: toolResultText(content) });
+    return !isError;
   } catch (err) {
     const text = sanitizeError(err instanceof Error ? err.message : String(err));
+    const errorText = `Error: ${text}`;
     const msg: Message = {
       role: "toolResult",
       toolCallId: tc.id,
       toolName: tc.name,
-      content: [{ type: "text", text: `Error: ${text}` }],
+      content: [{ type: "text", text: errorText }],
       isError: true,
       timestamp: Date.now(),
     };
     messages.push(msg);
     added.push(msg);
+    onProgress?.({ kind: "tool_end", toolId: tc.id, ok: false, output: errorText });
     return false;
   }
 }

@@ -13,12 +13,50 @@ export interface PaneHistoryItem {
   text: string;
 }
 
+export type LivePhase = "waiting" | "thinking" | "responding" | "tool";
+
+export interface LiveToolActivity {
+  id: string;
+  name: string;
+  arguments: string;
+  output: string;
+  status: "running" | "success" | "error";
+}
+
+export interface LiveActivity {
+  phase: LivePhase;
+  startedAt: number;
+  text: string;
+  tools: LiveToolActivity[];
+}
+
+export type LiveProgress =
+  | { kind: "phase"; phase: LivePhase; text?: string; replaceText?: boolean }
+  | { kind: "tool_start"; toolId: string; name: string; arguments: string }
+  | { kind: "tool_update"; toolId: string; output: string }
+  | { kind: "tool_end"; toolId: string; ok: boolean; output?: string };
+
+const LIVE_TEXT_MAX = 4000;
+const LIVE_ARGUMENTS_MAX = 2000;
+const LIVE_OUTPUT_MAX = 4000;
+const LIVE_TOOL_MAX = 8;
+const LIVE_RENDER_INTERVAL_MS = 60;
+const LIVE_ELAPSED_INTERVAL_MS = 1000;
+const LIVE_TEXT_LINES = 8;
+const LIVE_OUTPUT_LINES = 4;
+const LIVE_LINES_MAX = 32;
+
 function stringify(value: unknown): string {
   try {
     return JSON.stringify(value);
   } catch {
     return String(value);
   }
+}
+
+function boundText(value: string, max: number): string {
+  const normalized = value.replace(/\r/g, "");
+  return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 3))}...` : normalized;
 }
 
 function textParts(content: unknown): string[] {
@@ -86,8 +124,34 @@ function historyLines(history: Message[], width: number): string[] {
   return lines;
 }
 
+function elapsedText(startedAt: number, now = Date.now()): string {
+  return `${Math.max(0, Math.floor((now - startedAt) / 1000))}s`;
+}
+
+function liveLines(activity: LiveActivity, width: number, now = Date.now()): string[] {
+  const lines: string[] = [`[LIVE] ${activity.phase} | ${elapsedText(activity.startedAt, now)}`];
+  if (activity.text) {
+    const text = wrapTextWithAnsi(`[LIVE] ${boundText(activity.text, LIVE_TEXT_MAX)}`, width);
+    lines.push(...text.slice(-LIVE_TEXT_LINES));
+  }
+  for (const tool of activity.tools) {
+    const args = tool.arguments ? ` ${tool.arguments}` : "";
+    lines.push(...wrapTextWithAnsi(`[TOOL] ${tool.name}${args} | ${tool.status}`, width));
+    if (tool.output) {
+      const output = wrapTextWithAnsi(`[TOOL] > ${boundText(tool.output, LIVE_OUTPUT_MAX)}`, width);
+      lines.push(...output.slice(-LIVE_OUTPUT_LINES));
+    }
+  }
+  return lines.slice(-LIVE_LINES_MAX);
+}
+
 /** Pure deterministic renderer used by the TUI component and self-tests. */
-export function renderWorkerPane(worker: WorkerRecord | undefined, width: number, maxConversationLines = 30): string[] {
+export function renderWorkerPane(
+  worker: WorkerRecord | undefined,
+  width: number,
+  maxConversationLines = Number.MAX_SAFE_INTEGER,
+  live?: LiveActivity,
+): string[] {
   const paneWidth = Math.max(4, width);
   const innerWidth = paneWidth - 2;
   const row = (text = "") => `|${fitLine(text, innerWidth)}|`;
@@ -105,8 +169,15 @@ export function renderWorkerPane(worker: WorkerRecord | undefined, width: number
     row(` ${worker.executorModelId}`),
     row(` ${"-".repeat(Math.max(0, innerWidth - 2))}`),
   );
-  const conversation = historyLines(worker.history, Math.max(1, innerWidth - 2));
-  const recent = conversation.slice(-Math.max(1, maxConversationLines));
+  const availableWidth = Math.max(1, innerWidth - 2);
+  const currentLiveLines = live ? liveLines(live, availableWidth) : [];
+  for (const line of currentLiveLines) lines.push(row(` ${line}`));
+
+  const conversationLimit = Number.isFinite(maxConversationLines)
+    ? Math.max(1, maxConversationLines - currentLiveLines.length)
+    : maxConversationLines;
+  const conversation = historyLines(worker.history, availableWidth);
+  const recent = conversation.slice(-conversationLimit);
   if (recent.length === 0) lines.push(row(" No visible messages."));
   else for (const line of recent) lines.push(row(` ${line}`));
   lines.push(border);
@@ -117,11 +188,16 @@ class WorkerPaneComponent implements Component {
   constructor(
     private readonly tui: TUI,
     private readonly getWorker: () => WorkerRecord | undefined,
+    private readonly getLive: (workerId: string) => LiveActivity | undefined,
   ) {}
 
   render(width: number): string[] {
-    const available = Math.max(1, Math.floor(this.tui.terminal.rows * 0.9) - 8);
-    return renderWorkerPane(this.getWorker(), width, Math.min(30, available));
+    // The overlay's maxHeight is 90%; reserve only the fixed pane header/borders
+    // and let the renderer use the rest instead of capping history at 30 lines.
+    const overlayRows = Math.max(8, Math.floor(this.tui.terminal.rows * 0.9));
+    const conversationCapacity = Math.max(1, overlayRows - 7);
+    const worker = this.getWorker();
+    return renderWorkerPane(worker, width, conversationCapacity, worker ? this.getLive(worker.id) : undefined);
   }
 
   invalidate(): void {}
@@ -134,6 +210,12 @@ export class FusionPaneController {
   #finish?: () => void;
   #tui?: TUI;
   #instance = 0;
+  #live = new Map<string, LiveActivity>();
+  #liveTokens = new Map<string, number>();
+  #liveSequence = 0;
+  #elapsedTimer?: ReturnType<typeof setInterval>;
+  #renderTimer?: ReturnType<typeof setTimeout>;
+  #renderQueued = false;
 
   constructor(private readonly getWorker: (id: string) => WorkerRecord | undefined) {}
 
@@ -141,12 +223,97 @@ export class FusionPaneController {
     return { ...this.#state };
   }
 
+  get liveTimerActive(): boolean {
+    return this.#elapsedTimer !== undefined;
+  }
+
+  get renderTimerActive(): boolean {
+    return this.#renderTimer !== undefined;
+  }
+
+  getLive(workerId: string): LiveActivity | undefined {
+    const activity = this.#live.get(workerId);
+    if (!activity) return undefined;
+    return {
+      ...activity,
+      tools: activity.tools.map((tool) => ({ ...tool })),
+    };
+  }
+
   restore(state: PaneState): void {
+    this.#clearLiveState();
     this.#state = { ...state };
   }
 
   select(workerId: string): void {
     this.#state = { visible: this.#state.visible, workerId };
+    this.refresh();
+  }
+
+  beginLive(workerId: string, startedAt = Date.now()): number {
+    const token = ++this.#liveSequence;
+    if (!this.#state.visible) return token;
+    this.#liveTokens.set(workerId, token);
+    this.#live.set(workerId, { phase: "waiting", startedAt, text: "", tools: [] });
+    this.#ensureElapsedTimer();
+    this.refresh();
+    return token;
+  }
+
+  updateLive(workerId: string, progress: LiveProgress, token?: number): void {
+    if (!this.#state.visible) return;
+    if (token !== undefined && this.#liveTokens.get(workerId) !== token) return;
+    const activity = this.#live.get(workerId);
+    if (!activity) return;
+
+    switch (progress.kind) {
+      case "phase":
+        activity.phase = progress.phase;
+        if (progress.replaceText) activity.text = "";
+        if (progress.text !== undefined) activity.text = boundText(progress.text, LIVE_TEXT_MAX);
+        break;
+      case "tool_start": {
+        const existing = activity.tools.find((tool) => tool.id === progress.toolId);
+        if (existing) {
+          existing.name = boundText(progress.name, 200);
+          existing.arguments = boundText(progress.arguments, LIVE_ARGUMENTS_MAX);
+          existing.status = "running";
+          existing.output = "";
+        } else {
+          activity.tools.push({
+            id: progress.toolId,
+            name: boundText(progress.name, 200),
+            arguments: boundText(progress.arguments, LIVE_ARGUMENTS_MAX),
+            output: "",
+            status: "running",
+          });
+          if (activity.tools.length > LIVE_TOOL_MAX) activity.tools.splice(0, activity.tools.length - LIVE_TOOL_MAX);
+        }
+        activity.phase = "tool";
+        break;
+      }
+      case "tool_update": {
+        const tool = activity.tools.find((item) => item.id === progress.toolId);
+        if (tool) tool.output = boundText(progress.output, LIVE_OUTPUT_MAX);
+        break;
+      }
+      case "tool_end": {
+        const tool = activity.tools.find((item) => item.id === progress.toolId);
+        if (tool) {
+          tool.status = progress.ok ? "success" : "error";
+          if (progress.output !== undefined) tool.output = boundText(progress.output, LIVE_OUTPUT_MAX);
+        }
+        break;
+      }
+    }
+    this.refresh();
+  }
+
+  clearLive(workerId: string, token?: number): void {
+    if (token !== undefined && this.#liveTokens.get(workerId) !== token) return;
+    this.#liveTokens.delete(workerId);
+    this.#live.delete(workerId);
+    if (this.#live.size === 0) this.#stopElapsedTimer();
     this.refresh();
   }
 
@@ -164,14 +331,18 @@ export class FusionPaneController {
       (tui, _theme, _keybindings, done) => {
         this.#tui = tui;
         this.#finish = () => done();
-        return new WorkerPaneComponent(tui, () => this.#state.workerId ? this.getWorker(this.#state.workerId) : undefined);
+        return new WorkerPaneComponent(
+          tui,
+          () => this.#state.workerId ? this.getWorker(this.#state.workerId) : undefined,
+          (id) => this.getLive(id),
+        );
       },
       {
         overlay: true,
         overlayOptions: {
           anchor: "right-center",
-          width: "42%",
-          minWidth: 42,
+          width: "46%",
+          minWidth: 46,
           maxHeight: "90%",
           margin: 1,
           nonCapturing: true,
@@ -186,6 +357,8 @@ export class FusionPaneController {
       this.#finish = undefined;
       this.#tui = undefined;
       this.#state.visible = false;
+      this.#clearLiveState();
+      this.#clearRenderTimer();
     });
     return true;
   }
@@ -196,10 +369,47 @@ export class FusionPaneController {
     this.#finish = undefined;
     this.#tui = undefined;
     this.#instance += 1;
+    this.#clearLiveState();
+    this.#clearRenderTimer();
     finish?.();
   }
 
   refresh(): void {
-    this.#tui?.requestRender();
+    if (!this.#tui || this.#renderQueued) return;
+    this.#renderQueued = true;
+    this.#renderTimer = setTimeout(() => {
+      this.#renderTimer = undefined;
+      this.#renderQueued = false;
+      this.#tui?.requestRender();
+    }, LIVE_RENDER_INTERVAL_MS);
+  }
+
+  #ensureElapsedTimer(): void {
+    if (this.#elapsedTimer) return;
+    this.#elapsedTimer = setInterval(() => {
+      if (this.#live.size === 0 || !this.#state.visible) {
+        this.#stopElapsedTimer();
+        return;
+      }
+      this.refresh();
+    }, LIVE_ELAPSED_INTERVAL_MS);
+  }
+
+  #stopElapsedTimer(): void {
+    if (!this.#elapsedTimer) return;
+    clearInterval(this.#elapsedTimer);
+    this.#elapsedTimer = undefined;
+  }
+
+  #clearLiveState(): void {
+    this.#live.clear();
+    this.#liveTokens.clear();
+    this.#stopElapsedTimer();
+  }
+
+  #clearRenderTimer(): void {
+    if (this.#renderTimer) clearTimeout(this.#renderTimer);
+    this.#renderTimer = undefined;
+    this.#renderQueued = false;
   }
 }

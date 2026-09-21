@@ -335,11 +335,17 @@ const c3 = addUsage(c2, undefined);
 eq("usage sum", c3, { input: 13, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: 3 });
 
 // --- 8c. executor dispatches through the configured model registry ---
-import { runExecutorTurn } from "../src/llm.ts";
+import { getSupportsTemperature, runExecutorTurn } from "../src/llm.ts";
+eq("temperature compatibility", [
+  getSupportsTemperature({ api: "openai-codex-responses", reasoning: false } as never),
+  getSupportsTemperature({ api: "openai-responses", reasoning: true } as never),
+  getSupportsTemperature({ api: "openai-responses", reasoning: false } as never),
+  getSupportsTemperature({ api: "anthropic-messages", reasoning: false, compat: { supportsTemperature: false } } as never),
+], [false, false, true, false]);
 const resultStream = (result: unknown | Promise<unknown>) => ({ result: () => Promise.resolve(result) });
 let registryCompleteCalls = 0;
 let registryCall: { model?: unknown; options?: Record<string, unknown> } = {};
-const registryModel = { provider: "opencode-go", id: "registered", input: ["text"] };
+const registryModel = { provider: "opencode-go", id: "registered", api: "openai-codex-responses", input: ["text"], reasoning: true };
 const registrySignal = new AbortController().signal;
 const registryResult = await runExecutorTurn(
   {
@@ -374,7 +380,7 @@ eq("registry streamSimple dispatch", [
   registryCall.options?.reasoning,
   registryCall.options?.headers,
   registryResult.message.content,
-], [1, true, true, 128, 0.2, "high", {
+], [1, true, true, 128, undefined, "high", {
   "x-opencode-session": "session-test",
   "x-opencode-client": "pi",
 }, [{ type: "text", text: "registry ok" }]]);

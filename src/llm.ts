@@ -237,8 +237,9 @@ export function sanitizeError(message: string): string {
 }
 
 export function getSupportsTemperature(model: Model<Api>): boolean {
-  const meta = model as unknown as { supportsTemperature?: boolean };
-  return meta.supportsTemperature !== false;
+  if (model.api === "openai-codex-responses" || model.reasoning) return false;
+  const compat = model.compat as { supportsTemperature?: boolean } | undefined;
+  return compat?.supportsTemperature !== false;
 }
 
 export function getTextContent(message: AssistantMessage): string {

@@ -106,6 +106,18 @@ function clipStatus(value: string, max: number, tail = false): string {
   return tail ? `…${text.slice(-(max - 1))}` : `${text.slice(0, max - 1)}…`;
 }
 
+export function formatElapsedDuration(elapsedMs: number): string {
+  const totalSeconds = Number.isFinite(elapsedMs) ? Math.max(0, Math.floor(elapsedMs / 1_000)) : 0;
+  const seconds = totalSeconds % 60;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes === 0) return `${seconds}s`;
+  const minutes = totalMinutes % 60;
+  const secondText = String(seconds).padStart(2, "0");
+  if (totalMinutes < 60) return `${minutes}m ${secondText}s`;
+  const hours = Math.floor(totalMinutes / 60);
+  return `${hours}h ${String(minutes).padStart(2, "0")}m ${secondText}s`;
+}
+
 export function formatLiveStatusAction(activity: LiveActivity | undefined): string {
   if (!activity) return "starting";
   if (activity.phase === "tool") {
@@ -298,7 +310,7 @@ export default function (pi: ExtensionAPI) {
         const worker = running.find((item) => item.id === selected) ?? running.at(-1)!;
         const activity = pane.getLive(worker.id);
         const label = clipStatus(worker.label || worker.id.slice(4, 12), 24);
-        const elapsed = activity ? `${Math.max(0, Math.floor((Date.now() - activity.startedAt) / 1000))}s` : "0s";
+        const elapsed = formatElapsedDuration(activity ? Date.now() - activity.startedAt : 0);
         const more = running.length > 1 ? ` • +${running.length - 1}` : "";
         ctx.ui.setStatus("fusion", `Fusion • ${label} • ${formatLiveStatusAction(activity)} • ${elapsed}${more}`);
         return;

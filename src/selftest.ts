@@ -4,7 +4,7 @@ import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext, latestUserText } from "../src/utils.ts";
-import fusionExtension, { formatLiveStatusAction } from "../src/index.ts";
+import fusionExtension, { formatElapsedDuration, formatLiveStatusAction } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
@@ -1105,6 +1105,13 @@ eq("status line passes through visible worker activity", [
   formatLiveStatusAction({ phase: "tool", startedAt: 0, text: "", tools: [{ id: "1", name: "bash", arguments: '{"command":"git status"}', output: "", status: "running" }] }),
   formatLiveStatusAction(thinkingActivity),
 ], ["한국어로 작업 결과를 설명 중", 'bash {"command":"git status"}', "thinking"]);
+eq("status elapsed uses h/m/s", [
+  formatElapsedDuration(0),
+  formatElapsedDuration(59_999),
+  formatElapsedDuration(60_000),
+  formatElapsedDuration(65_000),
+  formatElapsedDuration(3_661_000),
+], ["0s", "59s", "1m 00s", "1m 05s", "1h 01m 01s"]);
 const crowdedActivity: LiveActivity = {
   phase: "tool",
   startedAt: Date.now() - 2_000,

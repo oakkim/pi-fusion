@@ -151,7 +151,7 @@ shows one compact view of its existing live stream:
 - tool call: the actual tool name and arguments
 - visible response: the worker's latest visible words, unchanged
 - otherwise: `waiting`, `thinking`, or `starting`
-- elapsed time, plus `+N` when other workers are also active
+- elapsed time as `42s`, `3m 07s`, or `1h 02m 09s`, plus `+N` when other workers are also active
 
 There is no extra summarization, translation, or model call. Because visible
 response text is passed through directly, the worker's conversation language

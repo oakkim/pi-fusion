@@ -826,13 +826,13 @@ try {
   await sh("git", ["init", "-b", "main", fusionDir]);
   await tgit(fusionDir, ["add", "-A"]);
   await tgit(fusionDir, ["commit", "-m", "init"]);
-  const registered = new Map<string, { execute: (...args: any[]) => Promise<any> }>();
+  const registered = new Map<string, { execute: (...args: any[]) => Promise<any>; renderCall?: (...args: any[]) => any }>();
   const lifecycleHandlers = new Map<string, (...args: any[]) => Promise<void>>();
   const journalEntries: string[] = [];
   const completionMessages: Array<{ message: any; options: any }> = [];
   fusionExtension({
     on: (event: string, handler: (...args: any[]) => Promise<void>) => lifecycleHandlers.set(event, handler),
-    registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any> }) => registered.set(tool.name, tool),
+    registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any>; renderCall?: (...args: any[]) => any }) => registered.set(tool.name, tool),
     registerCommand: () => {},
     appendEntry: (type: string) => journalEntries.push(type),
     sendMessage: (message: any, options: any) => completionMessages.push({ message, options }),
@@ -875,6 +875,61 @@ try {
   const ask = registered.get("fusion_ask")!;
   const status = registered.get("fusion_status")!;
   const interrupt = registered.get("fusion_interrupt")!;
+  const plainTheme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const renderCallText = (tool: { renderCall?: (...args: any[]) => any }, args: unknown, expanded = false) => {
+    const component = tool.renderCall?.(args, plainTheme, { expanded });
+    return component?.render(200).map((line: string) => line.trimEnd()).join("\n") ?? "";
+  };
+  const spawnCallText = renderCallText(spawn, {
+    task: "Add the request renderer\nand run npm test",
+    label: "call UI",
+    worktree: "render-call",
+    context_mode: "recent",
+  });
+  const followupCallText = renderCallText(followup, {
+    worker_id: "wrk_visible",
+    message: "Also cover the collapsed view",
+    when_busy: "queue",
+  });
+  const expandedSpawnCallText = renderCallText(spawn, { task: "first line\nsecond line" }, true);
+  const sanitizedFollowupCallText = renderCallText(followup, {
+    worker_id: "wrk_safe",
+    message: "visible\u001b]2;INJECTED\u0007 request",
+  });
+  const partialSpawnCallText = renderCallText(spawn, null);
+  const partialFollowupCallText = renderCallText(followup, { worker_id: "wrk_partial" });
+  const clippedSpawnCallText = renderCallText(spawn, { task: "x".repeat(300) });
+  const clippedExpandedSpawnCallText = renderCallText(spawn, { task: "y".repeat(8_100) }, true);
+  eq("spawn call renderer shows request and routing metadata", [
+    spawnCallText.includes("Fusion Spawn"),
+    spawnCallText.includes("task: Add the request renderer and run npm test"),
+    spawnCallText.includes("label=call UI"),
+    spawnCallText.includes("worktree=render-call"),
+    spawnCallText.includes("context=recent"),
+  ], [true, true, true, true, true]);
+  eq("followup call renderer shows message and delivery mode", [
+    followupCallText.includes("Fusion Followup"),
+    followupCallText.includes("message: Also cover the collapsed view"),
+    followupCallText.includes("worker=wrk_visible"),
+    followupCallText.includes("when_busy=queue"),
+  ], [true, true, true, true]);
+  eq("expanded spawn call preserves multiline request", expandedSpawnCallText.includes("first line\nsecond line"), true);
+  eq("call renderer strips terminal controls", [sanitizedFollowupCallText.includes("\u001b]"), sanitizedFollowupCallText.includes("INJECTED")], [false, false]);
+  eq("call renderers tolerate partial streamed arguments", [
+    partialSpawnCallText.includes("task: …"),
+    partialFollowupCallText.includes("message: …"),
+    partialFollowupCallText.includes("worker=wrk_partial"),
+    partialFollowupCallText.includes("when_busy=steer"),
+  ], [true, true, true, true]);
+  eq("call renderer bounds collapsed and expanded requests", [
+    clippedSpawnCallText.includes("…"),
+    clippedSpawnCallText.includes("x".repeat(300)),
+    clippedExpandedSpawnCallText.includes("… [truncated]"),
+    clippedExpandedSpawnCallText.includes("y".repeat(8_100)),
+  ], [true, false, true, false]);
   const readStatus = async (id: string) => {
     const result = await status.execute("status", { id }, undefined, undefined, context);
     return JSON.parse(result.content[0].text);

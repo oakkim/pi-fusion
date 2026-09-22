@@ -119,13 +119,13 @@ native thinking API; OpenAI fast mode uses the full stream with the equivalent
 reasoning effort. The override is journaled as a `fusion-thinking` entry and applies to existing
 persistent workers on their next turn.
 
-## OpenAI fast mode (v0.15)
+## OpenAI fast mode (v0.15; persistent command in v0.17)
 
 ```
 /fusion-fast                 -> interactive picker (TUI) or current status
-/fusion-fast on              -> request OpenAI priority processing for sidekick calls
-/fusion-fast off             -> use the provider's default service tier
-/fusion-fast default         -> return to fusion.json (default: off)
+/fusion-fast on              -> persist priority processing for current and future sessions
+/fusion-fast off             -> persist the provider's default tier for all sessions
+/fusion-fast default         -> remove the persisted preference and use config/built-in default
 /fusion-fast status          -> show effective mode, source, and model support
 ```
 
@@ -135,8 +135,13 @@ tool streaming, and provider-side cost accounting. It is independent from the
 Lead's setting and is re-evaluated for the actual escalation rung: unsupported
 fallback providers simply use their normal service tier. A toggle applies when
 the next worker or inquiry turn starts; it does not rewrite an already in-flight
-request. Session overrides are journaled as `fusion-fast`; set
-`"fastMode": true` in `fusion.json` for a persistent default.
+request. `on` and `off` atomically update the global `fusion.json` preference
+while preserving its other keys, then clear any older session-only override
+in the current session. The next Pi session therefore inherits the selected
+value automatically.
+`default` removes only the global `fastMode` key, allowing a trusted project
+config or the built-in `off` default to apply. `"fastMode"` can still be managed
+manually in `fusion.json`.
 
 Priority processing is faster but consumes the higher OpenAI priority tier
 (pi-ai currently prices it at 2x, or 2.5x for GPT-5.5). Availability and plan

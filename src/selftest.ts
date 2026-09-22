@@ -341,7 +341,7 @@ const cfg2 = applyDefaults({ fallbackExecutors: ["p/pro", "p/pro", ""], maxEscal
 eq("config ladder and fast mode", [cfg2.fallbackExecutors, cfg2.maxEscalations, cfg2.fastMode], [["p/pro"], 5, true]);
 
 // --- 9b. config override ---
-import { applyConsentOverride, applyFastModeOverride, applyOverride, applyThinkingOverride, applyDefaults as _ad } from "../src/config.ts";
+import { applyConsentOverride, applyFastModeOverride, applyOverride, applyThinkingOverride, applyDefaults as _ad, loadGlobalConfig } from "../src/config.ts";
 eq("leadMutations default", _ad({}).leadMutations, "allow");
 eq("leadMutations delegate", _ad({ leadMutations: "delegate" }).leadMutations, "delegate");
 eq("leadMutations bogus", _ad({ leadMutations: "sometimes" as unknown as "allow" }).leadMutations, "allow");
@@ -1522,10 +1522,13 @@ await commands.get("fusion-thinking")!.handler("high", {
 const thinkingEntry = thinkingBranch.at(-1) as { customType: string; data: { thinkingLevel: string } };
 eq("fusion thinking command", [thinkingEntry.customType, thinkingEntry.data.thinkingLevel, thinkingNotice], ["fusion-thinking", "high", "Fusion thinking: high (session override)"]);
 
-// --- 12. /fusion-fast controls OpenAI priority processing ---
+// --- 12. /fusion-fast persists OpenAI priority processing across sessions ---
 const fastFixture = mkdtempSync(_join(tmpdir(), "fusion-fast-config-"));
+const fastAgentDir = _join(fastFixture, "agent");
 mkdirSync(_join(fastFixture, ".pi"));
+mkdirSync(fastAgentDir);
 writeFileSync(_join(fastFixture, ".pi", "fusion.json"), JSON.stringify({ executor: "openai-codex/gpt-5.6-luna", fastMode: false }));
+writeFileSync(_join(fastAgentDir, "fusion.json"), JSON.stringify({ executorToolsConsent: true, preserved: "yes" }));
 const fastCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 const fastBranch: unknown[] = [];
 let fastNotice = "";
@@ -1534,7 +1537,7 @@ fusionExtension({
   registerTool: () => {},
   registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => fastCommands.set(name, command),
   appendEntry: (customType: string, data: unknown) => fastBranch.push({ type: "custom", customType, data }),
-} as never);
+} as never, { agentDir: fastAgentDir });
 const fastCommandModel = { provider: "openai-codex", id: "gpt-5.6-luna", api: "openai-codex-responses", input: ["text"], reasoning: true };
 const fastCommandContext = {
   cwd: fastFixture,
@@ -1555,15 +1558,61 @@ const fastCommandContext = {
 };
 await fastCommands.get("fusion-fast")!.handler("status", fastCommandContext);
 eq("fusion fast off status", fastNotice, "Fusion fast mode: off (config file) • default provider service tier");
+fastBranch.push({ type: "custom", customType: "fusion-fast", data: { fastMode: false, timestamp: Date.now() } });
 await fastCommands.get("fusion-fast")!.handler("on", fastCommandContext);
-const fastOnEntry = fastBranch.at(-1) as { customType: string; data: { fastMode: boolean } };
-eq("fusion fast on", [fastOnEntry.customType, fastOnEntry.data.fastMode, fastNotice.includes("on (session override)"), fastNotice.includes("priority")], ["fusion-fast", true, true, true]);
+const fastOnEntry = fastBranch.at(-1) as { customType: string; data: { fastMode?: boolean } };
+const persistedOnRaw = JSON.parse(readFileSync(_join(fastAgentDir, "fusion.json"), "utf8"));
+eq("fusion fast on persists globally", [
+  fastOnEntry.customType,
+  "fastMode" in fastOnEntry.data,
+  loadGlobalConfig(fastAgentDir).fastMode,
+  persistedOnRaw.preserved,
+  statSync(_join(fastAgentDir, "fusion.json")).mode & 0o777,
+  fastNotice.includes("on (global preference)"),
+  fastNotice.includes("priority"),
+], ["fusion-fast", false, true, "yes", 0o600, true, true]);
+const futureFastCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+let futureFastNotice = "";
+fusionExtension({
+  on: () => {},
+  registerTool: () => {},
+  registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => futureFastCommands.set(name, command),
+  appendEntry: () => {},
+} as never, { agentDir: fastAgentDir });
+await futureFastCommands.get("fusion-fast")!.handler("status", {
+  ...fastCommandContext,
+  ui: { ...fastCommandContext.ui, notify: (text: string) => { futureFastNotice = text; } },
+  sessionManager: { getBranch: () => [] },
+});
+eq("fusion fast survives a new session", futureFastNotice, "Fusion fast mode: on (global preference) • OpenAI priority service tier; higher cost/plan usage");
 await fastCommands.get("fusion-fast")!.handler("off", fastCommandContext);
-const fastOffEntry = fastBranch.at(-1) as { customType: string; data: { fastMode: boolean } };
-eq("fusion fast off", [fastOffEntry.customType, fastOffEntry.data.fastMode, fastNotice], ["fusion-fast", false, "Fusion fast mode: off (session override) • default provider service tier"]);
+const fastOffEntry = fastBranch.at(-1) as { customType: string; data: { fastMode?: boolean } };
+eq("fusion fast off persists globally", [fastOffEntry.customType, "fastMode" in fastOffEntry.data, loadGlobalConfig(fastAgentDir).fastMode, fastNotice], ["fusion-fast", false, false, "Fusion fast mode: off (global preference) • default provider service tier"]);
 await fastCommands.get("fusion-fast")!.handler("default", fastCommandContext);
 const fastDefaultEntry = fastBranch.at(-1) as { customType: string; data: { fastMode?: boolean } };
-eq("fusion fast default", [fastDefaultEntry.customType, "fastMode" in fastDefaultEntry.data, fastNotice], ["fusion-fast", false, "Fusion fast mode: off (config/default) • default provider service tier"]);
+const persistedDefaultRaw = JSON.parse(readFileSync(_join(fastAgentDir, "fusion.json"), "utf8"));
+eq("fusion fast default clears global preference", [fastDefaultEntry.customType, "fastMode" in fastDefaultEntry.data, "fastMode" in persistedDefaultRaw, persistedDefaultRaw.preserved, fastNotice], ["fusion-fast", false, false, "yes", "Fusion fast mode: off (config/default) • default provider service tier"]);
+const failedJournalCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+const failedJournalBranch = [{ type: "custom", customType: "fusion-fast", data: { fastMode: false, timestamp: Date.now() } }];
+let failedJournalNotice = "";
+fusionExtension({
+  on: () => {},
+  registerTool: () => {},
+  registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => failedJournalCommands.set(name, command),
+  appendEntry: () => { throw new Error("journal unavailable"); },
+} as never, { agentDir: fastAgentDir });
+await failedJournalCommands.get("fusion-fast")!.handler("on", {
+  ...fastCommandContext,
+  ui: { ...fastCommandContext.ui, notify: (text: string) => { failedJournalNotice = text; } },
+  sessionManager: { getBranch: () => failedJournalBranch },
+});
+eq("fusion fast reports uncleared session override", [
+  loadGlobalConfig(fastAgentDir).fastMode,
+  failedJournalNotice,
+], [
+  true,
+  "Fusion fast mode was saved globally as on, but this session still uses its previous off override because the journal could not be cleared. New sessions will use the persisted preference.",
+]);
 rmSync(fastFixture, { recursive: true, force: true });
 
 // --- 13. /fusion-consent persists allow, ask, and clear overrides ---

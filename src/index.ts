@@ -24,6 +24,8 @@ import {
   FUSION_THINKING_LEVELS,
   isFusionThinkingLevel,
   loadConfig,
+  loadGlobalConfig,
+  persistGlobalFastMode,
   type ConsentOverride,
   type ExecutorOverride,
   type FastModeOverride,
@@ -263,7 +265,7 @@ export function formatLiveStatusAction(activity: LiveActivity | undefined): stri
   return activity.phase;
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) {
   const runtime = new WorkerRuntime();
   const inquiries = new InquiryRuntime();
   const backgroundTurns = new Map<string, Promise<void>>();
@@ -375,11 +377,14 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
-  function persistFastModeOverride(override: FastModeOverride): void {
+  function persistFastModeOverride(override: FastModeOverride): boolean {
     try {
-      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-fast", { ...override, timestamp: Date.now() });
+      const appendEntry = (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry;
+      if (!appendEntry) return false;
+      appendEntry("fusion-fast", { ...override, timestamp: Date.now() });
+      return true;
     } catch {
-      // journal is best-effort
+      return false;
     }
   }
 
@@ -499,9 +504,13 @@ export default function (pi: ExtensionAPI) {
 
   /** Session command overrides win over fusion.json. */
   function effectiveConfig(ctx: ExtensionContext) {
-    const modelConfig = applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted()), restoreExecutorOverride(ctx));
+    const modelConfig = applyOverride(loadConfig(ctx.cwd, ctx.isProjectTrusted(), options.agentDir), restoreExecutorOverride(ctx));
     const thinkingConfig = applyThinkingOverride(modelConfig, restoreThinkingOverride(ctx));
-    const fastConfig = applyFastModeOverride(thinkingConfig, restoreFastModeOverride(ctx));
+    const globalFastMode = loadGlobalConfig(options.agentDir).fastMode;
+    const persistedFastConfig = typeof globalFastMode === "boolean"
+      ? { ...thinkingConfig, fastMode: globalFastMode }
+      : thinkingConfig;
+    const fastConfig = applyFastModeOverride(persistedFastConfig, restoreFastModeOverride(ctx));
     return applyDefaults(applyConsentOverride(fastConfig, restoreConsentOverride(ctx)));
   }
 
@@ -1817,7 +1826,7 @@ export default function (pi: ExtensionAPI) {
 
       if (!arg) {
         if (!ctx.hasUI) {
-          const fileCfg = applyDefaults(loadConfig(ctx.cwd, ctx.isProjectTrusted()));
+          const fileCfg = applyDefaults(loadConfig(ctx.cwd, ctx.isProjectTrusted(), options.agentDir));
           const override = restoreExecutorOverride(ctx);
           tell([`Fusion executor: ${resolved ? modelDisplay(resolved) : "unset"}${override?.auto ? " (session: auto)" : override?.executor ? " (session override)" : current.executor ? " (config file)" : " (auto)"}`, `Config file: ${fileCfg.executor ?? "(unset)"}`, "Usage: /fusion-model <provider/id> | auto | clear"].join("\n"));
           return;
@@ -1868,7 +1877,7 @@ export default function (pi: ExtensionAPI) {
         else ctx.ui.notify(text, level);
       };
       const cfg = effectiveConfig(ctx);
-      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted(), options.agentDir);
       const warnings: string[] = [];
       const executor = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
       const availableLevels = executor ? getSupportedThinkingLevels(executor) : ["off" as const];
@@ -1920,7 +1929,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("fusion-fast", {
-    description: "Set OpenAI sidekick priority processing: /fusion-fast [on|off|default|status]",
+    description: "Persist OpenAI sidekick priority processing: /fusion-fast [on|off|default|status]",
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trim().toLowerCase();
       const values = ["on", "off", "default", "status"];
@@ -1932,7 +1941,8 @@ export default function (pi: ExtensionAPI) {
         if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
         else ctx.ui.notify(text, level);
       };
-      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted(), options.agentDir);
+      const globalConfig = loadGlobalConfig(options.agentDir);
       const override = restoreFastModeOverride(ctx);
       const cfg = effectiveConfig(ctx);
       const warnings: string[] = [];
@@ -1940,21 +1950,41 @@ export default function (pi: ExtensionAPI) {
       const supported = executor ? supportsOpenAIFastMode(executor) : false;
       const source = typeof override?.fastMode === "boolean"
         ? "session override"
-        : typeof fileConfig.fastMode === "boolean" ? "config file" : "default";
+        : typeof globalConfig.fastMode === "boolean"
+          ? "global preference"
+          : typeof fileConfig.fastMode === "boolean" ? "config file" : "default";
       const enabledNote = supported
         ? "OpenAI priority service tier; higher cost/plan usage"
         : `not applied to current executor ${executor ? modelDisplay(executor) : "unset"}`;
       const report = () => tell(`Fusion fast mode: ${cfg.fastMode ? "on" : "off"} (${source}) • ${cfg.fastMode ? enabledNote : "default provider service tier"}`);
 
-      const apply = (next: FastModeOverride, enabled: boolean, nextSource: string) => {
-        persistFastModeOverride(next);
+      const applyPersistent = (next: boolean | undefined) => {
+        try {
+          persistGlobalFastMode(next, options.agentDir);
+        } catch (error) {
+          tell(`Could not persist Fusion fast mode: ${error instanceof Error ? error.message : String(error)}`, "error");
+          return;
+        }
+        // Clear old session-only entries so the persisted preference takes
+        // effect immediately and remains the source for future sessions.
+        const journalUpdated = persistFastModeOverride({});
+        const remainingOverride = restoreFastModeOverride(ctx);
+        const enabled = effectiveConfig(ctx).fastMode;
         refreshStatus(ctx);
+        if (typeof override?.fastMode === "boolean") {
+          const saved = typeof next === "boolean" ? (next ? "on" : "off") : "default";
+          if (typeof remainingOverride?.fastMode === "boolean") {
+            tell(`Fusion fast mode was saved globally as ${saved}, but this session still uses its previous ${remainingOverride.fastMode ? "on" : "off"} override because the journal could not be cleared. New sessions will use the persisted preference.`, "warning");
+            return;
+          }
+          if (!journalUpdated) {
+            tell(`Fusion fast mode was saved globally as ${saved} and is effective now, but the journal clear could not be recorded. Reopening this session may restore its previous ${override.fastMode ? "on" : "off"} override.`, "warning");
+            return;
+          }
+        }
         const level = enabled && !supported ? "warning" : "info";
+        const nextSource = typeof next === "boolean" ? "global preference" : "config/default";
         tell(`Fusion fast mode: ${enabled ? "on" : "off"} (${nextSource}) • ${enabled ? enabledNote : "default provider service tier"}`, level);
-      };
-      const setDefault = () => {
-        const configured = fileConfig.fastMode ?? false;
-        apply({}, configured, "config/default");
       };
 
       const arg = args.trim().toLowerCase();
@@ -1964,14 +1994,14 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const choice = await ctx.ui.select(`Fusion fast mode (current: ${cfg.fastMode ? "on" : "off"}):`, [
-          "on (OpenAI priority tier)",
-          "off (provider default)",
-          `default (${fileConfig.fastMode ? "on" : "off"})`,
+          "on (persist across sessions; OpenAI priority tier)",
+          "off (persist across sessions; provider default)",
+          "default (remove persisted preference)",
         ]);
         if (!choice) return;
-        if (choice.startsWith("on")) apply({ fastMode: true }, true, "session override");
-        else if (choice.startsWith("off")) apply({ fastMode: false }, false, "session override");
-        else setDefault();
+        if (choice.startsWith("on")) applyPersistent(true);
+        else if (choice.startsWith("off")) applyPersistent(false);
+        else applyPersistent(undefined);
         return;
       }
       if (arg === "status") {
@@ -1979,15 +2009,15 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (arg === "on" || arg === "fast" || arg === "priority") {
-        apply({ fastMode: true }, true, "session override");
+        applyPersistent(true);
         return;
       }
       if (arg === "off") {
-        apply({ fastMode: false }, false, "session override");
+        applyPersistent(false);
         return;
       }
       if (arg === "default" || arg === "clear") {
-        setDefault();
+        applyPersistent(undefined);
         return;
       }
       tell(`Unknown fast mode: ${args.trim()}. Use on, off, default, or status.`, "error");
@@ -2126,7 +2156,7 @@ export default function (pi: ExtensionAPI) {
         if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
         else ctx.ui.notify(text, level);
       };
-      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+      const fileConfig = loadConfig(ctx.cwd, ctx.isProjectTrusted(), options.agentDir);
       const override = restoreConsentOverride(ctx);
       const source = typeof override?.executorToolsConsent === "boolean"
         ? "session override"

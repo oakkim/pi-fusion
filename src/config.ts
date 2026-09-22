@@ -5,7 +5,7 @@
 
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FusionConfig, ResolvedFusionConfig, ToolSelection } from "./types.ts";
 
@@ -25,10 +25,10 @@ const TOOL_NAMES = ["read", "grep", "find", "ls", "bash", "edit", "write"] as co
 const TOOL_MODES = ["none", "readonly", "all"] as const;
 export const FUSION_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
 
-export function loadConfig(cwd: string, projectTrusted: boolean): FusionConfig {
+export function loadConfig(cwd: string, projectTrusted: boolean, agentDir = getAgentDir()): FusionConfig {
   const paths: string[] = [];
   if (projectTrusted) paths.push(join(cwd, ".pi", "fusion.json"));
-  paths.push(join(getAgentDir(), "fusion.json"));
+  paths.push(globalFusionConfigPath(agentDir));
   for (const p of paths) {
     if (!existsSync(p)) continue;
     try {
@@ -38,6 +38,46 @@ export function loadConfig(cwd: string, projectTrusted: boolean): FusionConfig {
     }
   }
   return {};
+}
+
+export function globalFusionConfigPath(agentDir = getAgentDir()): string {
+  return join(agentDir, "fusion.json");
+}
+
+export function loadGlobalConfig(agentDir = getAgentDir()): FusionConfig {
+  const configPath = globalFusionConfigPath(agentDir);
+  if (!existsSync(configPath)) return {};
+  try {
+    return normalizeConfig(JSON.parse(readFileSync(configPath, "utf8")));
+  } catch (err) {
+    console.error(`[pi-fusion] failed to parse ${configPath}:`, err);
+    return {};
+  }
+}
+
+/** Persist the slash-command fast preference without replacing unrelated config. */
+export function persistGlobalFastMode(fastMode: boolean | undefined, agentDir = getAgentDir()): void {
+  const configPath = globalFusionConfigPath(agentDir);
+  let raw: Record<string, unknown> = {};
+  if (existsSync(configPath)) {
+    const parsed = JSON.parse(readFileSync(configPath, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`Global Fusion config is not a JSON object: ${configPath}`);
+    }
+    raw = { ...(parsed as Record<string, unknown>) };
+  }
+  if (typeof fastMode === "boolean") raw.fastMode = fastMode;
+  else delete raw.fastMode;
+
+  mkdirSync(agentDir, { recursive: true, mode: 0o700 });
+  const temporary = `${configPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(raw, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    chmodSync(temporary, 0o600);
+    renameSync(temporary, configPath);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 function normalizeConfig(raw: unknown): FusionConfig {
@@ -121,7 +161,7 @@ export interface ThinkingOverride {
   thinkingLevel?: ModelThinkingLevel;
 }
 
-/** Session override from /fusion-fast. */
+/** Legacy session override retained for existing `fusion-fast` journal entries. */
 export interface FastModeOverride {
   fastMode?: boolean;
 }
@@ -144,7 +184,7 @@ export function applyThinkingOverride(base: FusionConfig, override: ThinkingOver
   return { ...base, thinkingLevel: override.thinkingLevel };
 }
 
-/** Session fast-mode choice wins over file config, including an explicit false. */
+/** A legacy session fast-mode choice wins over persisted config, including explicit false. */
 export function applyFastModeOverride(base: FusionConfig, override: FastModeOverride | undefined): FusionConfig {
   if (!override || typeof override.fastMode !== "boolean") return base;
   return { ...base, fastMode: override.fastMode };

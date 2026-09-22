@@ -248,7 +248,7 @@ the current conversation while code, paths, commands, and raw output stay
 unchanged. Private thinking text is never exposed. Updates are throttled and
 the elapsed timer stops when no workers are active.
 
-## Read-only monitor sidecar (v0.16)
+## Read-only monitor sidecar (v0.18)
 
 ```text
 /fusion-monitor              -> publish telemetry and open a separate monitor window
@@ -264,10 +264,19 @@ screen with a full-width worker list and scrollable detail view:
 - `j` / `k` or Tab / Shift-Tab selects a worker
 - Up / Down and Page Up / Page Down scroll output
 - `f` follows the newest live activity, `r` refreshes, and `q` closes
-- visible sidekick responses, tool arguments/output, elapsed time, queue/steer
-  counts, persistent public history, and worktree metadata are displayed
+- Lead/user messages use Pi-style user cards, visible Sidekick markdown uses Pi's
+  public assistant renderer, and tool calls/results are paired into compact
+  pending/success/error cards with bounded arguments/output
+- a fixed selected-worker coordination strip always shows `Steering N · Queue N`,
+  pending versus injected steering, and the latest/next bounded preview; worker
+  list badges and header totals remain visible while transcript follow mode scrolls
+- a fixed Pi-shaped usage footer shows cumulative `↑input ↓output RcacheRead
+  WcacheWrite CH% $cost (sub) context/window (auto)` plus the latest actual executor
+  when there is room; context is unknown before provider usage and immediately after
+  Fusion compaction
 - private thinking is removed before publication and terminal control sequences
-  from model/tool text are stripped before rendering
+  from model/tool text are stripped before rendering; snapshots use a structured,
+  tool-call/result-paired schema and remain owner-only/read-only
 
 The bridge is read-only and local: the extension atomically writes a bounded,
 owner-only (`0600`) session snapshot under the OS temporary directory, and the

@@ -12,6 +12,7 @@
 
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
@@ -33,18 +34,20 @@ import {
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
 import { SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
-import { FusionPaneController, formatPaneHistory, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
+import { FusionPaneController, formatPaneTranscript, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
 import {
   FusionMonitorPublisher,
   launchMonitorWindow,
   manualMonitorCommand,
+  MONITOR_SCHEMA_VERSION,
   sanitizeMonitorText,
   type MonitorSnapshotPayload,
 } from "./monitor.ts";
 import { getTextContent, runExecutorTurn, supportsOpenAIFastMode } from "./llm.ts";
+import type { UsageLike } from "./cost.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
-import { WorkerRuntime, type WorkerRecord } from "./runtime.ts";
+import { WorkerRuntime, type WorkerContextTelemetry, type WorkerRecord } from "./runtime.ts";
 import { InquiryRuntime, type InquiryThread, type InquiryTurn } from "./inquiry.ts";
 import { fusionArgumentCompletions, isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, parseFusionCommand, type FusionMode } from "./mode.ts";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree } from "./worktree.ts";
@@ -265,6 +268,52 @@ export function formatLiveStatusAction(activity: LiveActivity | undefined): stri
   return activity.phase;
 }
 
+/**
+ * Derive the current context only from a valid provider usage block and the
+ * messages appended after it. Before a provider response (and after Fusion
+ * compaction) the result deliberately has no token count.
+ */
+export function deriveWorkerContextTelemetry(messages: Message[], contextWindow?: number): WorkerContextTelemetry {
+  const window = typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+    ? contextWindow
+    : undefined;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index] as Message & { usage?: UsageLike; stopReason?: string };
+    if (message.role !== "assistant" || !message.usage || message.stopReason === "error" || message.stopReason === "aborted") continue;
+    let usageTokens = 0;
+    try {
+      usageTokens = calculateContextTokens(message.usage as never);
+    } catch {
+      usageTokens = 0;
+    }
+    if (!Number.isFinite(usageTokens) || usageTokens <= 0) continue;
+    let trailingTokens = 0;
+    for (let trailing = index + 1; trailing < messages.length; trailing++) {
+      try {
+        trailingTokens += Math.max(0, estimateTokens(messages[trailing] as never));
+      } catch {
+        // A future compat message shape must not fabricate a context value.
+      }
+    }
+    return { known: true, tokens: usageTokens + trailingTokens, ...(window ? { window } : {}) };
+  }
+  return { known: false, ...(window ? { window } : {}) };
+}
+
+/** Pi's subscription marker: Kimi Coding is special even with API-key auth. */
+export function executorUsesSubscription(registry: ExtensionContext["modelRegistry"], modelId: string | undefined): boolean {
+  if (!modelId) return false;
+  const model = resolveModelIdentifier(registry, modelId);
+  if (!model) return false;
+  if (model.provider === "kimi-coding") return true;
+  try {
+    if (typeof registry.isUsingOAuth !== "function" || !registry.isUsingOAuth(model)) return false;
+    return registry.getProvider(model.provider)?.auth?.oauth?.isSubscription === true;
+  } catch {
+    return false;
+  }
+}
+
 export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) {
   const runtime = new WorkerRuntime();
   const inquiries = new InquiryRuntime();
@@ -450,13 +499,54 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     const ctx = activeContext;
     if (!ctx) throw new Error("Fusion session is not active.");
     const sessionId = ctx.sessionManager.getSessionId() ?? `ephemeral-${process.pid}-${sessionEpoch}`;
+    const themeName = typeof ctx.ui?.theme?.name === "string" ? ctx.ui.theme.name : undefined;
     return {
-      schemaVersion: 1,
+      schemaVersion: MONITOR_SCHEMA_VERSION,
       sessionId,
       cwd: ctx.cwd,
+      ...(themeName ? { themeName } : {}),
       selectedWorkerId: pane.state.workerId,
       workers: runtime.list().map((worker) => {
         const live = pane.getLive(worker.id);
+        const allSteering = steeringFor(worker.id);
+        const allQueue = pendingFollowups.get(worker.id) ?? [];
+        const steering = allSteering.slice(-12).map((entry) => ({
+          id: sanitizeMonitorText(entry.id, 120),
+          turnId: sanitizeMonitorText(entry.turnId, 120),
+          status: entry.status,
+          preview: sanitizeMonitorText(entry.message, 180).replace(/\n+/g, " "),
+          enqueuedAt: entry.enqueuedAt,
+        }));
+        const queue = allQueue.slice(0, 12).map((entry) => ({
+          id: sanitizeMonitorText(entry.id, 120),
+          status: "queued" as const,
+          strategy: entry.strategy,
+          preview: sanitizeMonitorText(entry.message, 180).replace(/\n+/g, " "),
+          enqueuedAt: entry.enqueuedAt,
+          ...(entry.interruptedTurnId ? { interruptedTurnId: sanitizeMonitorText(entry.interruptedTurnId, 120) } : {}),
+        }));
+        const telemetry = worker.telemetry;
+        const context = telemetry?.context?.known
+          ? deriveWorkerContextTelemetry(worker.history, telemetry.context.window)
+          : telemetry?.context;
+        const latestExecutor = telemetry?.latestExecutor ?? worker.executorModelId;
+        const transcript = formatPaneTranscript(worker.history).slice(-120).map((item) => {
+          if (item.kind === "tool") {
+            return {
+              kind: "tool" as const,
+              role: "TOOL" as const,
+              id: sanitizeMonitorText(item.id, 200),
+              name: sanitizeMonitorText(item.name, 200),
+              arguments: sanitizeMonitorText(item.arguments, 2_000),
+              ...(item.output !== undefined ? { output: sanitizeMonitorText(item.output, 4_000) } : {}),
+              status: item.status,
+            };
+          }
+          if (item.kind === "user") {
+            return { kind: "user" as const, role: "LEAD" as const, text: sanitizeMonitorText(item.text) };
+          }
+          return { kind: "assistant" as const, role: "SIDEKICK" as const, text: sanitizeMonitorText(item.text) };
+        });
         return {
           id: worker.id,
           label: worker.label,
@@ -466,12 +556,20 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           activeTurnId: worker.activeTurnId ?? undefined,
           createdAt: worker.createdAt,
           worktree: worker.worktree ? { branch: worker.worktree.branch, path: worker.worktree.path } : undefined,
-          queuedFollowups: pendingFollowups.get(worker.id)?.length ?? 0,
-          steeringUpdates: steeringFor(worker.id, worker.activeTurnId ?? undefined).length,
-          history: formatPaneHistory(worker.history).slice(-120).map((item) => ({
-            role: item.role,
-            text: sanitizeMonitorText(item.text),
-          })),
+          queuedFollowups: allQueue.length,
+          steeringUpdates: allSteering.length,
+          coordination: { steering, queue },
+          history: transcript,
+          telemetry: {
+            usage: telemetry?.cumulative,
+            latestUsage: telemetry?.latest,
+            latestExecutor,
+            contextTokens: context?.tokens,
+            contextWindow: context?.window,
+            contextKnown: context?.known === true,
+            subscription: executorUsesSubscription(ctx.modelRegistry, latestExecutor),
+            automaticCompaction: telemetry?.automaticCompaction !== false,
+          },
           live: live ? {
             ...live,
             text: sanitizeMonitorText(live.text, 4_000),
@@ -852,7 +950,16 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       const result = mutating ? await runSerialized(exec, signal) : await exec();
       signal.throwIfAborted();
       const output = getTextContent(result.message);
-      if (!runtime.finishTurn(turnId, output, result.added)) {
+      const responseContext = deriveWorkerContextTelemetry(
+        [...worker.history, ...result.added],
+        executor.contextWindow,
+      );
+      if (!runtime.finishTurn(turnId, output, result.added, {
+        usage: result.usage,
+        latestUsage: result.message.usage,
+        latestExecutor: modelDisplay(executor),
+        context: responseContext,
+      })) {
         const status = worker.status === "closed"
           ? "closed"
           : runtime.getTurn(turnId)?.status === "interrupted" ? "interrupted" : "stale";
@@ -884,6 +991,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           turns: result.turns,
           tool_calls: result.toolCalls.length,
           steered_instructions: steeredInstructions,
+          compacted,
           timestamp: Date.now(),
         });
       } catch {

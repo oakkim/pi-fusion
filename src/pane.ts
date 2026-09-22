@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Message } from "@earendil-works/pi-ai/compat";
-import { truncateToWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, truncateToWidth, wrapTextWithAnsi, type Component, type TUI } from "@earendil-works/pi-tui";
 import type { WorkerRecord } from "./runtime.ts";
 
 export interface PaneState {
@@ -12,6 +12,20 @@ export interface PaneHistoryItem {
   role: "LEAD" | "SIDEKICK" | "TOOL";
   text: string;
 }
+
+/** A public, model-visible transcript item with tool calls paired to results. */
+export type PaneTranscriptItem =
+  | { kind: "user"; role: "LEAD"; text: string }
+  | { kind: "assistant"; role: "SIDEKICK"; text: string }
+  | {
+      kind: "tool";
+      role: "TOOL";
+      id: string;
+      name: string;
+      arguments: string;
+      output?: string;
+      status: "running" | "success" | "error";
+    };
 
 export type LivePhase = "waiting" | "thinking" | "responding" | "tool";
 
@@ -54,6 +68,13 @@ function stringify(value: unknown): string {
   }
 }
 
+function visibleText(value: unknown, max = 8_000): string {
+  const text = stripTerminalSequences(typeof value === "string" ? value : String(value ?? ""))
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
+    .replace(/\r/g, "");
+  return text.length > max ? `${text.slice(0, Math.max(0, max - 3))}...` : text;
+}
+
 function boundText(value: string, max: number): string {
   const normalized = value.replace(/\r/g, "");
   return normalized.length > max ? `${normalized.slice(0, Math.max(0, max - 3))}...` : normalized;
@@ -79,18 +100,92 @@ export function extractHandoffTask(text: string): string {
   return /<task>([\s\S]*?)<\/task>/.exec(text)?.[1]?.trim() || text.trim();
 }
 
-/** Convert compat messages to user-visible rows. Thinking blocks are deliberately omitted. */
-export function formatPaneHistory(history: Message[]): PaneHistoryItem[] {
-  const items: PaneHistoryItem[] = [];
+/**
+ * Convert compat messages to a paired, user-visible transcript. Thinking
+ * blocks are deliberately omitted and tool results update their call row
+ * instead of becoming a second unpaired history item.
+ */
+export function formatPaneTranscript(history: Message[]): PaneTranscriptItem[] {
+  const items: PaneTranscriptItem[] = [];
+  const tools = new Map<string, Extract<PaneTranscriptItem, { kind: "tool" }>>();
   for (const message of history) {
     if (message.role === "user") {
-      for (const text of textParts(message.content)) items.push({ role: "LEAD", text: extractHandoffTask(text) });
+      for (const text of textParts(message.content)) {
+        const visible = visibleText(extractHandoffTask(text));
+        if (visible.trim()) items.push({ kind: "user", role: "LEAD", text: visible });
+      }
       continue;
     }
     if (message.role === "assistant") {
       const content: unknown = message.content;
       if (typeof content === "string") {
-        if (content.trim()) items.push({ role: "SIDEKICK", text: content });
+        const visible = visibleText(content);
+        if (visible.trim()) items.push({ kind: "assistant", role: "SIDEKICK", text: visible });
+        continue;
+      }
+      if (!Array.isArray(content)) continue;
+      for (const part of content) {
+        if (!part || typeof part !== "object") continue;
+        const block = part as { type?: unknown; text?: unknown; id?: unknown; name?: unknown; arguments?: unknown };
+        if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
+          items.push({ kind: "assistant", role: "SIDEKICK", text: visibleText(block.text) });
+        } else if (block.type === "toolCall" && typeof block.name === "string") {
+          const id = typeof block.id === "string" && block.id ? block.id : `tool-${items.length}`;
+          const tool: Extract<PaneTranscriptItem, { kind: "tool" }> = {
+            kind: "tool",
+            role: "TOOL",
+            id: visibleText(id, 200),
+            name: visibleText(block.name, 200),
+            arguments: visibleText(stringify(block.arguments), 2_000),
+            status: "running",
+          };
+          items.push(tool);
+          tools.set(id, tool);
+        }
+        // block.type === "thinking" is intentionally not rendered.
+      }
+      continue;
+    }
+    if (message.role === "toolResult") {
+      const id = typeof message.toolCallId === "string" ? message.toolCallId : undefined;
+      const result = visibleText(textParts(message.content).join("\n") || "(no text output)", 4_000);
+      const existing = id ? tools.get(id) : undefined;
+      if (existing) {
+        existing.output = result;
+        existing.status = message.isError ? "error" : "success";
+      } else {
+        const fallback: Extract<PaneTranscriptItem, { kind: "tool" }> = {
+          kind: "tool",
+          role: "TOOL",
+          id: visibleText(id ?? `tool-result-${items.length}`, 200),
+          name: visibleText(message.toolName, 200),
+          arguments: "",
+          output: result,
+          status: message.isError ? "error" : "success",
+        };
+        items.push(fallback);
+        if (id) tools.set(id, fallback);
+      }
+    }
+  }
+  return items;
+}
+
+/** Alias used by monitor publishers and external deterministic tests. */
+export const formatStructuredTranscript = formatPaneTranscript;
+
+/** Convert compat messages to legacy user-visible rows. Thinking blocks are deliberately omitted. */
+export function formatPaneHistory(history: Message[]): PaneHistoryItem[] {
+  const items: PaneHistoryItem[] = [];
+  for (const message of history) {
+    if (message.role === "user") {
+      for (const text of textParts(message.content)) items.push({ role: "LEAD", text: visibleText(extractHandoffTask(text)) });
+      continue;
+    }
+    if (message.role === "assistant") {
+      const content: unknown = message.content;
+      if (typeof content === "string") {
+        if (content.trim()) items.push({ role: "SIDEKICK", text: visibleText(content) });
         continue;
       }
       if (!Array.isArray(content)) continue;
@@ -98,18 +193,18 @@ export function formatPaneHistory(history: Message[]): PaneHistoryItem[] {
         if (!part || typeof part !== "object") continue;
         const block = part as { type?: unknown; text?: unknown; name?: unknown; arguments?: unknown };
         if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
-          items.push({ role: "SIDEKICK", text: block.text });
+          items.push({ role: "SIDEKICK", text: visibleText(block.text) });
         } else if (block.type === "toolCall" && typeof block.name === "string") {
           const args = stringify(block.arguments);
-          items.push({ role: "TOOL", text: `call ${block.name}${args === "{}" ? "" : ` ${args}`}` });
+          items.push({ role: "TOOL", text: `call ${visibleText(block.name, 200)}${args === "{}" ? "" : ` ${visibleText(args, 2_000)}`}` });
         }
         // block.type === "thinking" is intentionally not rendered.
       }
       continue;
     }
     if (message.role === "toolResult") {
-      const result = textParts(message.content).join("\n") || "(no text output)";
-      items.push({ role: "TOOL", text: `${message.toolName} ${message.isError ? "error" : "result"}: ${result}` });
+      const result = visibleText(textParts(message.content).join("\n") || "(no text output)", 4_000);
+      items.push({ role: "TOOL", text: `${visibleText(message.toolName, 200)} ${message.isError ? "error" : "result"}: ${result}` });
     }
   }
   return items;

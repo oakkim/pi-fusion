@@ -6,7 +6,37 @@
  */
 
 import type { Message } from "@earendil-works/pi-ai/compat";
+import { addUsage, usageSummary, zeroUsage, type UsageLike, type UsageSummary } from "./cost.ts";
 import type { WorkerStatus, TurnRecord, WorktreeInfo } from "./types.ts";
+
+export interface WorkerContextTelemetry {
+  /** Context tokens are absent/unknown until a successful provider response. */
+  tokens?: number;
+  window?: number;
+  known: boolean;
+}
+
+export interface WorkerTelemetry {
+  /** Cumulative successful-turn total. */
+  cumulative: UsageSummary;
+  /** Usage from the most recent successful assistant response, for CH. */
+  latest?: UsageSummary;
+  /** Actual model used by the latest successful executor turn. */
+  latestExecutor?: string;
+  context?: WorkerContextTelemetry;
+  /** Fusion history compaction is automatic and is shown as (auto) in the footer. */
+  automaticCompaction: boolean;
+}
+
+function latestAssistantUsage(history: Message[]): UsageSummary | undefined {
+  for (let index = history.length - 1; index >= 0; index--) {
+    const message = history[index] as Message & { usage?: UsageLike; stopReason?: string };
+    if (message.role !== "assistant" || !message.usage || message.stopReason === "error" || message.stopReason === "aborted") continue;
+    const summary = usageSummary(message.usage);
+    if (summary.input || summary.output || summary.cacheRead || summary.cacheWrite || summary.totalTokens || summary.cost) return summary;
+  }
+  return undefined;
+}
 
 export interface WorkerRecord {
   id: string; // wrk_...
@@ -19,6 +49,8 @@ export interface WorkerRecord {
   failures: number; // consecutive sidekick failures (for routing escalation)
   worktree?: WorktreeInfo; // isolated checkout (executor cwd); absent = shared project cwd
   createdAt: number;
+  /** Optional for journal compatibility with workers written before monitor telemetry. */
+  telemetry?: WorkerTelemetry;
 }
 
 export class WorkerRuntime {
@@ -51,6 +83,10 @@ export class WorkerRuntime {
       activeTurnId: null,
       failures: 0,
       createdAt: Date.now(),
+      telemetry: {
+        cumulative: zeroUsage(),
+        automaticCompaction: true,
+      },
     };
     const turn: TurnRecord = {
       id: `trn_${crypto.randomUUID()}`,
@@ -84,7 +120,12 @@ export class WorkerRuntime {
     return turn;
   }
 
-  finishTurn(turnId: string, text: string, assistantMessages: Message[]): boolean {
+  finishTurn(
+    turnId: string,
+    text: string,
+    assistantMessages: Message[],
+    telemetry?: { usage?: UsageLike; latestUsage?: UsageLike; latestExecutor?: string; context?: WorkerContextTelemetry },
+  ): boolean {
     const turn = this.#turns.get(turnId);
     const worker = turn ? this.#workers.get(turn.workerId) : undefined;
     if (!turn || !worker || turn.status !== "running" || worker.activeTurnId !== turnId) return false;
@@ -94,6 +135,24 @@ export class WorkerRuntime {
     worker.activeTurnId = null;
     worker.status = "idle";
     worker.failures = 0;
+    if (telemetry?.usage) {
+      const previous = worker.telemetry?.cumulative ?? zeroUsage();
+      worker.telemetry = {
+        cumulative: addUsage(previous, telemetry.usage),
+        latest: usageSummary(telemetry.latestUsage ?? telemetry.usage),
+        latestExecutor: telemetry.latestExecutor ?? worker.telemetry?.latestExecutor,
+        context: telemetry.context ?? worker.telemetry?.context,
+        automaticCompaction: worker.telemetry?.automaticCompaction ?? true,
+      };
+    } else if (telemetry?.latestExecutor || telemetry?.context) {
+      worker.telemetry = {
+        cumulative: worker.telemetry?.cumulative ?? zeroUsage(),
+        latest: worker.telemetry?.latest,
+        latestExecutor: telemetry.latestExecutor ?? worker.telemetry?.latestExecutor,
+        context: telemetry.context ?? worker.telemetry?.context,
+        automaticCompaction: worker.telemetry?.automaticCompaction ?? true,
+      };
+    }
     this.#controllers.delete(turnId);
     return true;
   }
@@ -159,6 +218,17 @@ export class WorkerRuntime {
     else while (worker.history[start]?.role === "toolResult") start++;
     const keep = worker.history.slice(start);
     worker.history = [worker.history[0]!, ...keep];
+    // The prior usage describes the pre-compaction context and must not be
+    // presented as live context until a provider responds again.
+    if (worker.telemetry) {
+      worker.telemetry = {
+        ...worker.telemetry,
+        context: {
+          known: false,
+          ...(worker.telemetry.context?.window ? { window: worker.telemetry.context.window } : {}),
+        },
+      };
+    }
     return true;
   }
 
@@ -177,13 +247,49 @@ export class WorkerRuntime {
     this.#turns.clear();
     this.#controllers.clear();
 
+    // Older journals have no worker telemetry. Keep cumulative fusion-cost
+    // usage by worker; latest CH comes only from restored assistant history.
+    const legacyUsage = new Map<string, { cumulative: UsageSummary; executor?: string }>();
+    for (const entry of entries) {
+      const e = entry as { type?: unknown; customType?: unknown; data?: unknown };
+      if (e?.type !== "custom" || e?.customType !== "fusion-cost" || !e.data || typeof e.data !== "object") continue;
+      const data = e.data as { worker_id?: unknown; usage?: UsageLike; executor?: unknown };
+      if (typeof data.worker_id !== "string") continue;
+      const previous = legacyUsage.get(data.worker_id) ?? { cumulative: zeroUsage() };
+      previous.cumulative = addUsage(previous.cumulative, data.usage);
+      if (typeof data.executor === "string" && data.executor) previous.executor = data.executor;
+      legacyUsage.set(data.worker_id, previous);
+    }
+
     // Scan session branch for fusion-worker snapshots, last wins per worker id.
     for (const entry of entries) {
       const e = entry as { type?: unknown; customType?: unknown; data?: unknown };
       if (e?.type !== "custom" || e?.customType !== "fusion-worker" || !("data" in (e as object))) continue;
       const data = (e as { data: { worker?: WorkerRecord; turns?: TurnRecord[] } }).data;
       if (!data?.worker?.id) continue;
-      this.#workers.set(data.worker.id, { ...data.worker, activeTurnId: null, status: data.worker.status === "closed" ? "closed" : "idle" });
+      const restored = { ...data.worker };
+      if (!restored.telemetry) {
+        const legacy = legacyUsage.get(restored.id);
+        restored.telemetry = {
+          cumulative: legacy?.cumulative ?? zeroUsage(),
+          latest: latestAssistantUsage(restored.history),
+          latestExecutor: legacy?.executor,
+          automaticCompaction: true,
+        };
+      } else {
+        restored.telemetry = {
+          cumulative: restored.telemetry.cumulative ?? zeroUsage(),
+          latest: restored.telemetry.latest,
+          latestExecutor: restored.telemetry.latestExecutor,
+          context: restored.telemetry.context,
+          automaticCompaction: restored.telemetry.automaticCompaction ?? true,
+        };
+      }
+      this.#workers.set(restored.id, {
+        ...restored,
+        activeTurnId: null,
+        status: restored.status === "closed" ? "closed" : "idle",
+      });
       for (const t of data.turns ?? []) {
         const existing = this.#turns.get(t.id);
         if (!existing || t.generation >= existing.generation) {

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { readFile, stat } from "node:fs/promises";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { ProcessTerminal, TuiAltScreen, matchesKey, type Component, type TUI } from "@earendil-works/pi-tui";
 import { parseMonitorSnapshot, renderMonitorScreen, shouldTerminateMonitor, type MonitorSnapshot, type MonitorViewState } from "./monitor.ts";
 
@@ -8,6 +9,25 @@ const snapshotPath = process.argv[2];
 if (!snapshotPath) {
   process.stderr.write("Usage: monitor-cli.ts <snapshot.json>\n");
   process.exit(2);
+}
+
+// Theme initialization belongs to the sidecar process, never the Lead extension.
+// Node executes this file directly in strip-only TypeScript mode, so keep the
+// control path free of enums/parameter properties and other runtime TS syntax.
+initTheme();
+let activeThemeName: string | undefined;
+
+function applySnapshotTheme(snapshot: MonitorSnapshot): void {
+  const next = snapshot.themeName;
+  if (next === activeThemeName) return;
+  try {
+    initTheme(next);
+  } catch {
+    // initTheme normally falls back to dark itself; retain a safe fallback for
+    // older Pi builds that may throw on an unknown custom theme.
+    try { initTheme(); } catch { /* keep the already initialized theme */ }
+  }
+  activeThemeName = next;
 }
 
 const terminal = new ProcessTerminal();
@@ -26,6 +46,7 @@ class MonitorComponent implements Component {
   }
 
   setSnapshot(snapshot: MonitorSnapshot): void {
+    applySnapshotTheme(snapshot);
     const previousWorkers = this.snapshot?.workers.map((worker) => worker.id).join("\0");
     this.snapshot = snapshot;
     const currentWorkers = snapshot.workers.map((worker) => worker.id).join("\0");
@@ -39,7 +60,7 @@ class MonitorComponent implements Component {
 
   render(width: number): string[] {
     const snapshot = this.snapshot ?? {
-      schemaVersion: 1,
+      schemaVersion: 2,
       sessionId: "waiting",
       cwd: "",
       workers: [],

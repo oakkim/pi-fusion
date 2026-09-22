@@ -5,10 +5,11 @@ import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext, latestUserText } from "../src/utils.ts";
-import fusionExtension, { formatElapsedDuration, formatLiveStatusAction, formatToolStatusAction } from "../src/index.ts";
+import fusionExtension, { deriveWorkerContextTelemetry, executorUsesSubscription, formatElapsedDuration, formatLiveStatusAction, formatToolStatusAction } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { extractHandoffTask, formatPaneHistory, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
+import { extractHandoffTask, formatPaneHistory, formatPaneTranscript, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
 import { buildMonitorLaunchPlan, FusionMonitorPublisher, isMonitorOwnerAlive, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, shouldTerminateMonitor, type MonitorSnapshot } from "../src/monitor.ts";
 
 let pass = 0;
@@ -132,6 +133,16 @@ w2Tools.history.push(
 rt2.compactHistory(w2Tools, 7);
 eq("compact starts at user handoff", w2Tools.history.map((message) => message.role), ["user", "user", "assistant", "toolResult", "assistant"]);
 eq("compact keeps tool pair", (w2Tools.history[3] as { toolCallId: string }).toolCallId, "new");
+w2Tools.telemetry = { cumulative: zeroUsage(), context: { known: true, tokens: 100, window: 1_000 }, automaticCompaction: true };
+rt2.compactHistory(w2Tools, 4);
+eq("compaction marks context unknown", w2Tools.telemetry.context, { known: false, window: 1_000 });
+const legacyRuntime = new WorkerRuntime();
+legacyRuntime.restore([
+  { type: "custom", customType: "fusion-cost", data: { worker_id: "wrk_legacy", executor: "provider/legacy", usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 1, totalTokens: 16, cost: { total: 0.5 } } } },
+  { type: "custom", customType: "fusion-cost", data: { worker_id: "wrk_legacy", executor: "provider/legacy", usage: { input: 4, output: 1, totalTokens: 5, cost: { total: 0.25 } } } },
+  { type: "custom", customType: "fusion-worker", data: { worker: { id: "wrk_legacy", label: "legacy", executorModelId: "provider/legacy", history: [{ role: "user", content: "old", timestamp: 1 }, { role: "assistant", content: "old done", usage: { input: 1, cacheRead: 99, totalTokens: 100, cost: { total: 0.01 } }, stopReason: "stop", timestamp: 2 }], generation: 1, status: "idle", activeTurnId: null, failures: 0, createdAt: 1 }, turns: [] } },
+]);
+eq("legacy telemetry restored from cost entries", [legacyRuntime.getWorker("wrk_legacy")?.telemetry?.cumulative, legacyRuntime.getWorker("wrk_legacy")?.telemetry?.latestExecutor, legacyRuntime.getWorker("wrk_legacy")?.telemetry?.latest], [{ input: 14, output: 3, cacheRead: 3, cacheWrite: 1, totalTokens: 21, cost: 0.75 }, "provider/legacy", { input: 1, output: 0, cacheRead: 99, cacheWrite: 0, totalTokens: 100, cost: 0.01 }]);
 
 // --- 3. routing: turn keeps, compaction reconsiders ---
 const policy = new AdaptiveRoutingPolicy(
@@ -360,12 +371,46 @@ eq("consent override ask", applyConsentOverride({ executorToolsConsent: true }, 
 eq("consent override clear", applyConsentOverride({ executorToolsConsent: true }, {}), { executorToolsConsent: true });
 
 // --- 8b. cost accounting ---
-import { addUsage, zeroUsage } from "../src/cost.ts";
+import { addUsage, formatCompactTokens, formatUsageFooter, zeroUsage } from "../src/cost.ts";
 const c0 = zeroUsage();
 const c1 = addUsage(c0, { input: 10, output: 5, totalTokens: 15, cost: { total: 1 } });
 const c2 = addUsage(c1, { input: 3, cost: { total: 2 } });
 const c3 = addUsage(c2, undefined);
 eq("usage sum", c3, { input: 13, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: 3 });
+eq("Pi compact token formatter", [
+  formatCompactTokens(999), formatCompactTokens(1_000), formatCompactTokens(9_999),
+  formatCompactTokens(10_000), formatCompactTokens(1_000_000), formatCompactTokens(10_000_000),
+], ["999", "1.0k", "10.0k", "10k", "1.0M", "10M"]);
+eq("Pi usage footer semantics", formatUsageFooter({
+  input: 3_500_000, output: 449_000, cacheRead: 117_000_000, cacheWrite: 272_000,
+  totalTokens: 0, cost: 89.7, latest: { input: 3, cacheRead: 997, cacheWrite: 0 },
+  contextTokens: 82_416, contextWindow: 272_000, contextKnown: true,
+  subscription: true, automaticCompaction: true,
+}), "↑3.5M ↓449k R117M W272k CH99.7% $89.700 (sub) 30.3%/272k (auto)");
+eq("unknown usage footer", formatUsageFooter({ ...zeroUsage(), automaticCompaction: true }), "?/? (auto)");
+const contextFromUsage = deriveWorkerContextTelemetry([
+  { role: "user", content: "task", timestamp: 1 },
+  { role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input: 100, output: 20, cacheRead: 5, cacheWrite: 0, totalTokens: 125, cost: { total: 0 } }, stopReason: "stop", timestamp: 2 },
+  { role: "user", content: "trailing context", timestamp: 3 },
+] as never, 272_000);
+const ignoredErrorContext = deriveWorkerContextTelemetry([
+  { role: "assistant", content: [{ type: "text", text: "failed" }], usage: { input: 999, output: 999, cacheRead: 0, cacheWrite: 0, totalTokens: 1_998, cost: { total: 0 } }, stopReason: "error", timestamp: 4 },
+] as never, 272_000);
+eq("context derives usage plus trailing estimates", [contextFromUsage.known, contextFromUsage.tokens! > 125, contextFromUsage.window], [true, true, 272_000]);
+eq("context skips failed provider usage", ignoredErrorContext, { known: false, window: 272_000 });
+const subscriptionModel = { provider: "dual-provider", id: "model", input: ["text"] };
+const subscriptionRegistry = {
+  getAll: () => [subscriptionModel],
+  isUsingOAuth: () => false,
+  getProvider: () => ({ auth: { oauth: { isSubscription: true } } }),
+};
+const oauthSubscriptionRegistry = { ...subscriptionRegistry, isUsingOAuth: () => true };
+const kimiRegistry = { getAll: () => [{ provider: "kimi-coding", id: "kimi", input: ["text"] }], isUsingOAuth: () => false, getProvider: () => undefined };
+eq("subscription marker follows auth source", [
+  executorUsesSubscription(subscriptionRegistry as never, "dual-provider/model"),
+  executorUsesSubscription(oauthSubscriptionRegistry as never, "dual-provider/model"),
+  executorUsesSubscription(kimiRegistry as never, "kimi-coding/kimi"),
+], [false, true, true]);
 
 // --- 8c. executor dispatches through the configured model registry ---
 import { getSupportsTemperature, runExecutorTurn, supportsOpenAIFastMode } from "../src/llm.ts";
@@ -1673,6 +1718,12 @@ eq("pane roles", paneItems.map((item) => item.role), ["LEAD", "SIDEKICK", "TOOL"
 eq("pane excludes thinking", paneItems.some((item) => item.text.includes("private chain")), false);
 eq("pane shows tool call", paneItems[2], { role: "TOOL", text: 'call read {"path":"src/parser.ts"}' });
 eq("pane shows tool result", paneItems[3], { role: "TOOL", text: "read result: file contents" });
+const structuredItems = formatPaneTranscript(paneHistory);
+eq("structured transcript pairs tool call/result", [structuredItems.map((item) => item.kind), structuredItems.find((item) => item.kind === "tool")], [
+  ["user", "assistant", "tool", "assistant"],
+  { kind: "tool", role: "TOOL", id: "call-1", name: "read", arguments: '{"path":"src/parser.ts"}', status: "success", output: "file contents" },
+]);
+eq("structured transcript excludes thinking", structuredItems.some((item) => "text" in item && item.text.includes("private chain")), false);
 const paneWorker = {
   id: "wrk_test",
   label: "parser",
@@ -1798,14 +1849,52 @@ const monitorSnapshot: MonitorSnapshot = {
 };
 const monitorWide = renderMonitorScreen(monitorSnapshot, 110, 28, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
 const monitorNarrow = renderMonitorScreen(monitorSnapshot, 64, 20, { scroll: 0, follow: false });
-eq("monitor screen dimensions", [monitorWide.lines.length, monitorWide.lines.every((line) => visibleWidth(line) <= 110), monitorNarrow.lines.length, monitorNarrow.lines.every((line) => visibleWidth(line) <= 64)], [28, true, 20, true]);
+const monitorNarrowFollowing = renderMonitorScreen(monitorSnapshot, 64, 20, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
+eq("monitor screen dimensions", [monitorWide.lines.length, monitorWide.lines.every((line) => visibleWidth(line) <= 110), monitorNarrow.lines.length, monitorNarrow.lines.every((line) => visibleWidth(line) <= 64), monitorNarrowFollowing.lines.length, monitorNarrowFollowing.lines.every((line) => visibleWidth(line) <= 64)], [28, true, 20, true, 20, true]);
+eq("monitor narrow keeps transcript beside coordination", monitorNarrowFollowing.lines.some((line) => line.includes("bash")), true);
+const shortWideMonitor = renderMonitorScreen(monitorSnapshot, 80, 10, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
+const shortNarrowMonitor = renderMonitorScreen(monitorSnapshot, 64, 10, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
+eq("monitor short coordination stays visible", [shortWideMonitor.lines.length, shortWideMonitor.lines.every((line) => visibleWidth(line) <= 80), shortWideMonitor.lines.some((line) => line.includes("Steering")), shortWideMonitor.lines.some((line) => line.includes("latest")), shortWideMonitor.lines.some((line) => line.includes("next")), shortNarrowMonitor.lines.length, shortNarrowMonitor.lines.every((line) => visibleWidth(line) <= 64), shortNarrowMonitor.lines.some((line) => line.includes("Steering")), shortNarrowMonitor.lines.some((line) => line.includes("latest")), shortNarrowMonitor.lines.some((line) => line.includes("next"))], [10, true, true, true, true, 10, true, true, true, true]);
+initTheme("dark");
+const richMonitor = renderMonitorScreen({
+  ...monitorSnapshot,
+  schemaVersion: 2,
+  workers: [{
+    ...monitorSnapshot.workers[0]!,
+    history: [
+      { kind: "user", role: "LEAD", text: "hello\u001b]133;A\u0007" },
+      { kind: "assistant", role: "SIDEKICK", text: "**answer**\u009d133;B\u009c" },
+    ],
+  }],
+}, 80, 16, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
+const richMonitorText = richMonitor.lines.join("\n");
+eq("monitor rich render strips generated OSC", [richMonitorText.includes("\u001b]"), richMonitorText.includes("\u009d"), richMonitorText.includes("\u009c"), richMonitor.lines.every((line) => visibleWidth(line) <= 80)], [false, false, false, true]);
+const longLabelMonitor = renderMonitorScreen({ ...monitorSnapshot, workers: [{ ...monitorSnapshot.workers[0]!, label: "very-long-worker-label-".repeat(20) }] }, 110, 28, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
+eq("monitor worker badges survive long labels", longLabelMonitor.lines.some((line) => line.includes("S2 Q1")), true);
 eq("monitor follows live tail", [monitorWide.selectedWorkerId, monitorWide.scroll, monitorWide.maxScroll, monitorWide.lines.some((line) => line.includes("bash"))], ["wrk_monitor", monitorWide.maxScroll, monitorWide.maxScroll, true]);
+eq("monitor keeps coordination fixed while following", [monitorWide.lines.some((line) => line.includes("Steering 2")), monitorWide.lines.some((line) => line.includes("Queue 1")), monitorWide.lines.some((line) => line.includes("latest"))], [true, true, true]);
 eq("monitor strips injected terminal controls", [
   sanitizeMonitorText("safe\u001b]2;INJECTED\u0007"),
   sanitizeMonitorText("safe\u009b2JINJECT").includes("\u009b"),
   monitorWide.lines.some((line) => line.includes("INJECTED")),
 ], ["safe", false, false]);
 eq("monitor parser rejects invalid snapshots", [parseMonitorSnapshot("{}"), parseMonitorSnapshot(JSON.stringify(monitorSnapshot))?.workers.length], [undefined, 1]);
+const structuredMonitorRaw = JSON.stringify({
+  ...monitorSnapshot,
+  schemaVersion: 2,
+  workers: [{
+    ...monitorSnapshot.workers[0],
+    queuedFollowups: 13,
+    steeringUpdates: 14,
+    coordination: {
+      steering: Array.from({ length: 40 }, (_, index) => ({ id: `str_${index}`, turnId: "trn_monitor", status: index % 2 ? "injected" : "pending", preview: `preview ${index}`, enqueuedAt: Date.now() - index * 1_000 })),
+      queue: Array.from({ length: 40 }, (_, index) => ({ id: `qfu_${index}`, status: "queued", strategy: "queue", preview: `queued ${index}`, enqueuedAt: Date.now() - index * 1_000 })),
+    },
+    history: [{ kind: "user", role: "LEAD", text: "visible task" }, { kind: "assistant", role: "SIDEKICK", text: "visible answer" }, { kind: "tool", role: "TOOL", id: "tool", name: "read", arguments: "{}", output: "visible result", status: "success" }],
+  }],
+});
+const parsedStructuredMonitor = parseMonitorSnapshot(structuredMonitorRaw)!;
+eq("monitor structured schema is bounded", [parsedStructuredMonitor.schemaVersion, parsedStructuredMonitor.workers[0]!.coordination!.steering.length, parsedStructuredMonitor.workers[0]!.coordination!.queue.length, parsedStructuredMonitor.workers[0]!.steeringUpdates, parsedStructuredMonitor.workers[0]!.queuedFollowups], [2, 12, 12, 14, 13]);
 eq("monitor detects dead or stale publisher", [
   isMonitorOwnerAlive(process.pid),
   shouldTerminateMonitor(monitorSnapshot),

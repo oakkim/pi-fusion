@@ -599,7 +599,7 @@ function isFiniteNumber(value: unknown): value is number {
 function normalizeLive(value: unknown): LiveActivity | undefined {
   if (!value || typeof value !== "object") return undefined;
   const live = value as Record<string, unknown>;
-  if ((live.phase !== "waiting" && live.phase !== "thinking" && live.phase !== "responding" && live.phase !== "tool")
+  if ((live.phase !== "queued" && live.phase !== "waiting" && live.phase !== "thinking" && live.phase !== "responding" && live.phase !== "tool")
     || !isFiniteNumber(live.startedAt) || typeof live.text !== "string" || !Array.isArray(live.tools)) return undefined;
   const tools = live.tools.flatMap((raw) => {
     if (!raw || typeof raw !== "object") return [];

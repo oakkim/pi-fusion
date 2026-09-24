@@ -27,7 +27,7 @@ export type PaneTranscriptItem =
       status: "running" | "success" | "error";
     };
 
-export type LivePhase = "waiting" | "thinking" | "responding" | "tool";
+export type LivePhase = "queued" | "waiting" | "thinking" | "responding" | "tool";
 
 export interface LiveToolActivity {
   id: string;

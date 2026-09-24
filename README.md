@@ -33,12 +33,12 @@ Lead (your model, planner/reviewer)
 - Sidekick keeps **independent persistent history** per worker (`WorkerRuntime`). Its final visible result is steered into the Lead at the next safe checkpoint after completion; private thinking is never forwarded.
 - Spawn and follow-up return IDs immediately, so the Lead and user can keep talking while the worker runs. Idle/queued follow-ups append to the same history with bumped `generation` (`<fusion_handoff generation="N">`); a busy `steer` stays inside the active generation.
 - Independent compaction per worker (`maxHistoryMessages`, default 40; keeps first + last N-1) with routing reconsidered at that boundary.
-- Mutating tools (bash/edit/write) require trusted project + consent, and mutating runs are serialized — same fail-closed posture as pi-devin-fusion.
+- Mutating tools (bash/edit/write) require trusted project + consent. Mutating turns are serialized per checkout; workers in separate worktrees can mutate in parallel when writes stay inside those worktrees. Worktrees are not a filesystem sandbox. The monitor distinguishes turns queued for a shared checkout from turns waiting on the executor.
 - Session journal: worker and inquiry snapshots are appended as `fusion-worker` / `fusion-inquiry` custom entries and restored on `session_start` (best-effort durable across `/resume`).
 
 ## Worktrees (v0.2)
 
-Write work goes to an isolated checkout so parallel workers never share a directory:
+Write work goes to an isolated checkout so workers can mutate separate directories in parallel:
 
 ```
 spawn worktree=parser -> ~/.pi/agent/fusion-worktrees/<proj>/parser (branch pi-fusion/parser)

@@ -11,6 +11,7 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, formatPaneTranscript, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
 import { buildMonitorLaunchPlan, FusionMonitorPublisher, isMonitorOwnerAlive, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, shouldTerminateMonitor, type MonitorSnapshot } from "../src/monitor.ts";
+import { runSerialized } from "../src/mutation-queue.ts";
 
 let pass = 0;
 let fail = 0;
@@ -20,6 +21,49 @@ function eq(name: string, a: unknown, b: unknown): void {
   if (sa === sb) { pass++; console.log(`ok   ${name}`); }
   else { fail++; console.log(`FAIL ${name}\n  got:      ${sa}\n  expected: ${sb}`); }
 }
+
+// Mutations in one checkout queue, while isolated worktree paths remain parallel.
+const queueEvents: string[] = [];
+let releaseFirstMutation!: () => void;
+const firstMutationGate = new Promise<void>((resolve) => { releaseFirstMutation = resolve; });
+const firstMutation = runSerialized("/tmp/fusion-queue-root", async () => {
+  queueEvents.push("first-start");
+  await firstMutationGate;
+  queueEvents.push("first-end");
+});
+const secondMutation = runSerialized("/tmp/fusion-queue-root", async () => {
+  queueEvents.push("second-run");
+}, undefined, {
+  onQueued: () => queueEvents.push("second-queued"),
+  onStart: () => queueEvents.push("second-start"),
+});
+const independentMutation = runSerialized("/tmp/fusion-queue-other", async () => {
+  queueEvents.push("other-run");
+});
+await independentMutation;
+await Promise.resolve();
+eq("mutation queue exposes shared-root wait and permits independent roots", [
+  queueEvents.includes("second-queued"),
+  queueEvents.includes("first-start"),
+  queueEvents.includes("other-run"),
+  queueEvents.includes("second-start"),
+], [true, true, true, false]);
+releaseFirstMutation();
+await Promise.all([firstMutation, secondMutation]);
+eq("shared-root mutations preserve queue order", queueEvents.slice(-3), ["first-end", "second-start", "second-run"]);
+
+let releaseAbortBlocker!: () => void;
+const abortBlockerGate = new Promise<void>((resolve) => { releaseAbortBlocker = resolve; });
+const abortBlocker = runSerialized("/tmp/fusion-abort-root", async () => { await abortBlockerGate; });
+const abortController = new AbortController();
+let abortedMutationRan = false;
+const abortedMutation = runSerialized("/tmp/fusion-abort-root", async () => { abortedMutationRan = true; }, abortController.signal);
+abortController.abort();
+const abortRejected = await abortedMutation.then(() => false, () => true);
+releaseAbortBlocker();
+await abortBlocker;
+await new Promise((resolve) => setTimeout(resolve, 0));
+eq("aborted queued mutation never starts", [abortRejected, abortedMutationRan], [true, false]);
 
 // --- 1. spawn -> finish -> followup keeps same worker/history ---
 const rt = new WorkerRuntime();
@@ -1841,6 +1885,10 @@ eq("live pane respects available height", [crowdedPane.length <= 17, crowdedPane
 const paneController = new FusionPaneController((id) => id === "wrk_test" ? paneWorker : undefined);
 paneController.restore({ visible: true, workerId: "wrk_test" });
 const liveToken = paneController.beginLive("wrk_test", Date.now() - 3_000);
+paneController.updateLive("wrk_test", { kind: "phase", phase: "queued", replaceText: true }, liveToken);
+eq("pane distinguishes queued mutation from executor wait", paneController.getLive("wrk_test")?.phase, "queued");
+paneController.updateLive("wrk_test", { kind: "phase", phase: "waiting", replaceText: true }, liveToken);
+eq("live status reports executor wait", formatLiveStatusAction(paneController.getLive("wrk_test")), "waiting");
 paneController.updateLive("wrk_test", { kind: "phase", phase: "thinking", replaceText: true }, liveToken);
 paneController.updateLive("wrk_test", { kind: "tool_start", toolId: "call-1", name: "bash", arguments: '{"command":"echo hi"}' }, liveToken);
 paneController.updateLive("wrk_test", { kind: "tool_update", toolId: "call-1", output: "partial output" }, liveToken);
@@ -1849,6 +1897,7 @@ paneController.updateLive("wrk_test", { kind: "tool_start", toolId: "call-2", na
 paneController.updateLive("wrk_test", { kind: "tool_end", toolId: "call-2", ok: false, output: "failed" }, liveToken);
 const liveActivity = paneController.getLive("wrk_test");
 eq("pane live activity lifecycle", [liveActivity?.phase, liveActivity?.tools[0]?.name, liveActivity?.tools[0]?.output, liveActivity?.tools[0]?.status, liveActivity?.tools[1]?.status], ["tool", "bash", "final output", "success", "error"]);
+eq("live status reports queued phase", formatLiveStatusAction({ phase: "queued", startedAt: Date.now(), text: "", tools: [] }), "queued");
 eq("pane live state is transient", [paneController.getLive("wrk_test") !== undefined, paneController.liveTimerActive], [true, true]);
 paneController.clearLive("wrk_test", liveToken);
 eq("pane live state clears", [paneController.getLive("wrk_test"), paneController.liveTimerActive], [undefined, false]);
@@ -1934,6 +1983,13 @@ eq("monitor strips injected terminal controls", [
   monitorWide.lines.some((line) => line.includes("INJECTED")),
 ], ["safe", false, false]);
 eq("monitor parser rejects invalid snapshots", [parseMonitorSnapshot("{}"), parseMonitorSnapshot(JSON.stringify(monitorSnapshot))?.workers.length], [undefined, 1]);
+const queuedMonitorSnapshot = {
+  ...monitorSnapshot,
+  workers: [{ ...monitorSnapshot.workers[0]!, live: { phase: "queued" as const, startedAt: Date.now(), text: "", tools: [] } }],
+};
+const parsedQueuedMonitor = parseMonitorSnapshot(JSON.stringify(queuedMonitorSnapshot));
+const queuedMonitorRender = renderMonitorScreen(queuedMonitorSnapshot, 80, 28, { selectedWorkerId: "wrk_monitor", scroll: 0, follow: true });
+eq("monitor shows mutation-queue status", [parsedQueuedMonitor?.workers[0]?.live?.phase, queuedMonitorRender.lines.some((line) => line.includes("Live") && line.includes("queued"))], ["queued", true]);
 const structuredMonitorRaw = JSON.stringify({
   ...monitorSnapshot,
   schemaVersion: 2,

@@ -52,6 +52,7 @@ import { WorkerRuntime, type WorkerContextTelemetry, type WorkerRecord } from ".
 import { InquiryRuntime, type InquiryThread, type InquiryTurn } from "./inquiry.ts";
 import { fusionArgumentCompletions, isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, parseFusionCommand, type FusionMode } from "./mode.ts";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree } from "./worktree.ts";
+import { runSerialized } from "./mutation-queue.ts";
 
 const ContextMode = Type.Union([Type.Literal("none"), Type.Literal("recent")], { default: "none" });
 
@@ -119,8 +120,6 @@ const InterruptParams = Type.Object({
   cancel_queued: Type.Optional(Type.Boolean({ description: "Also cancel pending steering updates and queued follow-ups. Default true." })),
 });
 
-/** Serialize mutating executor runs to avoid clobbered writes (port of pi-devin-fusion). */
-let mutationQueue: Promise<unknown> = Promise.resolve();
 function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return promise;
   return new Promise<T>((resolve, reject) => {
@@ -132,12 +131,6 @@ function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T>
     if (signal.aborted) onAbort();
     else signal.addEventListener("abort", onAbort, { once: true });
   });
-}
-
-function runSerialized<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-  const run = mutationQueue.then(fn, fn);
-  mutationQueue = run.then(() => undefined, () => undefined);
-  return raceWithAbort(run, signal);
 }
 
 function userMsg(text: string): Message {
@@ -994,7 +987,13 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
 
     try {
       const mutating = isMutatingSelection(cfg.executorTools);
-      const result = mutating ? await runSerialized(exec, signal) : await exec();
+      const mutationScope = worker.worktree?.path ?? ctx.cwd;
+      const result = mutating
+        ? await runSerialized(mutationScope, exec, signal, {
+          onQueued: () => pane.updateLive(workerId, { kind: "phase", phase: "queued", replaceText: true }, liveToken),
+          onStart: () => pane.updateLive(workerId, { kind: "phase", phase: "waiting", replaceText: true }, liveToken),
+        })
+        : await exec();
       signal.throwIfAborted();
       const output = getTextContent(result.message);
       const responseContext = deriveWorkerContextTelemetry(
@@ -1842,7 +1841,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       "If the project checkout is dirty, resolve that first — merge refuses to clobber.",
     ],
     parameters: MergeParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const w: WorkerRecord | undefined = runtime.getWorker(params.worker_id);
       if (!w) return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} was not found.` }) }], details: { status: "error" } };
       if (!w.worktree) {
@@ -1859,7 +1858,10 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         return { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `Worker ${params.worker_id} is busy (${reason}); merge only idle workers.` }) }], details: { status: "error" } };
       }
       try {
-        const result = await runSerialized(() => mergeWorktree(w.worktree!, w.label));
+        // Reserve the source worktree against new turns and the shared checkout against other mutations/merges.
+        const result = await runSerialized(w.worktree.path, () =>
+          runSerialized(ctx.cwd, () => mergeWorktree(w.worktree!, w.label))
+        );
         return {
           content: [{ type: "text", text: JSON.stringify({ worker_id: w.id, status: "merged", branch: w.worktree.branch, committed: result.committed, merge: result.mergeOutput.slice(0, 2000) }, null, 2) }],
           details: { status: "merged" },

@@ -17,33 +17,58 @@ pi install git:github.com/oakkim/pi-fusion
 In an existing pi session, run `/reload`. Then choose a worker model:
 
 ```text
-/fusion-model
+/fusion model
 ```
 
-The picker searches provider names, model IDs, and display names. It fits the terminal height and supports arrow keys, Page Up/Down, Enter, and Esc. `/advisor-model` uses the same picker. RPC sessions use pi's standard selection dialog.
+The picker searches provider names, model IDs, and display names. It fits the terminal height and supports arrow keys, Page Up/Down, Enter, and Esc. `/advisor model` uses the same picker. RPC sessions use pi's standard selection dialog.
 
-Fusion starts in `available` mode: the Lead decides when to delegate. Ask for work normally, or use `/fusion on` to request the plan, delegate, and review workflow for each prompt. To enable the optional advisor, choose a model with `/advisor-model`.
+Fusion starts in `available` mode: the Lead decides when to delegate. Ask for work normally, or use `/fusion on` to request the plan, delegate, and review workflow for each prompt. To enable the optional advisor, choose a model with `/advisor model`.
 
-Worker writes require a trusted project and confirmation by default. Use `/fusion-consent allow` to allow them for the current session.
+Worker writes require a trusted project and confirmation by default. Use `/fusion consent allow` to allow them for the current session.
 
 ## Commands
 
-Commands without arguments open a picker, toggle a view, or show status as described below.
+pi-fusion adds just `/fusion` and `/advisor` to the slash-command menu. Enter either command without arguments to see its current status. Neither changes your settings.
 
-| Command | Purpose and arguments |
+Type a space after the command to see its subcommands. Start typing to filter suggestions, then use the arrow keys and Tab or Enter to select one. Type the next argument to get matching options, model names, or worker IDs. Model suggestions search providers, IDs, and display names; thinking suggestions match the selected model's capabilities.
+
+```text
+/fusion model
+/fusion thinking high
+/fusion fast on
+/advisor model
+/advisor thinking high
+/advisor fast on
+/advisor status
+```
+
+`/fusion model` and `/advisor model` open the searchable picker when no model is supplied. Add a `provider/model` to select it directly. `/fusion help` and `/advisor help` show the available commands.
+
+| Fusion command | Purpose |
 | --- | --- |
-| `/fusion` | Toggle `available` and forced mode. `on` requests the delegation workflow for each prompt; `available` lets the Lead decide; `off` blocks all `fusion_*` tools. Use `/fusion <prompt>` for one forced prompt while Fusion is enabled. |
-| `/fusion-model` | Select the executor. Accepts `provider/model`, `auto` for automatic selection, or `clear` to restore the config default. |
-| `/advisor-model` | Select the Lead advisor. Accepts `provider/model`, `off`, `clear`, or `status` to show its model and usage. |
-| `/fusion-thinking` | Select executor reasoning effort. Accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `clear`. |
-| `/fusion-fast` | Select OpenAI priority processing. `on` and `off` save a global preference; `default` removes it; `status` shows the effective setting. |
-| `/fusion-consent` | Select worker write consent. `allow` and `ask` apply to the session; `default` restores config; `status` shows the setting. |
-| `/fusion-status` | List workers and inquiry threads. |
-| `/fusion-ask <id> <question>` | Ask about a worker using its `wrk_...` ID, or continue an inquiry using its `inq_...` ID. |
-| `/fusion-monitor` | Open a separate read-only monitor. Also accepts `open`, `close`, and `status`. |
-| `/fusion-pane` | Toggle the optional worker overlay. Also accepts `open`, `close`, and a `wrk_...` ID. |
+| `/fusion` or `/fusion status` | Show the current mode, executor, workers, and inquiry threads. |
+| `/fusion on`, `/fusion available`, `/fusion off` | Request delegation for each prompt, let the Lead decide, or block `fusion_*` tools. |
+| `/fusion model [provider/model]` | Select the executor. `auto` uses automatic selection; `clear` restores the config default. |
+| `/fusion thinking [level]` | Select executor reasoning effort. `clear` restores the config default. |
+| `/fusion fast [action]` | Select OpenAI priority processing. `on` and `off` save a global preference; `default` removes it; `status` shows the setting. |
+| `/fusion consent [action]` | Select worker write consent. `allow` and `ask` apply to the session; `default` restores config; `status` shows the setting. |
+| `/fusion ask <id> <question>` | Ask about a worker using its `wrk_...` ID, or continue an inquiry using its `inq_...` ID. |
+| `/fusion monitor [action]` | Open a separate read-only monitor. Accepts `open`, `close`, or `status`. |
+| `/fusion pane [target]` | Toggle the optional worker overlay. Accepts `open`, `close`, `toggle`, or a worker ID. |
+| `/fusion run <prompt>` | Send one prompt through the delegation workflow while Fusion is enabled. |
 
-Mode, executor, thinking, consent, and advisor choices are stored in the session journal. Fast mode is the exception: its command saves a preference for current and future sessions.
+| Advisor command | Purpose |
+| --- | --- |
+| `/advisor` or `/advisor status` | Show the model, thinking, fast mode, and this branch's usage. |
+| `/advisor model [provider/model]` | Select an authenticated advisor model. |
+| `/advisor thinking [level]` | Select advisor reasoning effort. `clear` forgets the saved choice and restores config or follows the Lead. |
+| `/advisor fast [action]` | Select advisor priority processing. `on` and `off` save a global preference; `default` removes it; `status` shows the setting. |
+| `/advisor off` | Disable the advisor and remember that choice. |
+| `/advisor clear` | Forget the saved advisor model and restore the project config default. |
+
+Fusion mode, executor, thinking, and consent choices are stored in the session journal. Advisor model and thinking selections are also saved globally, so new sessions start with your last choices; existing branches retain their own selections. The two fast commands save separate global preferences for current and future sessions.
+
+The previous `/fusion-*` and `/advisor-model` commands are replaced by these subcommands. Saved preferences and sessions continue to work. Bare `/fusion` now shows status instead of toggling modes; use `/fusion run <prompt>` for the previous one-off prompt form.
 
 ## Working with workers
 
@@ -99,7 +124,7 @@ These serve different purposes:
 
 | | Lead advisor | Worker inquiry |
 | --- | --- | --- |
-| Entry point | `ask_advisor()` after selecting `/advisor-model` | `fusion_ask` or `/fusion-ask` |
+| Entry point | `ask_advisor()` after selecting `/advisor model` | `fusion_ask` or `/fusion ask` |
 | Context | Current Lead conversation | Snapshot of one worker's history and visible activity |
 | Model | Explicitly selected advisor model | Worker's executor, with executor fallback if unavailable |
 | Conversation | One stateless opinion per call | Persistent side conversation using `thread_id` |
@@ -107,7 +132,9 @@ These serve different purposes:
 
 The Lead can call `ask_advisor()` without arguments for a consequential decision, repeated failure, or complex review. Routine work does not require advice. The Lead checks the advice against evidence and makes the final decision. Workers cannot call the advisor, and `/fusion off` does not disable it.
 
-Advisor requests include the Lead's effective instructions, active compaction summary, current conversation, and full textual tool evidence. Private thinking and signatures are excluded, and images are marked unavailable. Oversized context is rejected without truncation: compact the Lead conversation or choose a larger model. Advisor reasoning follows the Lead's setting, clamped to the selected model's supported levels. An unavailable advisor never falls back to a different model.
+Advisor requests include the Lead's effective instructions, active compaction summary, current conversation, and full textual tool evidence. Private thinking and signatures are excluded, and images are marked unavailable. Oversized context is rejected without truncation: compact the Lead conversation or choose a larger model. An unavailable advisor never falls back to a different model.
+
+Advisor reasoning follows the Lead unless set with `/advisor thinking` or `advisorThinkingLevel`, and is clamped to the selected model's supported levels. `/advisor fast` controls priority processing independently of Fusion workers and the Lead. Both settings apply to the next advisor call.
 
 Worker inquiries run alongside the worker without changing its instructions. The worker never sees or remembers that side conversation. To act on an inquiry result, send a separate `fusion_followup`.
 
@@ -120,9 +147,9 @@ Fusion available • gpt-5.6-luna (max) • fast • Advisor on
 Fusion off • Advising…
 ```
 
-`fast` appears only when enabled for a supported model. Active workers show their current tool or visible response, elapsed time, and pending updates. Private thinking is never shown. `/advisor-model status` reports advisor attempts, tokens, and cost for the current branch.
+`fast` in the status line refers to the executor and appears only when enabled for a supported model. Active workers show their current tool or visible response, elapsed time, and pending updates. Private thinking is never shown. `/advisor status` reports advisor settings, attempts, tokens, and cost for the current branch.
 
-For more detail, open `/fusion-monitor`. On macOS it uses Ghostty when available, then Terminal.app. The separate window shows workers, visible conversation and tool output, steering and queue state, and usage.
+For more detail, open `/fusion monitor`. On macOS it uses Ghostty when available, then Terminal.app. The separate window shows workers, visible conversation and tool output, steering and queue state, and usage.
 
 | Monitor key | Action |
 | --- | --- |
@@ -132,15 +159,17 @@ For more detail, open `/fusion-monitor`. On macOS it uses Ghostty when available
 | `r` | Refresh |
 | `q` | Close the window |
 
-The monitor reads a local snapshot accessible only to the current user. It has no control socket or network listener and exits when the publisher stops. `/fusion-monitor close` stops publication and closes connected monitors.
+The monitor reads a local snapshot accessible only to the current user. It has no control socket or network listener and exits when the publisher stops. `/fusion monitor close` stops publication and closes connected monitors.
 
-`/fusion-pane` provides a smaller, optional overlay inside pi. It keeps the editor usable, can cover part of the transcript, and hides below 110 terminal columns. Closing it does not stop the worker.
+`/fusion pane` provides a smaller, optional overlay inside pi. It keeps the editor usable, can cover part of the transcript, and hides below 110 terminal columns. Closing it does not stop the worker.
 
 ## Configuration
 
 Use `.pi/fusion.json` for a trusted project or `~/.pi/agent/fusion.json` for global defaults. If `PI_CODING_AGENT_DIR` is set, the global file is under that directory.
 
-The first valid config file wins: trusted project first, global second. **The files are not merged.** An empty project config therefore uses built-in defaults rather than inheriting the global file's keys, except for the global fast preference described under [Priority processing](#priority-processing). Session overrides take precedence over the selected file.
+The first valid config file wins: trusted project first, global second. **The files are not merged.** An empty project config therefore uses built-in defaults rather than inheriting the global file's keys, except for saved Advisor choices and the global fast preferences described under [Priority processing](#priority-processing). Session overrides take precedence.
+
+Advisor commands automatically save `advisorModel`, `advisorThinkingLevel`, and `advisorFastMode` in the global file. Saved values take precedence over project defaults. `off` is remembered too. `/advisor clear`, `/advisor thinking clear`, and `/advisor fast default` remove the corresponding saved choice; model and thinking resets also clear the current branch's override.
 
 For example, replace these model IDs with ones available in your pi setup:
 
@@ -157,6 +186,8 @@ For example, replace these model IDs with ones available in your pi setup:
 | --- | --- | --- |
 | `executor` | Automatic | First authenticated text model other than the Lead, falling back to the Lead if necessary. An unavailable configured executor also falls back to automatic selection. |
 | `advisorModel` | Off | Explicit `provider/model`; `false` disables it. |
+| `advisorThinkingLevel` | Follow Lead | Advisor reasoning effort; clamped to the advisor model's supported levels. |
+| `advisorFastMode` | `false` | Request priority processing for a supported advisor model. |
 | `executorTools` | `"all"` | `"none"`, `"readonly"`, `"all"`, or a list of tool names. |
 | `executorToolsConsent` | `false` | Skip worker write confirmations when `true`; the project must still be trusted. |
 | `leadMutations` | `"allow"` | `"delegate"` blocks the Lead's `bash`, `edit`, and `write` tools, even with Fusion off. Reads remain available. |
@@ -169,7 +200,7 @@ For example, replace these model IDs with ones available in your pi setup:
 | `temperature` | `0.2` | Sampling temperature, from 0 to 2. |
 | `maxHistoryMessages` | `40` | Message-count trigger for compaction, from 4 to 200. Token limits can trigger it earlier. |
 
-Available worker tools are `read`, `grep`, `find`, `ls`, `bash`, `edit`, and `write`. The `readonly` set contains the first four. A toolset containing `bash`, `edit`, or `write` requires trust and consent when a spawn or follow-up is requested. `/fusion-consent allow` skips the confirmation, but cannot bypass trust.
+Available worker tools are `read`, `grep`, `find`, `ls`, `bash`, `edit`, and `write`. The `readonly` set contains the first four. A toolset containing `bash`, `edit`, or `write` requires trust and consent when a spawn or follow-up is requested. `/fusion consent allow` skips the confirmation, but cannot bypass trust.
 
 ### Model fallback
 
@@ -177,9 +208,11 @@ Each consecutive worker failure selects the next available model in `[executor, 
 
 ### Priority processing
 
-`/fusion-fast on` and `off` save `fastMode` globally and clear the current session's older fast override. The global boolean takes precedence over a project's `fastMode`. `default` removes that global preference and returns to the selected config's value or the built-in `false` default. Older restored sessions can still carry their own fast override.
+`/fusion fast on` and `off` save `fastMode` globally and clear the current session's older fast override. The global boolean takes precedence over a project's `fastMode`. `default` removes that global preference and returns to the selected config's value or the built-in `false` default. Older restored sessions can still carry their own fast override.
 
-Priority processing applies to direct OpenAI Responses and OpenAI Codex models. Unsupported fallback providers use their normal tier. It affects subsequent worker and inquiry turns, independently of Lead and Advisor settings. Priority pricing and availability depend on the provider and account.
+`/advisor fast` uses the same actions with its own `advisorFastMode` global preference. It affects subsequent advisor calls without changing worker or Lead settings. `/advisor fast status` shows whether it applies to the selected advisor.
+
+Priority processing applies to direct OpenAI Responses and OpenAI Codex models. Unsupported providers use their normal tier. Priority pricing and availability depend on the provider and account.
 
 ## Development
 

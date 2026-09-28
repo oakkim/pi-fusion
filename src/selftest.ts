@@ -8,7 +8,7 @@ import { buildRecentContext, latestUserText } from "../src/utils.ts";
 import fusionExtension, { deriveWorkerContextTelemetry, executorUsesSubscription, formatElapsedDuration, formatLiveStatusAction, formatToolStatusAction } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { getKeybindings, visibleWidth } from "@earendil-works/pi-tui";
+import { CombinedAutocompleteProvider, getKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, formatPaneTranscript, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
 import { buildMonitorLaunchPlan, FusionMonitorPublisher, isMonitorOwnerAlive, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, shouldTerminateMonitor, type MonitorSnapshot } from "../src/monitor.ts";
 import { runSerialized } from "../src/mutation-queue.ts";
@@ -1076,13 +1076,13 @@ try {
     appendEntry: (customType: string, data: unknown) => advisorAppend({ type: "custom", customType, data }),
   } as never, advisorDir);
   const advise = advisorTools.get("ask_advisor");
-  const advisorCommand = advisorCommands.get("advisor-model");
+  const advisorCommand = advisorCommands.get("advisor");
   advisor.start(advisorContext);
   const unconfiguredAdvice = await advise.execute("unconfigured", {}, undefined, undefined, advisorContext);
   eq("advisor is inactive until an explicit model is selected", [activeAdvisorTools.includes("ask_advisor"), unconfiguredAdvice.isError, advisorModelCalls], [false, true, 0]);
-  await advisorCommand.handler("opencode-go/missing", advisorContext);
+  await advisorCommand.handler("model opencode-go/missing", advisorContext);
   eq("advisor rejects invalid explicit models without fallback", [advisorNotice.includes("Unknown"), activeAdvisorTools.includes("ask_advisor"), advisorModelCalls], [true, false, 0]);
-  await advisorCommand.handler("opencode-go/advisor", advisorContext);
+  await advisorCommand.handler("model opencode-go/advisor", advisorContext);
   const selectedOptions = { selectedTools: ["ask_advisor"], sections: {} as Record<string, string> };
   advisor.preparePrompt(selectedOptions, "system", advisorContext);
   const advice = await advise.execute("ask", {}, undefined, undefined, advisorContext);
@@ -1135,6 +1135,90 @@ try {
   eq("advisor ignores untrusted project config", activeAdvisorTools.includes("ask_advisor"), false);
   await advisorCommand.handler("status", advisorContext);
   eq("advisor status reports recorded usage", advisorNotice.includes("$1.0000"), true);
+
+  // Independent advisor effort and priority must reach the provider, not just the UI.
+  advisor.start(advisorContext);
+  advisorComplete = async () => responseWithUsage([{ type: "text", text: "Check the result." }]);
+  writeFileSync(_join(advisorDir, "fusion.json"), JSON.stringify({ fastMode: true, preserved: "yes" }));
+  await advisorCommand.handler("thinking low", advisorContext);
+  const advisorThinkingEntry = advisorEntries.at(-1);
+  await advise.execute("low", {}, undefined, undefined, advisorContext);
+  eq("advisor effort is independent of Lead and executor settings", [advisorThinkingEntry.customType, advisorThinkingEntry.data.thinkingLevel, advisorOptions.reasoning, advisorOptions.serviceTier, advisorContext.thinkingLevel], ["fusion-advisor-thinking", "low", "low", undefined, "high"]);
+  await advisorCommand.handler("thinking off", advisorContext);
+  await advise.execute("off", {}, undefined, undefined, advisorContext);
+  eq("advisor off effort omits provider reasoning", advisorOptions.reasoning, undefined);
+  writeFileSync(_join(advisorDir, ".pi", "fusion.json"), JSON.stringify({ advisorModel: "opencode-go/advisor", advisorThinkingLevel: "medium", advisorFastMode: true }));
+  await advisorCommand.handler("thinking clear", advisorContext);
+  await advise.execute("config-effort", {}, undefined, undefined, advisorContext);
+  eq("advisor thinking clear restores config and unsupported priority is omitted", [advisorOptions.reasoning, advisorOptions.serviceTier], ["medium", undefined]);
+
+  await advisorCommand.handler("fast off", advisorContext);
+  const advisorGlobalOff = JSON.parse(readFileSync(_join(advisorDir, "fusion.json"), "utf8"));
+  eq("advisor fast preference preserves executor and unknown config keys", [advisorGlobalOff.advisorFastMode, advisorGlobalOff.fastMode, advisorGlobalOff.preserved], [false, true, "yes"]);
+  await advisorCommand.handler("fast on", advisorContext);
+  await advise.execute("unsupported-fast", {}, undefined, undefined, advisorContext);
+  eq("unsupported advisor provider never receives priority", [advisorOptions.serviceTier, advisorNotice.toLowerCase().includes("not applied")], [undefined, true]);
+
+  const priorityAdvisor = { ...advisorModel, provider: "openai-codex", id: "gpt-5.6-luna", api: "openai-codex-responses" };
+  const plainAdvisor = { ...advisorModel, id: "plain", reasoning: false };
+  advisorContext.modelRegistry.getAll = advisorContext.modelRegistry.getAvailable = () => [advisorModel, priorityAdvisor, plainAdvisor];
+  advisorContext.modelRegistry.stream = (model: any, context: any, options: any) => {
+    advisorModelCalls++; advisorRequest = context; advisorOptions = options;
+    return resultStream(advisorComplete(model, context, options));
+  };
+  await advisorCommand.handler("model openai-codex/gpt-5.6-luna", advisorContext);
+  await advisorCommand.handler("thinking high", advisorContext);
+  await advise.execute("priority", {}, undefined, undefined, advisorContext);
+  eq("advisor priority uses the full provider path with reasoning effort and no tools", [advisorOptions.reasoningEffort, advisorOptions.serviceTier, advisorRequest.tools], ["high", "priority", undefined]);
+  await advisorCommand.handler("fast off", advisorContext);
+  await advise.execute("normal-tier", {}, undefined, undefined, advisorContext);
+  eq("advisor fast off restores the simple provider path", [advisorOptions.reasoning, advisorOptions.serviceTier, advisorOptions.reasoningEffort], ["high", undefined, undefined]);
+  await advisorCommand.handler("status", advisorContext);
+  eq("advisor status exposes its effort and fast setting", [advisorNotice.toLowerCase().includes("thinking high"), advisorNotice.toLowerCase().includes("fast off")], [true, true]);
+
+  const journalBeforeInvalid = advisorEntries.length;
+  const configBeforeInvalid = readFileSync(_join(advisorDir, "fusion.json"), "utf8");
+  for (const args of ["thinking turbo", "thinking high extra", "fast turbo", "fast on extra"]) await advisorCommand.handler(args, advisorContext);
+  eq("invalid advisor options cannot change config or journal", [advisorEntries.length, readFileSync(_join(advisorDir, "fusion.json"), "utf8")], [journalBeforeInvalid, configBeforeInvalid]);
+  advisor.stop();
+  advisor.start(advisorContext);
+  await advise.execute("resumed-settings", {}, undefined, undefined, advisorContext);
+  eq("advisor settings survive lifecycle restoration", [advisorOptions.reasoning, advisorOptions.serviceTier], ["high", undefined]);
+  await advisorCommand.handler("model opencode-go/plain", advisorContext);
+  await advise.execute("nonreasoner", {}, undefined, undefined, advisorContext);
+  eq("switching advisor models clamps an existing effort preference", advisorOptions.reasoning, undefined);
+  await advisorCommand.handler("fast default", advisorContext);
+  const advisorGlobalDefault = JSON.parse(readFileSync(_join(advisorDir, "fusion.json"), "utf8"));
+  eq("advisor fast default removes only its own global preference", ["advisorFastMode" in advisorGlobalDefault, advisorGlobalDefault.fastMode, advisorGlobalDefault.preserved], [false, true, "yes"]);
+  await advisorCommand.handler("thinking clear", advisorContext);
+  writeFileSync(_join(advisorDir, ".pi", "fusion.json"), JSON.stringify({ advisorModel: "opencode-go/advisor", advisorThinkingLevel: "invalid", advisorFastMode: "yes" }));
+  await advisorCommand.handler("clear", advisorContext);
+  await advise.execute("invalid-config", {}, undefined, undefined, advisorContext);
+  eq("invalid advisor config falls back to Lead effort and normal tier", [advisorOptions.reasoning, advisorOptions.serviceTier], ["high", undefined]);
+
+  await advisorCommand.handler("model openai-codex/gpt-5.6-luna", advisorContext);
+  await advisorCommand.handler("thinking high", advisorContext);
+  await advisorCommand.handler("fast on", advisorContext);
+  const lastAdvisor = loadGlobalConfig(advisorDir);
+  eq("last advisor model effort and fast choices are saved together", [lastAdvisor.advisorModel, lastAdvisor.advisorThinkingLevel, lastAdvisor.advisorFastMode, lastAdvisor.fastMode], ["openai-codex/gpt-5.6-luna", "high", true, true]);
+  const nextTools = new Map<string, any>();
+  const nextCommands = new Map<string, any>();
+  const nextEntries: any[] = [];
+  const nextContext = { ...advisorContext, thinkingLevel: "off", sessionManager: { getBranch: () => nextEntries, getEntries: () => [], getLeafId: () => null } };
+  const nextAdvisor = registerAdvisor({ registerTool: (tool: any) => nextTools.set(tool.name, tool), registerCommand: (name: string, command: any) => nextCommands.set(name, command), appendEntry: (customType: string, data: unknown) => nextEntries.push({ type: "custom", customType, data }) } as never, advisorDir);
+  nextAdvisor.start(nextContext);
+  const restoredAdvice = await nextTools.get("ask_advisor").execute("fresh-session", {}, undefined, undefined, nextContext);
+  eq("a fresh advisor instance restores the last choices over project defaults", [restoredAdvice.details.model, advisorOptions.reasoningEffort, advisorOptions.serviceTier], ["openai-codex/gpt-5.6-luna", "high", "priority"]);
+  await nextCommands.get("advisor").handler("off", nextContext);
+  eq("advisor off is remembered for future sessions", loadGlobalConfig(advisorDir).advisorModel, false);
+  for (const args of ["clear", "thinking clear", "fast default"]) await nextCommands.get("advisor").handler(args, nextContext);
+  const clearedAdvisor = JSON.parse(readFileSync(_join(advisorDir, "fusion.json"), "utf8"));
+  eq("advisor resets forget saved choices without changing executor settings", ["advisorModel" in clearedAdvisor, "advisorThinkingLevel" in clearedAdvisor, "advisorFastMode" in clearedAdvisor, clearedAdvisor.fastMode, clearedAdvisor.preserved], [false, false, false, true, "yes"]);
+  writeFileSync(_join(advisorDir, "fusion.json"), "[]");
+  const beforeFailedSave = nextEntries.length;
+  for (const args of ["model openai-codex/gpt-5.6-luna", "thinking high", "fast on"]) await nextCommands.get("advisor").handler(args, nextContext);
+  eq("failed advisor saves preserve the file and session choices", [readFileSync(_join(advisorDir, "fusion.json"), "utf8"), nextEntries.length, advisorNotice.startsWith("Could not")], ["[]", beforeFailedSave, true]);
+  nextAdvisor.stop();
   advisor.stop();
 } finally { rmSync(advisorDir, { recursive: true, force: true }); }
 
@@ -1967,18 +2051,82 @@ try {
 }
 
 // --- 9. forced mode helpers ---
-import { forceFusionPrompt, fusionArgumentCompletions, isForcePrompt, modeLabel, normalizeMode, parseFusionCommand } from "../src/mode.ts";
+import { forceFusionPrompt, isForcePrompt, modeLabel, normalizeMode } from "../src/mode.ts";
 eq("normalizeMode", [normalizeMode("forced"), normalizeMode("bogus"), normalizeMode(undefined)], ["forced", "available", "available"]);
-eq("parse set", parseFusionCommand("on"), { kind: "set", mode: "forced" });
-eq("parse off alias", parseFusionCommand("disable"), { kind: "set", mode: "off" });
-eq("parse toggle", parseFusionCommand("  "), { kind: "toggle" });
-eq("parse once", parseFusionCommand("fix it"), { kind: "once", prompt: "fix it" });
 const fp = forceFusionPrompt("do X");
 eq("force marker roundtrip", isForcePrompt(fp) && fp.includes("do X") && fp.includes("LEAD"), true);
 eq("forced prompt allows bounded unknown-file exploration", fp.includes("bounded codebase exploration") && fp.includes("rather than guessing paths"), true);
 eq("force idempotent-guard", isForcePrompt("just hello"), false);
-eq("completions", fusionArgumentCompletions("o")?.map((c) => c.value), ["on", "off"]);
 eq("modeLabel", [modeLabel("forced"), modeLabel("off"), modeLabel("available")], ["Fusion forced", "Fusion off", "Fusion available"]);
+
+// Root commands use Pi's real completion replacement rules, including nested arguments.
+const commandGroupDir = mkdtempSync(_join(tmpdir(), "fusion-command-groups-"));
+try {
+  const grouped = new Map<string, any>();
+  const events = new Map<string, any>();
+  const journal: any[] = [];
+  const notices: string[] = [];
+  const sentPrompts: string[] = [];
+  const workerModel = { provider: "test", id: "worker-basic", name: "Friendly Worker", input: ["text"], reasoning: false };
+  const wiseModel = { provider: "test", id: "advisor-pro", name: "Wise Advisor", input: ["text"], reasoning: true };
+  let availableModels = [workerModel, wiseModel];
+  const ctx: any = {
+    cwd: commandGroupDir, mode: "rpc", hasUI: false, model: wiseModel, isProjectTrusted: () => false,
+    ui: { notify: (text: string) => notices.push(text), setStatus() {} },
+    sessionManager: { getBranch: () => journal, getSessionId: () => undefined },
+    modelRegistry: { getAll: () => availableModels, getAvailable: () => availableModels, hasConfiguredAuth: () => true },
+  };
+  fusionExtension({
+    registerCommand: (name: string, command: any) => grouped.set(name, command), registerTool() {},
+    on: (event: string, handler: any) => events.set(event, handler),
+    appendEntry: (customType: string, data: unknown) => journal.push({ type: "custom", customType, data }),
+    sendUserMessage: (text: string) => sentPrompts.push(text),
+  } as never, { agentDir: commandGroupDir });
+  await events.get("session_start")({}, ctx);
+  const fusion = grouped.get("fusion");
+  const advisor = grouped.get("advisor");
+  eq("slash menu contains only Fusion and Advisor roots", [...grouped.keys()].sort(), ["advisor", "fusion"]);
+  await fusion.handler("", ctx);
+  await advisor.handler("", ctx);
+  eq("bare root commands show status without changing state", [journal.length, sentPrompts.length, notices.join("\n").includes("Fusion available"), notices.join("\n").includes("Advisor:")], [0, 0, true, true]);
+  for (const input of ["modle", "fix this file", "run", "off extra"]) await fusion.handler(input, ctx);
+  await advisor.handler("modelish", ctx);
+  eq("invalid commands cannot change settings or send model prompts", [journal.length, sentPrompts.length], [0, 0]);
+
+  const provider = new CombinedAutocompleteProvider([...grouped].map(([name, command]) => ({ name, ...command })), commandGroupDir);
+  const suggestions = async (line: string) => provider.getSuggestions([line], 0, line.length, { signal: new AbortController().signal });
+  const complete = async (line: string, value: string) => {
+    const result = await suggestions(line);
+    const item = result?.items.find((item) => item.value.trim() === value);
+    return item && provider.applyCompletion([line], 0, line.length, item, result!.prefix).lines[0];
+  };
+  eq("subcommand completion leaves space for the next argument", await complete("/fusion mo", "model"), "/fusion model ");
+  eq("model completion matches display names and retains its parent command", await complete("/fusion model Friendly", "model test/worker-basic"), "/fusion model test/worker-basic");
+  eq("advisor model completion uses the same nested contract", await complete("/advisor model Wise", "model test/advisor-pro"), "/advisor model test/advisor-pro");
+  eq("nested fixed arguments preserve the full command", await complete("/fusion fast o", "fast on"), "/fusion fast on");
+  await fusion.handler("model test/worker-basic", ctx);
+  const thinkingItems = (await suggestions("/fusion thinking "))?.items.map((item) => item.value.trim()) ?? [];
+  eq("thinking suggestions follow the selected model's capabilities", [thinkingItems.includes("thinking off"), thinkingItems.includes("thinking high")], [true, false]);
+  await advisor.handler("model test/advisor-pro", ctx);
+  eq("grouped selectors preserve existing session journal keys", journal.map((entry) => entry.customType), ["fusion-executor", "fusion-advisor-model"]);
+  eq("advisor nested options complete through the same native contract", [await complete("/advisor thinking h", "thinking high"), await complete("/advisor fast o", "fast on")], ["/advisor thinking high", "/advisor fast on"]);
+  await advisor.handler("model test/worker-basic", ctx);
+  const advisorThinkingItems = (await suggestions("/advisor thinking "))?.items.map((item) => item.value.trim()) ?? [];
+  eq("advisor thinking completion follows its own selected model", [advisorThinkingItems.includes("thinking off"), advisorThinkingItems.includes("thinking high"), advisorThinkingItems.includes("thinking clear")], [true, false, true]);
+  availableModels = [];
+  eq("model suggestions refresh when availability changes", (await suggestions("/advisor model Wise"))?.items.length ?? 0, 0);
+  availableModels = [workerModel, wiseModel];
+  await fusion.handler("on", ctx);
+  const modeEntriesBeforeStatus = journal.length;
+  await fusion.handler("", ctx);
+  eq("bare Fusion never toggles forced mode", [journal.length, notices.at(-1)?.includes("Fusion forced")], [modeEntriesBeforeStatus, true]);
+  await fusion.handler("run Review this\nKeep the existing API", ctx);
+  eq("explicit run preserves the entire task", [sentPrompts.length, sentPrompts[0]?.includes("User task:\nReview this\nKeep the existing API")], [1, true]);
+  await fusion.handler("off", ctx);
+  await fusion.handler("run Must not start", ctx);
+  eq("Fusion off still blocks explicit runs", sentPrompts.length, 1);
+  await events.get("session_shutdown")({}, ctx);
+} finally { rmSync(commandGroupDir, { recursive: true, force: true }); }
 
 // --- 10. Fusion augments the built-in footer instead of replacing it ---
 const sessionStartHandlers: Array<(event: unknown, ctx: any) => Promise<void>> = [];
@@ -2046,7 +2194,7 @@ const afterCancelledTree = await cancelledTreeTool.execute("after-cancelled-tree
 eq("cancelled tree navigation does not disable advisor", [afterCancelledTree.details.status, cancelledTreeRequests], ["completed", 1]);
 await cancelledTreeHandlers.get("session_shutdown")({}, cancelledTreeContext);
 
-// --- 11. /fusion-thinking persists a session override ---
+// --- 11. /fusion thinking persists a session override ---
 const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 const thinkingBranch: unknown[] = [];
 let thinkingNotice = "";
@@ -2057,7 +2205,7 @@ fusionExtension({
   appendEntry: (customType: string, data: unknown) => thinkingBranch.push({ type: "custom", customType, data }),
 } as never);
 const thinkingModel = { provider: "test", id: "reasoner", input: ["text"], reasoning: true };
-await commands.get("fusion-thinking")!.handler("high", {
+await commands.get("fusion")!.handler("thinking high", {
   cwd: "/tmp",
   mode: "tui",
   hasUI: true,
@@ -2077,7 +2225,7 @@ await commands.get("fusion-thinking")!.handler("high", {
 const thinkingEntry = thinkingBranch.at(-1) as { customType: string; data: { thinkingLevel: string } };
 eq("fusion thinking command", [thinkingEntry.customType, thinkingEntry.data.thinkingLevel, thinkingNotice], ["fusion-thinking", "high", "Fusion thinking: high (session override)"]);
 
-// --- 12. /fusion-fast persists OpenAI priority processing across sessions ---
+// --- 12. /fusion fast persists OpenAI priority processing across sessions ---
 const fastFixture = mkdtempSync(_join(tmpdir(), "fusion-fast-config-"));
 const fastAgentDir = _join(fastFixture, "agent");
 mkdirSync(_join(fastFixture, ".pi"));
@@ -2111,10 +2259,10 @@ const fastCommandContext = {
     hasConfiguredAuth: () => true,
   },
 };
-await fastCommands.get("fusion-fast")!.handler("status", fastCommandContext);
+await fastCommands.get("fusion")!.handler("fast status", fastCommandContext);
 eq("fusion fast off status", fastNotice, "Fusion fast mode: off (config file) • default provider service tier");
 fastBranch.push({ type: "custom", customType: "fusion-fast", data: { fastMode: false, timestamp: Date.now() } });
-await fastCommands.get("fusion-fast")!.handler("on", fastCommandContext);
+await fastCommands.get("fusion")!.handler("fast on", fastCommandContext);
 const fastOnEntry = fastBranch.at(-1) as { customType: string; data: { fastMode?: boolean } };
 const persistedOnRaw = JSON.parse(readFileSync(_join(fastAgentDir, "fusion.json"), "utf8"));
 eq("fusion fast on persists globally", [
@@ -2134,16 +2282,16 @@ fusionExtension({
   registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => futureFastCommands.set(name, command),
   appendEntry: () => {},
 } as never, { agentDir: fastAgentDir });
-await futureFastCommands.get("fusion-fast")!.handler("status", {
+await futureFastCommands.get("fusion")!.handler("fast status", {
   ...fastCommandContext,
   ui: { ...fastCommandContext.ui, notify: (text: string) => { futureFastNotice = text; } },
   sessionManager: { getBranch: () => [] },
 });
 eq("fusion fast survives a new session", futureFastNotice, "Fusion fast mode: on (global preference) • OpenAI priority service tier; higher cost/plan usage");
-await fastCommands.get("fusion-fast")!.handler("off", fastCommandContext);
+await fastCommands.get("fusion")!.handler("fast off", fastCommandContext);
 const fastOffEntry = fastBranch.at(-1) as { customType: string; data: { fastMode?: boolean } };
 eq("fusion fast off persists globally", [fastOffEntry.customType, "fastMode" in fastOffEntry.data, loadGlobalConfig(fastAgentDir).fastMode, fastNotice], ["fusion-fast", false, false, "Fusion fast mode: off (global preference) • default provider service tier"]);
-await fastCommands.get("fusion-fast")!.handler("default", fastCommandContext);
+await fastCommands.get("fusion")!.handler("fast default", fastCommandContext);
 const fastDefaultEntry = fastBranch.at(-1) as { customType: string; data: { fastMode?: boolean } };
 const persistedDefaultRaw = JSON.parse(readFileSync(_join(fastAgentDir, "fusion.json"), "utf8"));
 eq("fusion fast default clears global preference", [fastDefaultEntry.customType, "fastMode" in fastDefaultEntry.data, "fastMode" in persistedDefaultRaw, persistedDefaultRaw.preserved, fastNotice], ["fusion-fast", false, false, "yes", "Fusion fast mode: off (config/default) • default provider service tier"]);
@@ -2156,7 +2304,7 @@ fusionExtension({
   registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => failedJournalCommands.set(name, command),
   appendEntry: () => { throw new Error("journal unavailable"); },
 } as never, { agentDir: fastAgentDir });
-await failedJournalCommands.get("fusion-fast")!.handler("on", {
+await failedJournalCommands.get("fusion")!.handler("fast on", {
   ...fastCommandContext,
   ui: { ...fastCommandContext.ui, notify: (text: string) => { failedJournalNotice = text; } },
   sessionManager: { getBranch: () => failedJournalBranch },
@@ -2170,7 +2318,7 @@ eq("fusion fast reports uncleared session override", [
 ]);
 rmSync(fastFixture, { recursive: true, force: true });
 
-// --- 13. /fusion-consent persists allow, ask, and clear overrides ---
+// --- 13. /fusion consent persists allow, ask, and clear overrides ---
 const consentFixture = mkdtempSync(_join(tmpdir(), "fusion-consent-config-"));
 mkdirSync(_join(consentFixture, ".pi"));
 writeFileSync(_join(consentFixture, ".pi", "fusion.json"), JSON.stringify({ executorToolsConsent: false }));
@@ -2192,18 +2340,18 @@ const consentContext = {
     hasConfiguredAuth: () => true,
   },
 };
-await commands.get("fusion-consent")!.handler("allow", consentContext);
+await commands.get("fusion")!.handler("consent allow", consentContext);
 const allowEntry = thinkingBranch.at(-1) as { customType: string; data: { executorToolsConsent?: boolean } };
 eq("fusion consent allow", [allowEntry.customType, allowEntry.data.executorToolsConsent, consentNotice], ["fusion-consent", true, "Fusion consent: allow (session override)"]);
-await commands.get("fusion-consent")!.handler("ask", consentContext);
+await commands.get("fusion")!.handler("consent ask", consentContext);
 const askEntry = thinkingBranch.at(-1) as { customType: string; data: { executorToolsConsent?: boolean } };
 eq("fusion consent ask", [askEntry.customType, askEntry.data.executorToolsConsent, consentNotice], ["fusion-consent", false, "Fusion consent: ask (session override)"]);
-await commands.get("fusion-consent")!.handler("default", consentContext);
+await commands.get("fusion")!.handler("consent default", consentContext);
 const defaultEntry = thinkingBranch.at(-1) as { customType: string; data: { executorToolsConsent?: boolean } };
 eq("fusion consent default", [defaultEntry.customType, defaultEntry.data.executorToolsConsent, consentNotice], ["fusion-consent", undefined, "Fusion consent: ask (config/default)"]);
-await commands.get("fusion-consent")!.handler("status", consentContext);
+await commands.get("fusion")!.handler("consent status", consentContext);
 eq("fusion consent status", consentNotice, "Fusion consent: ask (config file)");
-await commands.get("fusion-consent")!.handler("allow", { ...consentContext, isProjectTrusted: () => false });
+await commands.get("fusion")!.handler("consent allow", { ...consentContext, isProjectTrusted: () => false });
 eq("fusion consent rejects untrusted", consentNotice, "Fusion consent cannot be allowed in an untrusted project.");
 rmSync(consentFixture, { recursive: true, force: true });
 
@@ -2324,7 +2472,7 @@ eq("pane close preserves in-flight state", [paneController.state, paneController
 paneController.shutdown();
 eq("pane shutdown clears transient state", paneController.getLive("wrk_test"), undefined);
 let paneNotice = "";
-await commands.get("fusion-pane")!.handler("open", {
+await commands.get("fusion")!.handler("pane open", {
   ...consentContext,
   mode: "rpc",
   ui: { ...consentContext.ui, notify: (text: string) => { paneNotice = text; } },
@@ -2427,9 +2575,9 @@ eq("monitor detects dead or stale publisher", [
 const ghosttyPlan = buildMonitorLaunchPlan("/pkg/monitor-cli.ts", "/tmp/snapshot.json", { platform: "darwin", ghostty: true, terminal: false });
 eq("monitor Ghostty launch plan", [ghosttyPlan?.kind, ghosttyPlan?.command, ghosttyPlan?.args.includes("-e"), ghosttyPlan?.args.at(-1)], ["ghostty", "/usr/bin/open", true, "/tmp/snapshot.json"]);
 eq("monitor has no unsupported launcher", buildMonitorLaunchPlan("script", "snapshot", { platform: "linux", ghostty: false, terminal: false }), undefined);
-eq("monitor command registered", commands.has("fusion-monitor"), true);
+eq("only grouped slash commands are registered", [...commands.keys()].sort(), ["advisor", "fusion"]);
 let monitorNotice = "";
-await commands.get("fusion-monitor")!.handler("open", {
+await commands.get("fusion")!.handler("monitor open", {
   ...consentContext,
   mode: "rpc",
   ui: { ...consentContext.ui, notify: (text: string) => { monitorNotice = text; } },

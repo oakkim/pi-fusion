@@ -18,6 +18,10 @@ export type ToolSelection = ToolMode | string[];
 export interface FusionConfig {
   /** Explicit Lead advisor model; false/unset disables advice. */
   advisorModel?: string | false;
+  /** Advisor reasoning effort. Unset follows the Lead, clamped to the advisor model. */
+  advisorThinkingLevel?: ModelThinkingLevel;
+  /** Request OpenAI priority processing for the advisor. Default false. */
+  advisorFastMode?: boolean;
   /** Explicit executor model, e.g. "openai/gpt-4.1-mini". Unset = auto (first non-planner text model). */
   executor?: string;
   /** Executor tool access: "none" | "readonly" | "all" | explicit list. Default "all". */

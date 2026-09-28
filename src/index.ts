@@ -50,11 +50,12 @@ import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifi
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
 import { WorkerRuntime, type WorkerContextTelemetry, type WorkerRecord } from "./runtime.ts";
 import { InquiryRuntime, type InquiryThread, type InquiryTurn } from "./inquiry.ts";
-import { fusionArgumentCompletions, isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, parseFusionCommand, type FusionMode } from "./mode.ts";
+import { isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, type FusionMode } from "./mode.ts";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree } from "./worktree.ts";
 import { runSerialized } from "./mutation-queue.ts";
 import { registerAdvisor } from "./advisor.ts";
-import { selectModel } from "./model-picker.ts";
+import { modelCompletions, selectModel } from "./model-picker.ts";
+import { registerCommandGroup, type Subcommand } from "./commands.ts";
 
 const ContextMode = Type.Union([Type.Literal("none"), Type.Literal("recent")], { default: "none" });
 
@@ -1940,41 +1941,43 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion", {
-    description: "Fusion mode: /fusion on | available | off (no arg toggles; /fusion <prompt> sends once through the planner/sidekick split)",
-    getArgumentCompletions: fusionArgumentCompletions,
-    handler: async (args, ctx) => {
-      const parsed = parseFusionCommand(args);
-      const tell = (text: string, level: "info" | "warning" = "info") => {
-        if (ctx.mode === "print") console.log(text);
-        else ctx.ui.notify(text, level);
-      };
-      if (parsed.kind === "set" || parsed.kind === "toggle") {
-        const next = parsed.kind === "set" ? parsed.mode : (restoreMode(ctx) === "forced" ? "available" : "forced");
-        persistMode(next);
+  const fusionCommands = new Map<string, Subcommand>();
+  for (const [name, mode, description] of [
+    ["on", "forced", "Force the planner/sidekick split"],
+    ["available", "available", "Let the Lead decide when to delegate"],
+    ["off", "off", "Disable Fusion tools for this session"],
+  ] as const) {
+    fusionCommands.set(name, {
+      description, acceptsArguments: false,
+      handler: async (_args, ctx) => {
+        persistMode(mode);
         refreshStatus(ctx);
-        tell(modeLabel(next));
-        return;
-      }
-      if (restoreMode(ctx) === "off") {
-        tell("Fusion is off. Use /fusion available or /fusion on first.", "warning");
-        return;
-      }
-      if (ctx.mode === "print") {
-        console.log(forceFusionPrompt(parsed.prompt));
-        return;
-      }
-      pi.sendUserMessage(forceFusionPrompt(parsed.prompt));
+        if (ctx.mode === "print" || ctx.mode === "json") console.log(modeLabel(mode));
+        else ctx.ui.notify(modeLabel(mode), "info");
+      },
+    });
+  }
+  fusionCommands.set("run", {
+    description: "Send one task through Fusion: /fusion run <prompt>",
+    handler: async (args, ctx) => {
+      const tell = (text: string) => {
+        if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
+        else ctx.ui.notify(text, "warning");
+      };
+      if (!args.trim()) { tell("Usage: /fusion run <prompt>"); return; }
+      if (restoreMode(ctx) === "off") { tell("Fusion is off. Use /fusion available or /fusion on first."); return; }
+      if (ctx.mode === "print") { console.log(forceFusionPrompt(args)); return; }
+      pi.sendUserMessage(forceFusionPrompt(args));
     },
   });
 
-  pi.registerCommand("fusion-ask", {
-    description: "Ask a read-only side chat: /fusion-ask <wrk_...|inq_...> <question>",
+  fusionCommands.set("ask", {
+    description: "Ask a read-only side chat: /fusion ask <wrk_...|inq_...> <question>",
     getArgumentCompletions: (prefix) => {
       if (/\s/.test(prefix)) return null;
       const normalized = prefix.trim().toLowerCase();
       const values = [...runtime.list().map((worker) => worker.id), ...inquiries.list().map((thread) => thread.id)];
-      const matches = values.filter((value) => value.toLowerCase().startsWith(normalized)).map((value) => ({ value, label: value }));
+      const matches = values.filter((value) => value.toLowerCase().startsWith(normalized)).map((value) => ({ value: `${value} `, label: value }));
       return matches.length ? matches : null;
     },
     handler: async (args, ctx) => {
@@ -1984,11 +1987,11 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       };
       const match = args.trim().match(/^(\S+)\s+([\s\S]+)$/);
       if (!match) {
-        tell("Usage: /fusion-ask <wrk_...|inq_...> <question>", "error");
+        tell("Usage: /fusion ask <wrk_...|inq_...> <question>", "error");
         return;
       }
       if (ctx.mode === "print") {
-        tell("/fusion-ask requires an interactive session so its asynchronous answer can be delivered.", "error");
+        tell("/fusion ask requires an interactive session so its asynchronous answer can be delivered.", "error");
         return;
       }
       const [, target, question] = match;
@@ -2004,8 +2007,12 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion-model", {
-    description: "Pick the sidekick executor: /fusion-model (interactive) | /fusion-model <provider/id> | auto | clear",
+  fusionCommands.set("model", {
+    getArgumentCompletions: (prefix) => modelCompletions(activeContext, prefix, [
+      { value: "auto", label: "auto", description: "Choose automatically" },
+      { value: "clear", label: "clear", description: "Use the configured default" },
+    ]),
+    description: "Pick the sidekick executor: /fusion model (interactive) | /fusion model <provider/id> | auto | clear",
     handler: async (args, ctx) => {
       const tell = (text: string, level: "info" | "warning" | "error" = "info") => {
         if (ctx.mode === "print") console.log(text);
@@ -2027,11 +2034,12 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         if (!ctx.hasUI) {
           const fileCfg = applyDefaults(loadConfig(ctx.cwd, ctx.isProjectTrusted(), options.agentDir));
           const override = restoreExecutorOverride(ctx);
-          tell([`Fusion executor: ${resolved ? modelDisplay(resolved) : "unset"}${override?.auto ? " (session: auto)" : override?.executor ? " (session override)" : current.executor ? " (config file)" : " (auto)"}`, `Config file: ${fileCfg.executor ?? "(unset)"}`, "Usage: /fusion-model <provider/id> | auto | clear"].join("\n"));
+          tell([`Fusion executor: ${resolved ? modelDisplay(resolved) : "unset"}${override?.auto ? " (session: auto)" : override?.executor ? " (session override)" : current.executor ? " (config file)" : " (auto)"}`, `Config file: ${fileCfg.executor ?? "(unset)"}`, "Usage: /fusion model <provider/id> | auto | clear"].join("\n"));
           return;
         }
         const lead = ctx.model ? modelDisplay(ctx.model) : "";
         const items = [{ value: "auto", label: "auto", description: "First authenticated text model other than the Lead" },
+          { value: "clear", label: "clear", description: "Use the configured default" },
           ...candidates.map((model) => ({ value: modelDisplay(model), label: modelDisplay(model), description: [model.name, modelDisplay(model) === lead ? "Lead" : ""].filter(Boolean).join(" · ") }))];
         const choice = await selectModel(ctx, "Fusion executor model", items, restoreExecutorOverride(ctx)?.auto ? "auto" : resolved ? modelDisplay(resolved) : "auto");
         if (!choice) {
@@ -2042,6 +2050,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           apply({ auto: true }, "auto");
           return;
         }
+        if (choice === "clear") { apply({}, loadConfig(ctx.cwd, ctx.isProjectTrusted(), options.agentDir).executor ?? "auto"); return; }
         apply({ executor: choice }, choice);
         return;
       }
@@ -2063,11 +2072,13 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion-thinking", {
-    description: "Set sidekick thinking: /fusion-thinking [off|minimal|low|medium|high|xhigh|max|clear]",
+  fusionCommands.set("thinking", {
+    description: "Set sidekick thinking: /fusion thinking [off|minimal|low|medium|high|xhigh|max|clear]",
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trim().toLowerCase();
-      const values = [...FUSION_THINKING_LEVELS, "clear"];
+      const cfg = activeContext ? effectiveConfig(activeContext) : undefined;
+      const executor = activeContext && cfg ? resolveExecutorModel(activeContext.modelRegistry, activeContext.model, cfg.executor, []) : undefined;
+      const values = [...(executor ? getSupportedThinkingLevels(executor) : ["off"]), "clear"];
       const matches = values.filter((value) => value.startsWith(normalized)).map((value) => ({ value, label: value }));
       return matches.length ? matches : null;
     },
@@ -2095,7 +2106,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         if (!ctx.hasUI) {
           const override = restoreThinkingOverride(ctx);
           const source = override?.thinkingLevel ? "session override" : fileConfig.thinkingLevel ? "config file" : "default";
-          tell(`Fusion thinking: ${currentLevel} (${source})\nUsage: /fusion-thinking <${availableLevels.join("|")}> | clear`);
+          tell(`Fusion thinking: ${currentLevel} (${source})\nUsage: /fusion thinking <${availableLevels.join("|")}> | clear`);
           return;
         }
         const choice = await ctx.ui.select(`Fusion executor thinking (current: ${currentLevel}):`, [
@@ -2128,8 +2139,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion-fast", {
-    description: "Persist OpenAI sidekick priority processing: /fusion-fast [on|off|default|status]",
+  fusionCommands.set("fast", {
+    description: "Persist OpenAI sidekick priority processing: /fusion fast [on|off|default|status]",
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trim().toLowerCase();
       const values = ["on", "off", "default", "status"];
@@ -2224,8 +2235,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion-monitor", {
-    description: "Open a read-only Fusion worker monitor in a separate terminal: /fusion-monitor [open|close|status]",
+  fusionCommands.set("monitor", {
+    description: "Open a read-only Fusion worker monitor in a separate terminal: /fusion monitor [open|close|status]",
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trim().toLowerCase();
       const values = ["open", "close", "status"];
@@ -2246,7 +2257,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       }
       if (action === "close") {
         try {
-          await monitor.close("Closed by /fusion-monitor.");
+          await monitor.close("Closed by /fusion monitor.");
           tell("Fusion monitor closed.");
         } catch (error) {
           tell(`Could not close Fusion monitor cleanly: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -2282,8 +2293,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion-pane", {
-    description: "Show optional detailed sidekick pane: /fusion-pane [open|close|toggle|wrk_...]",
+  fusionCommands.set("pane", {
+    description: "Show optional detailed sidekick pane: /fusion pane [open|close|toggle|wrk_...]",
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trim().toLowerCase();
       const values = ["open", "close", "toggle", ...runtime.list().map((worker) => worker.id)];
@@ -2343,8 +2354,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion-consent", {
-    description: "Set sidekick mutation consent: /fusion-consent [allow|ask|default|status]",
+  fusionCommands.set("consent", {
+    description: "Set sidekick mutation consent: /fusion consent [allow|ask|default|status]",
     getArgumentCompletions: (prefix) => {
       const normalized = prefix.trim().toLowerCase();
       const values = ["allow", "ask", "default", "status"];
@@ -2418,7 +2429,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
-  pi.registerCommand("fusion-status", {
+  fusionCommands.set("status", {
+    acceptsArguments: false,
     description: "List persistent sidekick workers and read-only inquiry threads",
     handler: async (_args, ctx) => {
       const workers = runtime.list();
@@ -2447,4 +2459,5 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       else ctx.ui.notify(text, "info");
     },
   });
+  registerCommandGroup(pi, "fusion", fusionCommands);
 }

@@ -74,3 +74,11 @@ export async function selectModel(
     };
   }, { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%" } });
 }
+
+/** Full model identifiers are terminal completion values; names/providers are searchable. */
+export function modelCompletions(ctx: ExtensionContext | undefined, prefix: string, extras: SelectItem[] = []): SelectItem[] | null {
+  const models = ctx?.modelRegistry.getAvailable().filter((model) => model.input.includes("text")) ?? [];
+  const items = [...extras, ...models.map((model) => ({ value: `${model.provider}/${model.id}`, label: `${model.provider}/${model.id}`, description: model.name }))];
+  const matches = fuzzyFilter(items, prefix.trim(), (item) => `${item.value} ${item.label} ${item.description ?? ""}`);
+  return matches.length ? matches : null;
+}

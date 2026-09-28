@@ -81,9 +81,11 @@ export function runTextRequest(
   maxTokens: number, signal: AbortSignal | undefined, ctx: ExtensionContext,
   thinkingLevel: ModelThinkingLevel = "off",
   fastMode = false,
+  onText?: (text: string) => void,
 ): Promise<AssistantMessage> {
   return runComplete(registry, model, { systemPrompt, messages },
-    buildCompleteOptions(model, maxTokens, 0.2, thinkingLevel, fastMode, signal, ctx));
+    buildCompleteOptions(model, maxTokens, 0.2, thinkingLevel, fastMode, signal, ctx),
+    onText ? (progress) => { if (progress.kind === "phase" && progress.phase === "responding" && progress.text !== undefined) onText(progress.text); } : undefined);
 }
 
 export interface ExecutorCheckpoint {

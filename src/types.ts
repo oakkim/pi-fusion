@@ -7,6 +7,7 @@
  * - fusion-ref (Kylejeong2/fusion): AdaptiveRoutingPolicy at compaction boundary
  */
 
+import type { UsageSummary } from "./cost.ts";
 import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 export type { Api, Model };
@@ -15,6 +16,8 @@ export type ToolMode = "none" | "readonly" | "all";
 export type ToolSelection = ToolMode | string[];
 
 export interface FusionConfig {
+  /** Explicit Lead advisor model; false/unset disables advice. */
+  advisorModel?: string | false;
   /** Explicit executor model, e.g. "openai/gpt-4.1-mini". Unset = auto (first non-planner text model). */
   executor?: string;
   /** Executor tool access: "none" | "readonly" | "all" | explicit list. Default "all". */
@@ -31,7 +34,7 @@ export interface FusionConfig {
   fastMode?: boolean;
   /** Skip consent prompt for mutating tools (trusted projects only). Default false. */
   executorToolsConsent?: boolean;
-  /** Max turns of sidekick history kept before compaction. Default 40 messages. */
+  /** Message-count trigger for semantic compaction; token limits also apply. Default 40. */
   maxHistoryMessages?: number;
   /** Escalation ladder: stronger executor models tried as consecutive failures mount. */
   fallbackExecutors?: string[];
@@ -75,6 +78,8 @@ export interface WorktreeInfo {
 }
 
 export interface TurnRecord {
+  /** Received provider usage, including partial progress and summaries. */
+  usage?: UsageSummary;
   id: string; // trn_...
   workerId: string; // wrk_...
   status: TurnStatus;

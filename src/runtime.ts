@@ -17,7 +17,7 @@ export interface WorkerContextTelemetry {
 }
 
 export interface WorkerTelemetry {
-  /** Cumulative successful-turn total. */
+  /** Cumulative received usage, including failed/interrupted turns and summaries. */
   cumulative: UsageSummary;
   /** Usage from the most recent successful assistant response, for CH. */
   latest?: UsageSummary;
@@ -51,6 +51,31 @@ export interface WorkerRecord {
   createdAt: number;
   /** Optional for journal compatibility with workers written before monitor telemetry. */
   telemetry?: WorkerTelemetry;
+}
+
+/** Repair a persisted interrupted batch without claiming that side effects did not occur. */
+export function repairIncompleteToolCalls(history: Message[]): Message[] {
+  const repaired: Message[] = [];
+  for (let i = 0; i < history.length; i++) {
+    const message = history[i]!;
+    repaired.push(message);
+    if (message.role !== "assistant" || !Array.isArray(message.content)
+      || message.stopReason === "error" || message.stopReason === "aborted") continue;
+    const calls = message.content.filter((block) => block.type === "toolCall");
+    if (!calls.length) continue;
+    const results = new Set<string>();
+    while (history[i + 1]?.role === "toolResult") {
+      const result = history[++i]! as Extract<Message, { role: "toolResult" }>;
+      repaired.push(result);
+      results.add(result.toolCallId);
+    }
+    for (const call of calls) {
+      if (results.has(call.id)) continue;
+      repaired.push({ role: "toolResult", toolCallId: call.id, toolName: call.name, isError: true,
+        content: [{ type: "text", text: "Execution was interrupted before a result was recorded. The outcome and possible side effects are unknown; inspect the current state before retrying." }], timestamp: Date.now() });
+    }
+  }
+  return repaired;
 }
 
 export class WorkerRuntime {
@@ -118,6 +143,28 @@ export class WorkerRuntime {
     worker.status = "running";
     this.#turns.set(turn.id, turn);
     return turn;
+  }
+
+  /** Full history + cumulative turn usage makes duplicate checkpoints idempotent. */
+  checkpointTurn(turnId: string, history: Message[], usage: UsageSummary, telemetry?: { latestExecutor?: string; context?: WorkerContextTelemetry }): boolean {
+    const turn = this.#turns.get(turnId);
+    const worker = turn ? this.#workers.get(turn.workerId) : undefined;
+    if (!turn || !worker || worker.generation !== turn.generation
+      || (turn.status !== "running" && turn.status !== "interrupted")
+      || (worker.activeTurnId !== null && worker.activeTurnId !== turnId)) return false;
+    const previous = turn.usage ?? zeroUsage();
+    const delta = zeroUsage();
+    for (const key of Object.keys(delta) as Array<keyof UsageSummary>) delta[key] = Math.max(0, usage[key] - previous[key]);
+    turn.usage = { ...usage };
+    worker.history = [...history];
+    worker.telemetry = {
+      cumulative: addUsage(worker.telemetry?.cumulative ?? zeroUsage(), delta),
+      latest: latestAssistantUsage(history) ?? worker.telemetry?.latest,
+      latestExecutor: telemetry?.latestExecutor ?? worker.telemetry?.latestExecutor,
+      context: telemetry?.context ?? worker.telemetry?.context,
+      automaticCompaction: true,
+    };
+    return true;
   }
 
   finishTurn(
@@ -208,30 +255,6 @@ export class WorkerRuntime {
     this.#controllers.delete(turnId);
   }
 
-  /** Independent compaction: keep history bounded per worker. */
-  compactHistory(worker: WorkerRecord, maxMessages: number): boolean {
-    if (worker.history.length <= maxMessages) return false;
-    // Keep the original task, then prefer a complete handoff over a protocol fragment.
-    let start = worker.history.length - (maxMessages - 1);
-    const handoff = worker.history.findIndex((message, index) => index >= start && message.role === "user");
-    if (handoff >= 0) start = handoff;
-    else while (worker.history[start]?.role === "toolResult") start++;
-    const keep = worker.history.slice(start);
-    worker.history = [worker.history[0]!, ...keep];
-    // The prior usage describes the pre-compaction context and must not be
-    // presented as live context until a provider responds again.
-    if (worker.telemetry) {
-      worker.telemetry = {
-        ...worker.telemetry,
-        context: {
-          known: false,
-          ...(worker.telemetry.context?.window ? { window: worker.telemetry.context.window } : {}),
-        },
-      };
-    }
-    return true;
-  }
-
   // ---- session journal (durable across /resume) ----
 
   snapshot(): Array<{ worker: WorkerRecord; turns: TurnRecord[] }> {
@@ -267,7 +290,7 @@ export class WorkerRuntime {
       if (e?.type !== "custom" || e?.customType !== "fusion-worker" || !("data" in (e as object))) continue;
       const data = (e as { data: { worker?: WorkerRecord; turns?: TurnRecord[] } }).data;
       if (!data?.worker?.id) continue;
-      const restored = { ...data.worker };
+      const restored = { ...data.worker, history: repairIncompleteToolCalls(data.worker.history) };
       if (!restored.telemetry) {
         const legacy = legacyUsage.get(restored.id);
         restored.telemetry = {

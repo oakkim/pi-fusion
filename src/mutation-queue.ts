@@ -22,10 +22,12 @@ function queueKey(path: string): string {
   }
 }
 
-function raceWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined, started: () => boolean): Promise<T> {
   if (!signal) return promise;
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(signal.reason ?? new Error("Operation aborted."));
+    const onAbort = () => {
+      if (!started()) reject(signal.reason ?? new Error("Operation aborted."));
+    };
     promise.then(
       (value) => { signal.removeEventListener("abort", onAbort); resolve(value); },
       (error) => { signal.removeEventListener("abort", onAbort); reject(error); },
@@ -48,8 +50,10 @@ export function runSerialized<T>(path: string, fn: () => Promise<T>, signal?: Ab
   const wasQueued = state.pending > 0;
   state.pending++;
 
+  let started = false;
   const run = state.tail.then(() => {
     signal?.throwIfAborted();
+    started = true;
     try { hooks?.onStart?.(); } catch { /* monitoring must not block work */ }
     return fn();
   });
@@ -63,7 +67,7 @@ export function runSerialized<T>(path: string, fn: () => Promise<T>, signal?: Ab
     try { hooks?.onQueued?.(); } catch { /* monitoring must not block work */ }
   }
 
-  // The queued function remains in the chain if its caller aborts. It checks
-  // the signal before starting, then releases its slot when its predecessor ends.
-  return raceWithAbort(run, signal);
+  // Queued cancellation is immediate. Once started, wait for actual cleanup so
+  // follow-ups cannot outrun the final tool result or release mutations early.
+  return raceWithAbort(run, signal, () => started);
 }

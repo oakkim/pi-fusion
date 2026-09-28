@@ -84,6 +84,8 @@ function normalizeConfig(raw: unknown): FusionConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const input = raw as Record<string, unknown>;
   const out: FusionConfig = {};
+  if (input.advisorModel === false) out.advisorModel = false;
+  else if (typeof input.advisorModel === "string" && input.advisorModel.trim()) out.advisorModel = input.advisorModel.trim();
   if (typeof input.executor === "string") out.executor = input.executor;
   const tools = normalizeToolSelection(input.executorTools);
   if (tools !== undefined) out.executorTools = tools;

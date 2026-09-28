@@ -8,7 +8,7 @@ import { buildRecentContext, latestUserText } from "../src/utils.ts";
 import fusionExtension, { deriveWorkerContextTelemetry, executorUsesSubscription, formatElapsedDuration, formatLiveStatusAction, formatToolStatusAction } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { getKeybindings, visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, formatPaneTranscript, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
 import { buildMonitorLaunchPlan, FusionMonitorPublisher, isMonitorOwnerAlive, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, shouldTerminateMonitor, type MonitorSnapshot } from "../src/monitor.ts";
 import { runSerialized } from "../src/mutation-queue.ts";
@@ -64,6 +64,22 @@ releaseAbortBlocker();
 await abortBlocker;
 await new Promise((resolve) => setTimeout(resolve, 0));
 eq("aborted queued mutation never starts", [abortRejected, abortedMutationRan], [true, false]);
+
+let releaseRunningMutation!: () => void;
+let markRunningMutation!: () => void;
+const runningMutationStarted = new Promise<void>((resolve) => { markRunningMutation = resolve; });
+const runningMutationGate = new Promise<void>((resolve) => { releaseRunningMutation = resolve; });
+const runningMutationAbort = new AbortController();
+let runningMutationSettled = false;
+const runningMutation = runSerialized("/tmp/fusion-running-abort-root", async () => { markRunningMutation(); await runningMutationGate; return "cleanup finished"; }, runningMutationAbort.signal);
+void runningMutation.then(() => { runningMutationSettled = true; }, () => { runningMutationSettled = true; });
+await runningMutationStarted;
+runningMutationAbort.abort();
+await Promise.resolve();
+await Promise.resolve();
+eq("active mutation cancellation waits for actual cleanup", runningMutationSettled, false);
+releaseRunningMutation();
+eq("active mutation delivers late cleanup result", await runningMutation, "cleanup finished");
 
 // --- 1. spawn -> finish -> followup keeps same worker/history ---
 const rt = new WorkerRuntime();
@@ -154,32 +170,22 @@ const restoredInquiries = new InquiryRuntime();
 restoredInquiries.restore([{ type: "custom", customType: "fusion-inquiry", data: inquirySnapshot }]);
 eq("inquiry restore interrupts active side query", [restoredInquiries.getThread(inquiryThread.id)?.activeTurnId, restoredInquiries.getTurn(inquiryNext.id)?.status, restoredInquiries.getThread(inquiryThread.id)?.history.length], [null, "interrupted", 2]);
 
-// --- 2. independent compaction ---
-const rt2 = new WorkerRuntime();
-const w2 = rt2.spawn({ label: undefined, executorModelId: "m", firstMessage: { role: "user", content: "t0", timestamp: 0 } as never }).worker;
-for (let i = 0; i < 50; i++) {
-  w2.history.push({ role: "assistant", content: `m${i}`, timestamp: i } as never);
-}
-const didCompact = rt2.compactHistory(w2, 40);
-eq("compacted", didCompact, true);
-eq("compact keeps first+39", [w2.history.length, (w2.history[0] as {content:string}).content], [40, "t0"]);
-
-const w2Tools = rt2.spawn({ label: undefined, executorModelId: "m", firstMessage: { role: "user", content: "task", timestamp: 0 } as never }).worker;
-w2Tools.history.push(
-  { role: "assistant", content: [{ type: "toolCall", id: "old", name: "read", arguments: {} }], timestamp: 1 } as never,
-  { role: "toolResult", toolCallId: "old", toolName: "read", content: [{ type: "text", text: "old" }], isError: false, timestamp: 2 } as never,
-  { role: "assistant", content: [{ type: "text", text: "old done" }], timestamp: 3 } as never,
-  { role: "user", content: "next", timestamp: 4 } as never,
-  { role: "assistant", content: [{ type: "toolCall", id: "new", name: "read", arguments: {} }], timestamp: 5 } as never,
-  { role: "toolResult", toolCallId: "new", toolName: "read", content: [{ type: "text", text: "new" }], isError: false, timestamp: 6 } as never,
-  { role: "assistant", content: [{ type: "text", text: "new done" }], timestamp: 7 } as never,
-);
-rt2.compactHistory(w2Tools, 7);
-eq("compact starts at user handoff", w2Tools.history.map((message) => message.role), ["user", "user", "assistant", "toolResult", "assistant"]);
-eq("compact keeps tool pair", (w2Tools.history[3] as { toolCallId: string }).toolCallId, "new");
-w2Tools.telemetry = { cumulative: zeroUsage(), context: { known: true, tokens: 100, window: 1_000 }, automaticCompaction: true };
-rt2.compactHistory(w2Tools, 4);
-eq("compaction marks context unknown", w2Tools.telemetry.context, { known: false, window: 1_000 });
+// --- 2. durable, idempotent progress and interrupted batch repair ---
+const checkpointRuntime = new WorkerRuntime();
+const cp = checkpointRuntime.spawn({ label: undefined, executorModelId: "m", firstMessage: { role: "user", content: "task", timestamp: 0 } as never });
+const received = { ...zeroUsage(), input: 10, output: 2, totalTokens: 12, cost: 0.5 };
+const pendingBatch = [cp.worker.history[0]!, { role: "assistant", content: [{ type: "toolCall", id: "a", name: "write", arguments: {} }, { type: "toolCall", id: "b", name: "write", arguments: {} }], timestamp: 1 }, { role: "toolResult", toolCallId: "a", toolName: "write", content: [{ type: "text", text: "saved" }], isError: false, timestamp: 2 }] as never;
+checkpointRuntime.checkpointTurn(cp.turn.id, pendingBatch, received);
+checkpointRuntime.checkpointTurn(cp.turn.id, pendingBatch, received);
+eq("checkpoint usage is idempotent", cp.worker.telemetry?.cumulative, received);
+checkpointRuntime.interrupt(cp.worker.id);
+eq("interrupted generation still accepts settled progress", checkpointRuntime.checkpointTurn(cp.turn.id, pendingBatch, { ...received, cost: 0.75 }), true);
+const checkpointRestore = new WorkerRuntime();
+checkpointRestore.restore([{ type: "custom", customType: "fusion-worker", data: checkpointRuntime.snapshot()[0] }]);
+const repairedHistory = checkpointRestore.getWorker(cp.worker.id)!.history;
+eq("restore preserves results and marks missing outcomes unknown", [repairedHistory.length, JSON.stringify(repairedHistory[2]).includes("saved"), JSON.stringify(repairedHistory[3]).includes("unknown"), checkpointRestore.getWorker(cp.worker.id)?.telemetry?.cumulative.cost], [4, true, true, 0.75]);
+checkpointRuntime.followup(cp.worker.id, { role: "user", content: "new generation", timestamp: 3 });
+eq("old checkpoint cannot overwrite next generation", [checkpointRuntime.checkpointTurn(cp.turn.id, pendingBatch, received), JSON.stringify(cp.worker.history).includes("new generation")], [false, true]);
 const legacyRuntime = new WorkerRuntime();
 legacyRuntime.restore([
   { type: "custom", customType: "fusion-cost", data: { worker_id: "wrk_legacy", executor: "provider/legacy", usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 1, totalTokens: 16, cost: { total: 0.5 } } } },
@@ -457,7 +463,7 @@ eq("subscription marker follows auth source", [
 ], [false, true, true]);
 
 // --- 8c. executor dispatches through the configured model registry ---
-import { getSupportsTemperature, runExecutorTurn, supportsOpenAIFastMode } from "../src/llm.ts";
+import { getSupportsTemperature, runExecutorTurn, supportsOpenAIFastMode, type ExecutorCheckpoint } from "../src/llm.ts";
 eq("temperature compatibility", [
   getSupportsTemperature({ api: "openai-codex-responses", reasoning: false } as never),
   getSupportsTemperature({ api: "openai-responses", reasoning: true } as never),
@@ -861,6 +867,277 @@ try {
 }
 eq("abort after last tool skips next model request", [lastToolAbortEscaped, modelRequestsAfterAbort], [true, 1]);
 
+// Checkpoints survive provider failures, cancellation, and semantic compaction.
+const reliabilityModel = { ...registryModel, contextWindow: 12_000, maxTokens: 4096 } as never;
+const responseWithUsage = (content: unknown[], stopReason = "stop") => ({
+  ...streamAssistant(content, stopReason) as any,
+  usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.25 } },
+});
+const testContext = { sessionManager: { getSessionId: () => undefined } } as never;
+let failureCheckpoint: ExecutorCheckpoint | undefined;
+let failureCalls = 0;
+let wroteFile = false;
+let providerFailed = false;
+try {
+  await runExecutorTurn({ streamSimple: () => {
+    if (++failureCalls > 1) throw new Error("provider unavailable");
+    return resultStream(responseWithUsage([{ type: "toolCall", id: "save", name: "write", arguments: {} }], "toolUse"));
+  } } as never, reliabilityModel, "system", [{ role: "user", content: "save", timestamp: 0 }], 128, 0.2, undefined,
+  [{ name: "write", description: "write", parameters: {}, execute: async () => { wroteFile = true; return { content: [{ type: "text", text: "file saved" }] }; } }] as never,
+  10, testContext, "off", undefined, undefined, false, { maxHistoryMessages: 40, checkpoint: (state) => { failureCheckpoint = state; } });
+} catch { providerFailed = true; }
+eq("provider failure preserves completed side effects and usage", [providerFailed, wroteFile, JSON.stringify(failureCheckpoint?.history).includes("file saved"), failureCheckpoint?.usage.totalTokens, failureCheckpoint?.usage.cost], [true, true, true, 12, 0.25]);
+
+let abortCheckpoint: ExecutorCheckpoint | undefined;
+const checkpointAbort = new AbortController();
+try {
+  await runExecutorTurn({ streamSimple: () => resultStream(responseWithUsage([
+    { type: "toolCall", id: "done", name: "write", arguments: {} },
+    { type: "toolCall", id: "pending", name: "write", arguments: {} },
+  ], "toolUse")) } as never, reliabilityModel, "system", [{ role: "user", content: "save", timestamp: 0 }], 128, 0.2, checkpointAbort.signal,
+  [{ name: "write", description: "write", parameters: {}, execute: async () => { checkpointAbort.abort(); return { content: [{ type: "text", text: "saved before abort" }] }; } }] as never,
+  10, testContext, "off", undefined, undefined, false, { maxHistoryMessages: 40, checkpoint: (state) => { abortCheckpoint = state; } });
+} catch { /* Expected abort. */ }
+eq("abort preserves finished tool and repairs missing result", [abortCheckpoint?.history.length, JSON.stringify(abortCheckpoint?.history[2]).includes("saved before abort"), JSON.stringify(abortCheckpoint?.history[3]).includes("unknown"), abortCheckpoint?.usage.cost], [4, true, true, 0.25]);
+
+const { transformMessages } = await import("@earendil-works/pi-ai/api/transform-messages");
+for (const stopReason of ["error", "aborted"]) {
+  let partialCheckpoint: ExecutorCheckpoint | undefined;
+  try {
+    await runExecutorTurn({ streamSimple: () => resultStream(responseWithUsage([{ type: "toolCall", id: "partial", name: "write", arguments: {} }], stopReason)) } as never,
+      reliabilityModel, "system", [{ role: "user", content: "save", timestamp: 0 }], 128, 0.2, undefined, [], 10, testContext,
+      "off", undefined, undefined, false, { maxHistoryMessages: 40, checkpoint: (state) => { partialCheckpoint = state; } });
+  } catch { /* Incomplete provider tool calls never execute. */ }
+  eq(`${stopReason} partial tool calls preserve usage without orphan results`, [partialCheckpoint?.history.length, partialCheckpoint?.usage.cost, transformMessages(partialCheckpoint!.history, reliabilityModel).map((message) => message.role)], [2, 0.25, ["user"]]);
+}
+
+const lateRuntime = new WorkerRuntime();
+const lateWorker = lateRuntime.spawn({ label: undefined, executorModelId: "m", firstMessage: { role: "user", content: "write", timestamp: 0 } });
+const lateAbort = new AbortController();
+lateRuntime.trackController(lateWorker.turn.id, lateAbort);
+let releaseLateTool!: () => void;
+let markLateTool!: () => void;
+const lateToolStarted = new Promise<void>((resolve) => { markLateTool = resolve; });
+const lateToolGate = new Promise<void>((resolve) => { releaseLateTool = resolve; });
+let lateFollowupStarted = false;
+const lateSerialized = runSerialized("/tmp/fusion-late-tool", () => runExecutorTurn({ streamSimple: () => resultStream(responseWithUsage([{ type: "toolCall", id: "late-write", name: "write", arguments: {} }], "toolUse")) } as never,
+  reliabilityModel, "system", lateWorker.worker.history, 128, 0.2, lateAbort.signal,
+  [{ name: "write", description: "write", parameters: {}, execute: async () => { markLateTool(); await lateToolGate; return { content: [{ type: "text", text: "write completed after abort" }] }; } }] as never,
+  10, testContext, "off", undefined, undefined, false,
+  { maxHistoryMessages: 40, checkpoint: (state) => { lateRuntime.checkpointTurn(lateWorker.turn.id, state.history, state.usage); } }), lateAbort.signal)
+  .catch(() => { lateRuntime.followup(lateWorker.worker.id, { role: "user", content: "continue", timestamp: Date.now() }); lateFollowupStarted = true; });
+await lateToolStarted;
+lateRuntime.interrupt(lateWorker.worker.id);
+await Promise.resolve();
+await Promise.resolve();
+eq("interrupting followup waits for active tool checkpoint", lateFollowupStarted, false);
+releaseLateTool();
+await lateSerialized;
+eq("late completed tool survives into next generation", [lateFollowupStarted, lateWorker.worker.generation, JSON.stringify(lateWorker.worker.history).includes("write completed after abort"), lateWorker.worker.telemetry?.cumulative.cost], [true, 2, true, 0.25]);
+
+const longHistory = [{ role: "user", content: "original handoff: preserve API", timestamp: 0 },
+  responseWithUsage([{ type: "text", text: "INCOMPLETE_SUCCESS_CLAIM" }], "aborted"),
+  ...Array.from({ length: 20 }, (_, i) => i === 2
+    ? { role: "user", content: "latest instruction: do not deploy", timestamp: i + 1 }
+    : { ...responseWithUsage([{ type: "thinking", thinking: "secret chain" }, { type: "text", text: `decision-${i}: ${"old finding ".repeat(100)}` }]), timestamp: i + 1 })] as never;
+let summaryCheckpoint: ExecutorCheckpoint | undefined;
+let summaryInput = "";
+let executorInput = "";
+const compactResult = await runExecutorTurn({ streamSimple: (_model: unknown, context: any) => {
+  if (context.systemPrompt !== "system") { summaryInput = JSON.stringify(context); return resultStream(responseWithUsage([{ type: "text", text: "Decisions: preserve API; completed investigation; next: verify." }])); }
+  executorInput = JSON.stringify(context);
+  return resultStream(responseWithUsage([{ type: "text", text: "finished" }]));
+} } as never, reliabilityModel, "system", longHistory, 128, 0.2, undefined, [], 10, testContext, "off", undefined, undefined, false,
+{ maxHistoryMessages: 8, checkpoint: (state) => { summaryCheckpoint = state; } });
+eq("semantic compaction preserves task recent instruction and usage", [summaryCheckpoint?.compacted, executorInput.includes("original handoff"), executorInput.includes("latest instruction"), executorInput.includes("Decisions:"), executorInput.includes("decision-19"), summaryInput.includes("secret chain"), summaryInput.includes("INCOMPLETE_SUCCESS_CLAIM"), compactResult.usage.cost], [true, true, true, true, true, false, false, 0.5]);
+let previousSummarySeen = false;
+await runExecutorTurn({ streamSimple: (_model: unknown, context: any) => {
+  if (context.systemPrompt !== "system") { previousSummarySeen = JSON.stringify(context).includes("<previous-summary>") && JSON.stringify(context).includes("Decisions:"); }
+  return resultStream(responseWithUsage([{ type: "text", text: "Updated compact memory." }]));
+} } as never, reliabilityModel, "system", [...summaryCheckpoint!.history, ...Array.from({ length: 10 }, () => responseWithUsage([{ type: "text", text: "new evidence ".repeat(100) }]))],
+128, 0.2, undefined, [], 10, testContext, "off", undefined, undefined, false, { maxHistoryMessages: 8, checkpoint: () => {} });
+eq("repeated compaction updates the previous summary", previousSummarySeen, true);
+
+for (const stopReason of ["error", "aborted", "length", "empty", "cancel"]) {
+  const summaryAbort = new AbortController();
+  let failedSummaryCheckpoint: ExecutorCheckpoint | undefined;
+  let failedSummaryCalls = 0;
+  let failedSummary = false;
+  try {
+    await runExecutorTurn({ streamSimple: () => { failedSummaryCalls++; if (stopReason === "cancel") summaryAbort.abort(); return resultStream(responseWithUsage([{ type: "text", text: stopReason === "empty" ? "" : "partial" }], stopReason === "empty" || stopReason === "cancel" ? "stop" : stopReason)); } } as never,
+      reliabilityModel, "system", longHistory, 128, 0.2, summaryAbort.signal, [], 10, testContext, "off", undefined, undefined, false,
+      { maxHistoryMessages: 8, checkpoint: (state) => { failedSummaryCheckpoint = state; } });
+  } catch { failedSummary = true; }
+  eq(`summary ${stopReason} preserves original history and billed usage`, [failedSummary, failedSummaryCalls, failedSummaryCheckpoint?.history, failedSummaryCheckpoint?.usage.cost], [true, 1, longHistory, 0.25]);
+}
+let oversizedRequests = 0;
+let oversizedRejected = false;
+try {
+  await runExecutorTurn({ streamSimple: () => { oversizedRequests++; throw new Error("must not call provider"); } } as never,
+    reliabilityModel, "system", [{ role: "user", content: "x".repeat(100_000), timestamp: 0 }], 128, 0.2, undefined, [], 10, testContext,
+    "off", undefined, undefined, false, { maxHistoryMessages: 40, checkpoint: () => {} });
+} catch { oversizedRejected = true; }
+eq("oversized handoff is rejected before provider request", [oversizedRejected, oversizedRequests], [true, 0]);
+
+let longTurnCheckpoint: ExecutorCheckpoint | undefined;
+let longTurnExecutions = 0;
+let longTurnSummaries = 0;
+let validToolPairs = true;
+const { contextTokens, contextBudget } = await import("./compaction.ts");
+const estimateTool = { name: "read", description: "read source", parameters: {} } as never;
+const estimatedMessages = [
+  { role: "user", content: "task", timestamp: 1 },
+  { ...responseWithUsage([{ type: "text", text: "saved" }]), usage: { ...responseWithUsage([]).usage, totalTokens: 110 }, timestamp: 2 },
+  { role: "toolResult", toolCallId: "read", toolName: "read", content: [{ type: "text", text: "done" }], isError: false, timestamp: 3 },
+] as never;
+const estimatedWithSummary = [estimatedMessages[0], { role: "user", content: "memory", timestamp: 100 }, estimatedMessages[1], estimatedMessages[2]] as never;
+eq("SDK token estimator keeps actual usage and invalidates pre-summary usage", [
+  contextTokens({ systemPrompt: "12345", tools: [estimateTool], messages: estimatedMessages }),
+  contextTokens({ systemPrompt: "12345", tools: [estimateTool], messages: estimatedWithSummary }),
+], [111, 2 + Math.ceil(JSON.stringify([estimateTool]).length / 4) + 1 + 2 + 2 + 1]);
+
+await runExecutorTurn({ streamSimple: (_model: unknown, context: any, options: any) => {
+  if (contextTokens(context) > contextBudget(reliabilityModel, options.maxTokens)) throw new Error("oversized request escaped guard");
+  if (context.systemPrompt !== "system") { longTurnSummaries++; return resultStream(responseWithUsage([{ type: "text", text: "Earlier tool batches finished. Continue verification." }])); }
+  for (let i = 0; i < context.messages.length; i++) {
+    const message = context.messages[i];
+    if (message.role === "toolResult") validToolPairs &&= context.messages.slice(0, i).some((candidate: any) => candidate.role === "assistant" && candidate.content.some((block: any) => block.type === "toolCall" && block.id === message.toolCallId));
+  }
+  return resultStream(longTurnExecutions < 4
+    ? responseWithUsage([{ type: "toolCall", id: `long-${longTurnExecutions}`, name: "read", arguments: { iteration: longTurnExecutions } }], "toolUse")
+    : responseWithUsage([{ type: "text", text: "long turn finished" }]));
+} } as never, reliabilityModel, "system", [{ role: "user", content: "read and verify", timestamp: 0 }], 128, 0.2, undefined,
+[{ name: "read", description: "read", parameters: {}, execute: async () => { longTurnExecutions++; return { content: [{ type: "text", text: "evidence ".repeat(1500) }] }; } }] as never,
+10, testContext, "off", undefined, undefined, false, { maxHistoryMessages: 1000, checkpoint: (state) => { longTurnCheckpoint = state; } });
+eq("token budget compacts during a single turn without splitting tool pairs", [longTurnExecutions, longTurnSummaries > 0, validToolPairs, longTurnCheckpoint?.compacted, longTurnCheckpoint?.usage.cost], [4, true, true, true, (5 + longTurnSummaries) * 0.25]);
+
+// Searchable model picker uses available terminal height and keeps selection after resize.
+const { selectModel } = await import("./model-picker.ts");
+const pickerItems = Array.from({ length: 60 }, (_, index) => ({ value: `provider/model-${index}`, label: `provider/model-${index}` }));
+pickerItems.push({ value: "other/reasoner", label: "other/reasoner", description: "Target Reasoner" } as any);
+const openPicker = () => {
+  let component: any;
+  const terminal = { rows: 24 };
+  const result = selectModel({ hasUI: true, mode: "tui", ui: { custom: (factory: any) => new Promise((done) => {
+    component = factory({ terminal, requestRender() {} }, { fg: (_key: string, text: string) => text }, getKeybindings(), done);
+  }) } } as never, "Choose model", pickerItems, pickerItems[8]!.value);
+  return { terminal, component, result };
+};
+const pickerResize = openPicker();
+const shortPickerRows = pickerResize.component.render(80).filter((line: string) => line.includes("provider/model-")).length;
+pickerResize.component.handleInput("\x1b[6~");
+pickerResize.terminal.rows = 40;
+const tallPickerRows = pickerResize.component.render(80).filter((line: string) => line.includes("provider/model-")).length;
+pickerResize.component.handleInput("\r");
+eq("model picker uses terminal height and preserves paged selection", [shortPickerRows, tallPickerRows, await pickerResize.result], [16, 32, pickerItems[24]!.value]);
+const pickerSearch = openPicker();
+for (const char of "other target") pickerSearch.component.handleInput(char);
+pickerSearch.component.handleInput("\r");
+eq("model picker searches provider and display name", await pickerSearch.result, "other/reasoner");
+
+// Lead advisor: current compaction-aware context, no private thinking/tools, exact model selection.
+const { registerAdvisor } = await import("./advisor.ts");
+const advisorDir = mkdtempSync(_join(tmpdir(), "fusion-advisor-"));
+try {
+  mkdirSync(_join(advisorDir, ".pi"));
+  const advisorEntries: any[] = [];
+  let advisorLeaf: string | null = null;
+  const advisorAppend = (entry: Record<string, unknown>) => {
+    const next = { id: `advisor-${advisorEntries.length}`, parentId: advisorLeaf, timestamp: new Date().toISOString(), ...entry };
+    advisorEntries.push(next); advisorLeaf = next.id; return next.id;
+  };
+  advisorAppend({ type: "message", message: { role: "user", content: "DISCARDED_OLD_TRANSCRIPT", timestamp: 1 } });
+  const keptId = advisorAppend({ type: "message", message: { role: "user", content: "retained constraint", timestamp: 2 } });
+  advisorAppend({ type: "compaction", summary: "COMPACTION_DECISION", firstKeptEntryId: keptId, tokensBefore: 20 });
+  advisorAppend({ type: "message", message: { role: "user", content: [{ type: "text", text: "CURRENT_USER_TASK" }, { type: "image", data: "PRIVATE_IMAGE_BYTES", mimeType: "image/png" }], timestamp: 3 } });
+  advisorAppend({ type: "message", message: responseWithUsage([{ type: "toolCall", id: "lead-read", name: "read", arguments: { path: "source.ts" } }], "toolUse") });
+  advisorAppend({ type: "message", message: { role: "toolResult", toolCallId: "lead-read", toolName: "read", content: [{ type: "text", text: `evidence ${"x".repeat(35_000)} END_OF_LONG_TOOL_EVIDENCE` }], isError: false, timestamp: 4 } });
+  advisorAppend({ type: "message", message: responseWithUsage([{ type: "thinking", thinking: "PRIVATE_LEAD_REASONING", thinkingSignature: "PRIVATE_SIGNATURE" }, { type: "text", text: "CURRENT_VISIBLE_PLAN", textSignature: "PRIVATE_TEXT_SIGNATURE" }, { type: "toolCall", id: "current-advisor", name: "ask_advisor", arguments: {} }], "toolUse") });
+  const advisorTools = new Map<string, any>();
+  const advisorCommands = new Map<string, any>();
+  let activeAdvisorTools = ["read", "ask_advisor", "fusion_spawn"];
+  let advisorNotice = "";
+  const advisorModel = { provider: "opencode-go", id: "advisor", api: "openai-completions", input: ["text"], reasoning: true, contextWindow: 100_000, maxTokens: 8192 };
+  let advisorRequest: any;
+  let advisorOptions: any;
+  let advisorModelCalls = 0;
+  let advisorComplete: (...args: any[]) => Promise<any> = async () => responseWithUsage([{ type: "thinking", thinking: "PRIVATE_ADVISOR_REASONING" }, { type: "text", text: "Verify the migration boundary before editing." }]);
+  const advisorContext: any = {
+    cwd: advisorDir, hasUI: false, mode: "rpc", model: { provider: "other", id: "lead" }, thinkingLevel: "high", isProjectTrusted: () => true,
+    getSystemPrompt: () => "CURRENT_EFFECTIVE_INSTRUCTIONS",
+    ui: { notify: (message: string) => { advisorNotice = message; } },
+    sessionManager: { getEntries: () => advisorEntries, getLeafId: () => advisorLeaf, getBranch: () => advisorEntries, getSessionId: () => "advisor-session" },
+    modelRegistry: { getAll: () => [advisorModel], getAvailable: () => [advisorModel], hasConfiguredAuth: () => true,
+      streamSimple: (model: any, context: any, options: any) => { advisorModelCalls++; advisorRequest = context; advisorOptions = options; return resultStream(advisorComplete(model, context, options)); } },
+  };
+  const advisor = registerAdvisor({
+    registerTool: (tool: any) => advisorTools.set(tool.name, tool), registerCommand: (command: string, definition: any) => advisorCommands.set(command, definition),
+    getActiveTools: () => activeAdvisorTools, setActiveTools: (names: string[]) => { activeAdvisorTools = names; },
+    appendEntry: (customType: string, data: unknown) => advisorAppend({ type: "custom", customType, data }),
+  } as never, advisorDir);
+  const advise = advisorTools.get("ask_advisor");
+  const advisorCommand = advisorCommands.get("advisor-model");
+  advisor.start(advisorContext);
+  const unconfiguredAdvice = await advise.execute("unconfigured", {}, undefined, undefined, advisorContext);
+  eq("advisor is inactive until an explicit model is selected", [activeAdvisorTools.includes("ask_advisor"), unconfiguredAdvice.isError, advisorModelCalls], [false, true, 0]);
+  await advisorCommand.handler("opencode-go/missing", advisorContext);
+  eq("advisor rejects invalid explicit models without fallback", [advisorNotice.includes("Unknown"), activeAdvisorTools.includes("ask_advisor"), advisorModelCalls], [true, false, 0]);
+  await advisorCommand.handler("opencode-go/advisor", advisorContext);
+  const selectedOptions = { selectedTools: ["ask_advisor"], sections: {} as Record<string, string> };
+  advisor.preparePrompt(selectedOptions, "system", advisorContext);
+  const advice = await advise.execute("ask", {}, undefined, undefined, advisorContext);
+  const requestText = JSON.stringify(advisorRequest);
+  eq("advisor receives effective compacted Lead evidence without private reasoning", [
+    activeAdvisorTools.includes("ask_advisor"), requestText.includes("CURRENT_EFFECTIVE_INSTRUCTIONS"), requestText.includes("COMPACTION_DECISION"),
+    requestText.includes("CURRENT_USER_TASK"), requestText.includes("CURRENT_VISIBLE_PLAN"), requestText.includes("END_OF_LONG_TOOL_EVIDENCE"),
+    requestText.includes("DISCARDED_OLD_TRANSCRIPT"), requestText.includes("PRIVATE_LEAD_REASONING"), requestText.includes("PRIVATE_SIGNATURE"), requestText.includes("PRIVATE_TEXT_SIGNATURE"), requestText.includes("PRIVATE_IMAGE_BYTES"),
+    advisorRequest.tools, advisorOptions.reasoning, advisorOptions.headers?.["x-opencode-session"], JSON.stringify(advice).includes("PRIVATE_ADVISOR_REASONING"), advice.details.usage.cost,
+  ], [true, true, true, true, true, true, false, false, false, false, false, undefined, "high", "advisor-session", false, 0.25]);
+  eq("advisor guidance is conditional and advisory", [selectedOptions.sections.pi_advisor.includes("Routine work does not require"), advise.parameters.additionalProperties, Object.keys(advise.parameters.properties).length], [true, false, 0]);
+  const workerSelection = resolveToolDefs("all", advisorDir).map((tool) => tool.name);
+  eq("advisor never enters the worker tool allowlist", workerSelection.includes("ask_advisor"), false);
+
+  advisorComplete = async () => responseWithUsage([{ type: "toolCall", id: "forbidden", name: "write", arguments: {} }], "toolUse");
+  const beforeForbidden = advisorModelCalls;
+  const forbiddenAdvice = await advise.execute("forbidden", {}, undefined, undefined, advisorContext);
+  eq("advisor rejects tool use without a second model call", [forbiddenAdvice.isError, forbiddenAdvice.content[0].text.includes("no tool was executed"), advisorModelCalls - beforeForbidden], [true, true, 1]);
+  advisorComplete = async () => responseWithUsage([{ type: "text", text: "partial" }], "error");
+  const failedAdvice = await advise.execute("failed", {}, undefined, undefined, advisorContext);
+  eq("advisor provider failure retains usage", [failedAdvice.isError, failedAdvice.details.status, failedAdvice.details.usage.cost, advisorEntries.at(-1).data.usage.cost], [true, "failed", 0.25, 0.25]);
+  const advisorCancel = new AbortController();
+  advisorComplete = async () => { advisorCancel.abort(); return responseWithUsage([{ type: "text", text: "LATE_SUCCESS_ADVICE" }]); };
+  const cancelledAdvice = await advise.execute("cancelled", {}, advisorCancel.signal, undefined, advisorContext);
+  eq("advisor cancellation rejects late success but records usage", [cancelledAdvice.isError, cancelledAdvice.details.status, JSON.stringify(cancelledAdvice).includes("LATE_SUCCESS_ADVICE"), cancelledAdvice.details.usage.cost, advisorEntries.at(-1).data.status], [true, "interrupted", false, 0.25, "interrupted"]);
+  const beforeOverflow = advisorModelCalls;
+  const largeContext = { ...advisorContext, getSystemPrompt: () => "x".repeat(500_000) };
+  const overflowAdvice = await advise.execute("oversized", {}, undefined, undefined, largeContext);
+  eq("advisor rejects oversized context without truncation or provider call", [overflowAdvice.isError, overflowAdvice.content[0].text.includes("no context was discarded"), advisorModelCalls], [true, true, beforeOverflow]);
+
+  let releaseAdvisor!: (response: any) => void;
+  advisorComplete = async () => new Promise((resolve) => { releaseAdvisor = resolve; });
+  const staleAdvice = advise.execute("stale", {}, undefined, undefined, advisorContext);
+  await Promise.resolve();
+  eq("advisor status shows an active consultation", advisor.status(advisorContext), "Advising…");
+  advisor.stop();
+  const entriesBeforeStale = advisorEntries.length;
+  advisor.start(advisorContext);
+  releaseAdvisor(responseWithUsage([{ type: "text", text: "OLD_BRANCH_ADVICE" }]));
+  const staleResult = await staleAdvice;
+  eq("advisor session replacement cannot journal or return old advice", [staleResult.details.status, JSON.stringify(staleResult).includes("OLD_BRANCH_ADVICE"), advisorEntries.length, staleResult.details.usage.cost], ["interrupted", false, entriesBeforeStale, 0.25]);
+  await advisorCommand.handler("off", advisorContext);
+  const offOptions = { selectedTools: ["ask_advisor"], sections: { pi_advisor: "old" } as Record<string, string> };
+  advisor.preparePrompt(offOptions, "system", advisorContext);
+  eq("advisor off removes tool and guidance", [activeAdvisorTools.includes("ask_advisor"), "pi_advisor" in offOptions.sections], [false, false]);
+  writeFileSync(_join(advisorDir, ".pi", "fusion.json"), JSON.stringify({ advisorModel: "opencode-go/advisor" }));
+  await advisorCommand.handler("clear", advisorContext);
+  eq("advisor clear restores trusted project default", activeAdvisorTools.includes("ask_advisor"), true);
+  advisor.start({ ...advisorContext, isProjectTrusted: () => false });
+  eq("advisor ignores untrusted project config", activeAdvisorTools.includes("ask_advisor"), false);
+  await advisorCommand.handler("status", advisorContext);
+  eq("advisor status reports recorded usage", advisorNotice.includes("$1.0000"), true);
+  advisor.stop();
+} finally { rmSync(advisorDir, { recursive: true, force: true }); }
+
 // --- 8d. registered tools launch detached background turns safely ---
 const fusionDir = mkdtempSync(_join(tmpdir(), "fusion-cancel-"));
 try {
@@ -870,19 +1147,20 @@ try {
   await sh("git", ["init", "-b", "main", fusionDir]);
   await tgit(fusionDir, ["add", "-A"]);
   await tgit(fusionDir, ["commit", "-m", "init"]);
-  const registered = new Map<string, { execute: (...args: any[]) => Promise<any>; renderCall?: (...args: any[]) => any }>();
-  const lifecycleHandlers = new Map<string, (...args: any[]) => Promise<void>>();
+  const registered = new Map<string, { execute: (...args: any[]) => Promise<any>; renderCall?: (...args: any[]) => any; promptSnippet?: string; promptGuidelines?: string[] }>();
+  const lifecycleHandlers = new Map<string, (...args: any[]) => void | Promise<void>>();
   const journalEntries: string[] = [];
+  const durableEntries: Array<{ type: string; customType: string; data: any }> = [];
   const completionMessages: Array<{ message: any; options: any }> = [];
   fusionExtension({
-    on: (event: string, handler: (...args: any[]) => Promise<void>) => lifecycleHandlers.set(event, handler),
-    registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any>; renderCall?: (...args: any[]) => any }) => registered.set(tool.name, tool),
+    on: (event: string, handler: (...args: any[]) => void | Promise<void>) => lifecycleHandlers.set(event, handler),
+    registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any>; renderCall?: (...args: any[]) => any; promptSnippet?: string; promptGuidelines?: string[] }) => registered.set(tool.name, tool),
     registerCommand: () => {},
-    appendEntry: (type: string) => journalEntries.push(type),
+    appendEntry: (type: string, data: unknown) => { journalEntries.push(type); durableEntries.push({ type: "custom", customType: type, data: structuredClone(data) }); },
     sendMessage: (message: any, options: any) => completionMessages.push({ message, options }),
   } as never);
 
-  const executorModel = { provider: "test", id: "executor", input: ["text"] };
+  const executorModel = { provider: "test", id: "executor", input: ["text"], contextWindow: 100_000, maxTokens: 4096 };
   const availableModels = [executorModel];
   let confirmCalls = 0;
   let customCalls = 0;
@@ -919,6 +1197,73 @@ try {
   const ask = registered.get("fusion_ask")!;
   const status = registered.get("fusion_status")!;
   const interrupt = registered.get("fusion_interrupt")!;
+  const beforeAgentStart = lifecycleHandlers.get("before_agent_start")!;
+  const routingSections = async (branch: unknown[] = [], selectedTools = ["fusion_spawn", "fusion_followup"], prompt = "Implement a two-file change") => {
+    const systemPromptOptions = { selectedTools: [...selectedTools], sections: { other_extension: "keep", pi_fusion_routing: "stale" } as Record<string, string> };
+    await beforeAgentStart({ prompt, systemPromptOptions }, { ...context, sessionManager: { getBranch: () => branch } });
+    return systemPromptOptions;
+  };
+  const availableRouting = await routingSections();
+  const dynamicPromptOptions = { selectedTools: ["fusion_spawn", "ask_advisor"], sections: {} as Record<string, string> };
+  const dynamicPromptEvent = {
+    prompt: "Review a consequential change",
+    systemPromptOptions: dynamicPromptOptions,
+    get systemPrompt() { return `Base prompt\n${Object.values(dynamicPromptOptions.sections).join("\n")}`; },
+  };
+  const dynamicPromptResult = await beforeAgentStart(dynamicPromptEvent, {
+    ...context,
+    sessionManager: { getBranch: () => [{ type: "custom", customType: "fusion-advisor-model", data: { advisorModel: "test/executor" } }] },
+  });
+  eq("dynamic Pi prompt keeps advisor and routing sections without forcing stale text", [
+    dynamicPromptResult,
+    dynamicPromptEvent.systemPrompt.includes("consequential approach decision"),
+    dynamicPromptEvent.systemPrompt.includes("Before substantial exploration"),
+  ], [undefined, true, true]);
+  const customPromptOptions = { customPrompt: "Do not delegate in this project", selectedTools: ["fusion_spawn"], sections: {} as Record<string, string> };
+  await beforeAgentStart({ prompt: "Review this", systemPromptOptions: customPromptOptions }, context);
+  eq("routing preserves custom prompt and states explicit precedence", [
+    customPromptOptions.customPrompt,
+    customPromptOptions.sections.pi_fusion_routing.includes("explicit user and project instructions take precedence"),
+  ], ["Do not delegate in this project", true]);
+  const forcedRouting = await routingSections([{ type: "custom", customType: "fusion-mode", data: { mode: "forced" } }]);
+  const offRouting = await routingSections([{ type: "custom", customType: "fusion-mode", data: { mode: "off" } }]);
+  const oneOffRouting = await routingSections([], ["fusion_spawn"], forceFusionPrompt("Implement a change"));
+  const disabledRouting = await routingSections([], ["read", "bash"]);
+  eq("available mode advertises Fusion and guides bounded delegation", [
+    spawn.promptSnippet?.includes("background worker"),
+    followup.promptSnippet?.includes("existing worker"),
+    availableRouting.sections.pi_fusion_routing.includes("Before substantial exploration"),
+    availableRouting.sections.pi_fusion_routing.includes("if unknown"),
+    availableRouting.sections.pi_fusion_routing.includes("short questions"),
+    availableRouting.sections.pi_fusion_routing.includes("only when Lead mutations are allowed"),
+    availableRouting.sections.pi_fusion_routing.includes("explicit user and project instructions take precedence"),
+    spawn.promptGuidelines?.some((rule) => rule.includes("bounded search goals")),
+    availableRouting.sections.other_extension,
+    availableRouting.selectedTools,
+  ], [true, true, true, true, true, true, true, true, "keep", ["fusion_spawn", "fusion_followup"]]);
+  eq("forced, off, one-off, and disabled tools omit routing guidance", [
+    "pi_fusion_routing" in forcedRouting.sections,
+    "pi_fusion_routing" in offRouting.sections,
+    "pi_fusion_routing" in disabledRouting.sections,
+    "pi_fusion_routing" in oneOffRouting.sections,
+    [forcedRouting, offRouting, oneOffRouting, disabledRouting].every((options) => options.sections.other_extension === "keep"),
+  ], [false, false, false, false, true]);
+  const legacyEvent = { prompt: "Implement a change", systemPrompt: "Base prompt", systemPromptOptions: { selectedTools: ["fusion_spawn"] } };
+  const legacyRouting = await beforeAgentStart(legacyEvent, context) as { systemPrompt?: string } | undefined;
+  const legacyRepeated = await beforeAgentStart({ ...legacyEvent, systemPrompt: legacyRouting?.systemPrompt }, context) as { systemPrompt?: string } | undefined;
+  const offContext = { ...context, sessionManager: { getBranch: () => [{ type: "custom", customType: "fusion-mode", data: { mode: "off" } }] } };
+  const legacyOff = await beforeAgentStart(legacyEvent, offContext);
+  const offSpawnCall = await lifecycleHandlers.get("tool_call")?.({ toolName: "fusion_spawn" }, offContext) as { block?: boolean } | undefined;
+  const availableSpawnCall = await lifecycleHandlers.get("tool_call")?.({ toolName: "fusion_spawn" }, context);
+  const offAdvisorCall = await lifecycleHandlers.get("tool_call")?.({ toolName: "ask_advisor" }, offContext);
+  eq("Fusion off does not block the Lead advisor", offAdvisorCall, undefined);
+  eq("off mode blocks Fusion calls without blocking available mode", [offSpawnCall?.block, availableSpawnCall], [true, undefined]);
+  eq("legacy Pi gets routing without duplicates or off-mode leakage", [
+    legacyRouting?.systemPrompt?.includes("<pi_fusion_routing>"),
+    legacyRouting?.systemPrompt?.includes("Base prompt"),
+    legacyRepeated,
+    legacyOff,
+  ], [true, true, undefined, undefined]);
   const plainTheme = {
     bold: (text: string) => text,
     fg: (_color: string, text: string) => text,
@@ -1007,6 +1352,29 @@ try {
     completionMessages[0]?.options.deliverAs,
     completionMessages[0]?.options.triggerTurn,
   ], ["fusion-result", true, "steer", true]);
+
+  writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: ["write"], executorToolsConsent: true }));
+  let recoveryRequests = 0;
+  completeImpl = async () => ++recoveryRequests === 1
+    ? responseWithUsage([{ type: "toolCall", id: "persist-write", name: "write", arguments: { path: "recover.txt", content: "durable edit" } }], "toolUse")
+    : responseWithUsage([{ type: "text", text: "provider partial failure" }], "error");
+  const recovery = await spawn.execute("recovery", { task: "write then recover" }, undefined, undefined, context);
+  await waitForStatus(recovery.details.turn_id, "failed");
+  const failedSnapshot = durableEntries.filter((entry) => entry.customType === "fusion-worker" && entry.data.worker.id === recovery.details.worker_id).at(-1)!;
+  const savedResult = failedSnapshot.data.worker.history.find((message: any) => message.role === "toolResult" && message.toolCallId === "persist-write");
+  let followupInput = "";
+  completeImpl = async (_model, completeContext) => { followupInput = JSON.stringify(completeContext); return responseWithUsage([{ type: "text", text: "recovered without repeating write" }]); };
+  const recoveryFollowup = await followup.execute("recover-followup", { worker_id: recovery.details.worker_id, message: "continue from saved state" }, undefined, undefined, context);
+  await waitForStatus(recoveryFollowup.details.turn_id, "completed");
+  const recoveryCosts = durableEntries.filter((entry) => entry.customType === "fusion-cost" && entry.data.worker_id === recovery.details.worker_id);
+  const recoveredSnapshot = durableEntries.filter((entry) => entry.customType === "fusion-worker" && entry.data.worker.id === recovery.details.worker_id).at(-1)!;
+  eq("registered worker persists real write through provider error and followup", [
+    readFileSync(_join(fusionDir, "recover.txt"), "utf8"), savedResult?.isError,
+    followupInput.includes("persist-write"), followupInput.includes("Successfully wrote"),
+    recoveryCosts.length, recoveryCosts.map((entry) => entry.data.usage.cost),
+    recoveredSnapshot.data.worker.telemetry.cumulative.cost,
+  ], ["durable edit", false, true, true, 2, [0.5, 0.25], 0.75]);
+  writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: "none" }));
 
   let releaseSteerFirst!: (message: unknown) => void;
   let releaseSteerSecond!: (message: unknown) => void;
@@ -1607,6 +1975,7 @@ eq("parse toggle", parseFusionCommand("  "), { kind: "toggle" });
 eq("parse once", parseFusionCommand("fix it"), { kind: "once", prompt: "fix it" });
 const fp = forceFusionPrompt("do X");
 eq("force marker roundtrip", isForcePrompt(fp) && fp.includes("do X") && fp.includes("LEAD"), true);
+eq("forced prompt allows bounded unknown-file exploration", fp.includes("bounded codebase exploration") && fp.includes("rather than guessing paths"), true);
 eq("force idempotent-guard", isForcePrompt("just hello"), false);
 eq("completions", fusionArgumentCompletions("o")?.map((c) => c.value), ["on", "off"]);
 eq("modeLabel", [modeLabel("forced"), modeLabel("off"), modeLabel("available")], ["Fusion forced", "Fusion off", "Fusion available"]);
@@ -1634,6 +2003,48 @@ await sessionStartHandlers[0]?.({}, {
   modelRegistry: { getAll: () => [], getAvailable: () => [] },
 });
 eq("fusion preserves built-in footer", [statusCall?.[0], statusCall?.[1].includes("Fusion available"), customFooterCalls], ["fusion", true, 0]);
+
+const compactStatusModel = { provider: "provider-not-in-footer", id: "a-very-long-executor-model-identifier", input: ["text"], reasoning: false };
+const compactStatusBranch: any[] = [
+  { type: "custom", customType: "fusion-mode", data: { mode: "off" } },
+  { type: "custom", customType: "fusion-advisor-model", data: { advisorModel: `${compactStatusModel.provider}/${compactStatusModel.id}` } },
+];
+const compactStatusContext: any = {
+  cwd: "/tmp", hasUI: true, ui: { setStatus: (key: string, text: string) => { statusCall = [key, text]; } },
+  sessionManager: { getBranch: () => compactStatusBranch }, isProjectTrusted: () => false,
+  modelRegistry: { getAll: () => [compactStatusModel], getAvailable: () => [compactStatusModel], hasConfiguredAuth: () => true },
+};
+await sessionStartHandlers[0]?.({}, compactStatusContext);
+eq("Fusion off keeps only the independent advisor badge", statusCall?.[1], "Fusion off • Advisor on");
+compactStatusBranch.shift();
+await sessionStartHandlers[0]?.({}, compactStatusContext);
+eq("idle Fusion status is compact and omits provider and disabled fast mode", [statusCall?.[1].includes("a-very-long-executor-mo… (off)"), statusCall?.[1].includes("provider-not-in-footer"), statusCall?.[1].includes("fast"), statusCall?.[1].endsWith("Advisor on")], [true, false, false, true]);
+
+// A cancelled /tree emits before_tree but no session_tree; advice remains usable.
+const cancelledTreeHandlers = new Map<string, any>();
+let cancelledTreeTool: any;
+const cancelledTreeModel = { ...registryModel, id: "tree-advisor", contextWindow: 100_000, maxTokens: 4096 };
+const cancelledTreeEntries: any[] = [
+  { type: "message", id: "tree-user", parentId: null, message: { role: "user", content: "review the current approach", timestamp: 1 } },
+  { type: "custom", id: "tree-model", parentId: "tree-user", customType: "fusion-advisor-model", data: { advisorModel: `${cancelledTreeModel.provider}/${cancelledTreeModel.id}` } },
+];
+let cancelledTreeRequests = 0;
+fusionExtension({
+  on: (event: string, handler: any) => cancelledTreeHandlers.set(event, handler),
+  registerTool: (tool: any) => { if (tool.name === "ask_advisor") cancelledTreeTool = tool; }, registerCommand: () => {},
+  appendEntry: (customType: string, data: any) => cancelledTreeEntries.push({ type: "custom", id: `tree-${cancelledTreeEntries.length}`, parentId: cancelledTreeEntries.at(-1).id, customType, data }),
+} as never);
+const cancelledTreeContext: any = {
+  cwd: "/tmp", hasUI: false, mode: "rpc", isProjectTrusted: () => false, getSystemPrompt: () => "system",
+  sessionManager: { getEntries: () => cancelledTreeEntries, getBranch: () => cancelledTreeEntries, getLeafId: () => cancelledTreeEntries.at(-1).id, getSessionId: () => "cancelled-tree" },
+  modelRegistry: { getAll: () => [cancelledTreeModel], getAvailable: () => [cancelledTreeModel], hasConfiguredAuth: () => true,
+    streamSimple: () => { cancelledTreeRequests++; return resultStream(responseWithUsage([{ type: "text", text: "Review still works." }])); } },
+};
+await cancelledTreeHandlers.get("session_start")({}, cancelledTreeContext);
+await cancelledTreeHandlers.get("session_before_tree")({}, cancelledTreeContext);
+const afterCancelledTree = await cancelledTreeTool.execute("after-cancelled-tree", {}, undefined, undefined, cancelledTreeContext);
+eq("cancelled tree navigation does not disable advisor", [afterCancelledTree.details.status, cancelledTreeRequests], ["completed", 1]);
+await cancelledTreeHandlers.get("session_shutdown")({}, cancelledTreeContext);
 
 // --- 11. /fusion-thinking persists a session override ---
 const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();

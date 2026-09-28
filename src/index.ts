@@ -34,7 +34,7 @@ import {
   type ThinkingOverride,
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
-import { SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
+import { AVAILABLE_LEAD_GUIDANCE, SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
 import { FusionPaneController, formatPaneTranscript, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
 import {
   FusionMonitorPublisher,
@@ -44,7 +44,7 @@ import {
   sanitizeMonitorText,
   type MonitorSnapshotPayload,
 } from "./monitor.ts";
-import { getTextContent, runExecutorTurn, supportsOpenAIFastMode } from "./llm.ts";
+import { getTextContent, runExecutorTurn, supportsOpenAIFastMode, type ExecutorCheckpoint } from "./llm.ts";
 import type { UsageLike } from "./cost.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
@@ -53,6 +53,8 @@ import { InquiryRuntime, type InquiryThread, type InquiryTurn } from "./inquiry.
 import { fusionArgumentCompletions, isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, parseFusionCommand, type FusionMode } from "./mode.ts";
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree } from "./worktree.ts";
 import { runSerialized } from "./mutation-queue.ts";
+import { registerAdvisor } from "./advisor.ts";
+import { selectModel } from "./model-picker.ts";
 
 const ContextMode = Type.Union([Type.Literal("none"), Type.Literal("recent")], { default: "none" });
 
@@ -320,6 +322,7 @@ export function deriveWorkerContextTelemetry(messages: Message[], contextWindow?
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index] as Message & { usage?: UsageLike; stopReason?: string };
     if (message.role !== "assistant" || !message.usage || message.stopReason === "error" || message.stopReason === "aborted") continue;
+    if (messages.slice(0, index).some((prefix) => prefix.timestamp > message.timestamp)) continue;
     let usageTokens = 0;
     try {
       usageTokens = calculateContextTokens(message.usage as never);
@@ -355,6 +358,7 @@ export function executorUsesSubscription(registry: ExtensionContext["modelRegist
 }
 
 export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) {
+  const advisor = registerAdvisor(pi, options.agentDir, (ctx) => refreshStatus(ctx));
   const runtime = new WorkerRuntime();
   const inquiries = new InquiryRuntime();
   const backgroundTurns = new Map<string, Promise<void>>();
@@ -727,6 +731,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     monitor.refresh();
     try {
       if (!ctx.hasUI) return;
+      const advisorStatus = advisor.status(ctx);
+      const advisorLabel = advisorStatus ? ` • ${advisorStatus}` : "";
       const active = runtime.list().filter(
         (worker) => worker.status === "running" || (pendingFollowups.get(worker.id)?.length ?? 0) > 0,
       );
@@ -746,19 +752,18 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           ? ` • steer ${pendingSteers}`
           : injectedSteers > 0 ? ` • updates ${injectedSteers}` : "";
         const action = worker.status === "running" ? formatLiveStatusAction(activity) : "settling";
-        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${action} • ${elapsed}${steerText}${queuedText}${more}`);
+        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${action} • ${elapsed}${steerText}${queuedText}${more}${advisorLabel}`);
         return;
       }
       const mode = restoreMode(ctx);
+      if (mode === "off") { ctx.ui.setStatus("fusion", `${modeLabel(mode)}${advisorLabel}`); return; }
       const warnings: string[] = [];
       const cfg = effectiveConfig(ctx);
       const resolved = resolveExecutorModel(ctx.modelRegistry, ctx.model, cfg.executor, warnings);
-      const execLabel = resolved ? modelDisplay(resolved) : "unset";
+      const execLabel = clipStatus(resolved?.id ?? "unset", 24);
       const thinkingLevel = resolved ? clampThinkingLevel(resolved, cfg.thinkingLevel) : "off";
-      const fastLabel = resolved && supportsOpenAIFastMode(resolved)
-        ? ` • fast ${cfg.fastMode ? "on" : "off"}`
-        : cfg.fastMode ? " • fast n/a" : "";
-      ctx.ui.setStatus("fusion", `${modeLabel(mode)} • executor ${execLabel} • thinking ${thinkingLevel}${fastLabel}`);
+      const fastLabel = cfg.fastMode && resolved && supportsOpenAIFastMode(resolved) ? " • fast" : "";
+      ctx.ui.setStatus("fusion", `${modeLabel(mode)} • ${execLabel} (${thinkingLevel})${fastLabel}${advisorLabel}`);
     } catch {
       // status is cosmetic
     }
@@ -801,6 +806,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    advisor.start(ctx);
     sessionEpoch += 1;
     sessionActive = true;
     activeContext = ctx;
@@ -815,15 +821,18 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     await suspendSession();
   });
   pi.on("session_tree", async (_event, ctx) => {
+    advisor.stop();
     // Defensive for hosts that emit only the post-tree event.
     await suspendSession();
     restoreRuntime(ctx);
+    advisor.start(ctx);
     sessionActive = true;
     activeContext = ctx;
     restorePane(ctx);
     refreshStatus(ctx);
   });
   pi.on("session_shutdown", async () => {
+    advisor.stop();
     await suspendSession();
     activeContext = undefined;
   });
@@ -861,6 +870,27 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     if (isForcePrompt(event.text.trim())) return { action: "continue" };
     if (restoreMode(ctx) !== "forced") return { action: "continue" };
     return { action: "transform", text: forceFusionPrompt(event.text), images: event.images };
+  });
+
+  // Available mode gets a short routing rule, without rewriting user messages
+  // or forcing every conversational request through a worker. Pi 0.87+ patches
+  // structured sections; older Pi requires a per-turn system-prompt return.
+  pi.on("before_agent_start", (event, ctx) => {
+    const systemPrompt = advisor.preparePrompt(event.systemPromptOptions, event.systemPrompt, ctx);
+    const enabled = restoreMode(ctx) === "available"
+      && event.systemPromptOptions.selectedTools?.includes("fusion_spawn")
+      && !isForcePrompt(event.prompt);
+    const sections = (event.systemPromptOptions as typeof event.systemPromptOptions & {
+      sections?: Record<string, string>;
+    }).sections;
+    if (sections) {
+      if (enabled) sections.pi_fusion_routing = AVAILABLE_LEAD_GUIDANCE;
+      else delete sections.pi_fusion_routing;
+      return;
+    } else if (enabled && !systemPrompt.includes("<pi_fusion_routing>")) {
+      return { systemPrompt: `${systemPrompt}\n\n<pi_fusion_routing>\n${AVAILABLE_LEAD_GUIDANCE}\n</pi_fusion_routing>` };
+    }
+    if (systemPrompt !== event.systemPrompt) return { systemPrompt };
   });
 
   function persist(ctx: ExtensionContext, workerId: string): void {
@@ -965,6 +995,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     liveToken = pane.beginLive(workerId);
     pane.refresh();
 
+    let checkpoint: ExecutorCheckpoint | undefined;
+    let steeredInstructions = 0;
     const exec = () => {
       signal.throwIfAborted();
       return runExecutorTurn(
@@ -982,6 +1014,18 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         (progress) => pane.updateLive(workerId, progress, liveToken),
         (finalCheckpoint) => drainSteeringMessages(workerId, turnId, finalCheckpoint),
         fastMode,
+        {
+          maxHistoryMessages: cfg.maxHistoryMessages,
+          checkpoint: (state) => {
+            if (!sessionActive || sessionEpoch !== epoch) return;
+            if (!runtime.checkpointTurn(turnId, state.history, state.usage, {
+              latestExecutor: modelDisplay(executor),
+              context: deriveWorkerContextTelemetry(state.history, executor.contextWindow),
+            })) return;
+            checkpoint = state;
+            persistCurrent();
+          },
+        },
       );
     };
 
@@ -996,16 +1040,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         : await exec();
       signal.throwIfAborted();
       const output = getTextContent(result.message);
-      const responseContext = deriveWorkerContextTelemetry(
-        [...worker.history, ...result.added],
-        executor.contextWindow,
-      );
-      if (!runtime.finishTurn(turnId, output, result.added, {
-        usage: result.usage,
-        latestUsage: result.message.usage,
-        latestExecutor: modelDisplay(executor),
-        context: responseContext,
-      })) {
+      if (!sessionActive || sessionEpoch !== epoch || !runtime.finishTurn(turnId, output, [])) {
         const status = worker.status === "closed"
           ? "closed"
           : runtime.getTurn(turnId)?.status === "interrupted" ? "interrupted" : "stale";
@@ -1016,33 +1051,10 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           details: { status, worker_id: workerId, turn_id: turnId },
         };
       }
-      const steeredInstructions = clearSteering(workerId, turnId).length;
-      // Independent compaction per worker (fusion-ref): the ladder rung is
-      // re-evaluated from failures every turn, so a compaction boundary also
-      // re-routes for free.
-      const compacted = runtime.compactHistory(worker, cfg.maxHistoryMessages);
+      steeredInstructions = clearSteering(workerId, turnId).length;
+      const compacted = checkpoint?.compacted ?? false;
       persistCurrent();
       pane.refresh();
-      try {
-        (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-cost", {
-          worker_id: workerId,
-          turn_id: turnId,
-          generation: turn.generation,
-          executor: modelDisplay(executor),
-          thinking_level: thinkingLevel,
-          fast_mode: fastMode,
-          service_tier: fastMode ? "priority" : "default",
-          rung,
-          usage: result.usage,
-          turns: result.turns,
-          tool_calls: result.toolCalls.length,
-          steered_instructions: steeredInstructions,
-          compacted,
-          timestamp: Date.now(),
-        });
-      } catch {
-        // cost journal is best-effort
-      }
       const header = `[fusion ${worker.id} | turn ${turnId} | generation ${turn.generation} | executor ${modelDisplay(executor)} | thinking ${thinkingLevel}${fastMode ? " | fast priority" : ""}${rung > 0 ? ` | escalated rung ${rung}` : ""}${steeredInstructions > 0 ? ` | steered ${steeredInstructions}` : ""}]`;
       return {
         text: `${header}\n\n${output}`,
@@ -1084,6 +1096,20 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         details: { status: "error", worker_id: workerId, turn_id: turnId, error: message, promoted_steers: promotedSteers },
       };
     } finally {
+      // One cost entry per settled turn preserves the existing cost consumers.
+      // Intermediate usage is already durable in fusion-worker checkpoints.
+      if (checkpoint && sessionActive && sessionEpoch === epoch && worker.generation === turn.generation) {
+        try {
+          (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-cost", {
+            worker_id: workerId, turn_id: turnId, generation: turn.generation,
+            executor: modelDisplay(executor), thinking_level: thinkingLevel,
+            fast_mode: fastMode, service_tier: fastMode ? "priority" : "default", rung,
+            usage: checkpoint.usage, turns: checkpoint.turns, tool_calls: checkpoint.toolCalls,
+            steered_instructions: steeredInstructions, compacted: checkpoint.compacted,
+            status: runtime.getTurn(turnId)?.status, timestamp: Date.now(),
+          });
+        } catch { /* cost journal is best-effort */ }
+      }
       runtime.untrackController(turnId);
       clearLive();
       pane.refresh();
@@ -1445,6 +1471,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   pi.registerTool({
     name: "fusion_spawn",
     label: "Fusion Spawn",
+    promptSnippet: "Delegate bounded codebase exploration or multi-step mechanical coding and verification to a persistent background worker",
     description: [
       "Start a PERSISTENT sidekick worker asynchronously (cheap executor, own session).",
       "Returns worker_id (wrk_...) + turn_id (trn_...) immediately while the turn continues in the background.",
@@ -1453,13 +1480,13 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       "Pass worktree for write work: the sidekick gets an isolated checkout+branch (pi-fusion/<name>), merged later with fusion_merge.",
     ].join(" "),
     promptGuidelines: [
-      "Use fusion_spawn for well-specified mechanical work: exact files, exact changes, constraints, verification to run.",
+      "Use fusion_spawn for bounded exploration or multi-step mechanical work: specify outcome, scope, constraints, and validation; include exact paths/edits when known, not guessed.",
       "fusion_spawn is non-blocking: after it returns the IDs, continue the user conversation or other Lead work. Do not busy-poll fusion_status; completion automatically hands control back to the Lead.",
       "When the result arrives, personally inspect the actual diff and relevant code before approval; the sidekick's report is evidence, not a substitute for Lead review.",
       "Send corrections via fusion_followup on the same worker_id instead of silently rewriting delegated work.",
       "Spawn a new worker only for independent work; otherwise follow up on the existing worker.",
       "Give overlapping write workers separate worktrees; never let two workers edit the same checkout.",
-      "When lead mutation enforcement is on, the lead cannot run commands for you — write specs that are fully self-sufficient (files, exact changes, verification commands to run yourself).",
+      "When lead mutation enforcement is on, the lead cannot run commands for you — write self-sufficient specs with known files or bounded search goals, constraints, and verification commands to run yourself.",
     ],
     parameters: SpawnParams,
     renderCall(args, theme, context) {
@@ -1530,6 +1557,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   pi.registerTool({
     name: "fusion_followup",
     label: "Fusion Followup",
+    promptSnippet: "Steer, correct, or continue an existing worker while preserving its context",
     description: [
       "Asynchronously continue the SAME persistent sidekick worker (wrk_...).",
       "If the worker is idle, returns a new turn_id and starts immediately.",
@@ -2003,17 +2031,18 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           return;
         }
         const lead = ctx.model ? modelDisplay(ctx.model) : "";
-        const items = ["auto (first non-lead authed text model)", ...candidates.map((m) => modelDisplay(m) + (modelDisplay(m) === lead ? "  [lead]" : ""))];
-        const choice = await ctx.ui.select("Fusion executor model:", items);
+        const items = [{ value: "auto", label: "auto", description: "First authenticated text model other than the Lead" },
+          ...candidates.map((model) => ({ value: modelDisplay(model), label: modelDisplay(model), description: [model.name, modelDisplay(model) === lead ? "Lead" : ""].filter(Boolean).join(" · ") }))];
+        const choice = await selectModel(ctx, "Fusion executor model", items, restoreExecutorOverride(ctx)?.auto ? "auto" : resolved ? modelDisplay(resolved) : "auto");
         if (!choice) {
           tell("Fusion executor unchanged", "warning");
           return;
         }
-        if (choice.startsWith("auto")) {
+        if (choice === "auto") {
           apply({ auto: true }, "auto");
           return;
         }
-        apply({ executor: choice.split(/\s+/)[0]! }, choice);
+        apply({ executor: choice }, choice);
         return;
       }
       const lower = arg.toLowerCase();

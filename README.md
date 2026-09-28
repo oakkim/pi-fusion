@@ -1,400 +1,213 @@
 # pi-fusion
 
-Persistent Lead/Sidekick (Devin Fusion pattern) for [pi](https://github.com/earendil-works/pi).
+Persistent background workers and an optional Lead advisor for [pi](https://github.com/earendil-works/pi).
 
-Two models work together: your **lead** plans and reviews, and a cheaper persistent
-**sidekick** implements — each with its own session, like
-[Cognition's Devin Fusion](https://cognition.ai/blog/devin-fusion).
+Your **Lead** plans the work and reviews the result. **Workers** (also called sidekicks) handle delegated tasks with their own conversation history. An optional **Advisor** gives the Lead a second opinion on difficult decisions.
 
-Lineage (ideas ported, not forked):
-- [pi-devin-fusion](https://github.com/khanhdeptraivaicachuong/pi-devin-fusion): pi extension idioms (consent gate, tool allowlist, bounded tool loop)
-- [opencode-agent](https://github.com/rink3y/opencode-agent): `wrk_`/`trn_` persistent worker protocol (spawn / followup / status / close / merge)
-- [Kylejeong2/fusion](https://github.com/Kylejeong2/fusion): reference implementation of the Fusion pattern (routing at compaction boundary, handoff framing)
-- [llm-fusion](https://github.com/przemekzur/llm-fusion): verify-then-escalate + cheap/frontier/fusion cost comparison
+Workers keep their context across follow-ups, so corrections and related work go back to the same worker. The Lead and user can keep talking while work runs in the background.
 
-## What v0 does
+## Install and quick start
 
-```
-Lead (your model, planner/reviewer)
-  |-- fusion_spawn "precise spec"  -> wrk_abc, trn_1 immediately (runs in background)
-  |-- fusion_followup wrk_abc "..." -> steer active turn (default) or start trn_2, SAME session history
-  |-- fusion_spawn worktree=parser ... -> wrk_def (isolated checkout pi-fusion/parser)
-  |-- fusion_followup wrk_def ...   -> same worktree
-  |-- fusion_merge wrk_def          -> commit + merge branch into project
-  |-- fusion_ask wrk_abc "what are you doing?" -> inq_1, iqt_1 (read-only side chat)
-  |-- fusion_ask inq_1 "what remains?"         -> same inquiry thread
-  |-- fusion_status wrk_abc | trn_1 | inq_1 | iqt_1
-  |-- fusion_close wrk_abc [remove]  -> retire; remove=true deletes checkout+branch
-  |-- /fusion-fast on|off            -> OpenAI priority tier for sidekick turns
-  |-- /fusion-monitor open           -> separate read-only worker TUI
-  +-- /fusion-status (list workers)
+Requires pi and Node.js 22.19.0 or later. Models use the providers already configured in pi.
+
+```bash
+pi install git:github.com/oakkim/pi-fusion
 ```
 
-- Sidekick keeps **independent persistent history** per worker (`WorkerRuntime`). Its final visible result is steered into the Lead at the next safe checkpoint after completion; private thinking is never forwarded.
-- Spawn and follow-up return IDs immediately, so the Lead and user can keep talking while the worker runs. Idle/queued follow-ups append to the same history with bumped `generation` (`<fusion_handoff generation="N">`); a busy `steer` stays inside the active generation.
-- Independent compaction per worker (`maxHistoryMessages`, default 40; keeps first + last N-1) with routing reconsidered at that boundary.
-- Mutating tools (bash/edit/write) require trusted project + consent. Mutating turns are serialized per checkout; workers in separate worktrees can mutate in parallel when writes stay inside those worktrees. Worktrees are not a filesystem sandbox. The monitor distinguishes turns queued for a shared checkout from turns waiting on the executor.
-- Session journal: worker and inquiry snapshots are appended as `fusion-worker` / `fusion-inquiry` custom entries and restored on `session_start` (best-effort durable across `/resume`).
+In an existing pi session, run `/reload`. Then choose a worker model:
 
-## Worktrees (v0.2)
-
-Write work goes to an isolated checkout so workers can mutate separate directories in parallel:
-
-```
-spawn worktree=parser -> ~/.pi/agent/fusion-worktrees/<proj>/parser (branch pi-fusion/parser)
-merge wrk_...          -> add -A + commit in worktree, refuse dirty project checkout,
-                           merge branch into the project branch. Worker stays alive.
-close wrk_... remove=true -> delete checkout + branch.
+```text
+/fusion-model
 ```
 
-Rules enforced: name must match `[a-zA-Z0-9-_]`; merge only idle workers; merge requires
-the project to be on the same branch as at spawn. The worktree is the default directory for
-relative tool paths and shell commands, not a filesystem sandbox: absolute paths and shell
-commands that leave the directory can still access other locations.
+The picker searches provider names, model IDs, and display names. It fits the terminal height and supports arrow keys, Page Up/Down, Enter, and Esc. `/advisor-model` uses the same picker. RPC sessions use pi's standard selection dialog.
 
-## Escalation (v0.3)
+Fusion starts in `available` mode: the Lead decides when to delegate. Ask for work normally, or use `/fusion on` to request the plan, delegate, and review workflow for each prompt. To enable the optional advisor, choose a model with `/advisor-model`.
+
+Worker writes require a trusted project and confirmation by default. Use `/fusion-consent allow` to allow them for the current session.
+
+## Commands
+
+Commands without arguments open a picker, toggle a view, or show status as described below.
+
+| Command | Purpose and arguments |
+| --- | --- |
+| `/fusion` | Toggle `available` and forced mode. `on` requests the delegation workflow for each prompt; `available` lets the Lead decide; `off` blocks all `fusion_*` tools. Use `/fusion <prompt>` for one forced prompt while Fusion is enabled. |
+| `/fusion-model` | Select the executor. Accepts `provider/model`, `auto` for automatic selection, or `clear` to restore the config default. |
+| `/advisor-model` | Select the Lead advisor. Accepts `provider/model`, `off`, `clear`, or `status` to show its model and usage. |
+| `/fusion-thinking` | Select executor reasoning effort. Accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `clear`. |
+| `/fusion-fast` | Select OpenAI priority processing. `on` and `off` save a global preference; `default` removes it; `status` shows the effective setting. |
+| `/fusion-consent` | Select worker write consent. `allow` and `ask` apply to the session; `default` restores config; `status` shows the setting. |
+| `/fusion-status` | List workers and inquiry threads. |
+| `/fusion-ask <id> <question>` | Ask about a worker using its `wrk_...` ID, or continue an inquiry using its `inq_...` ID. |
+| `/fusion-monitor` | Open a separate read-only monitor. Also accepts `open`, `close`, and `status`. |
+| `/fusion-pane` | Toggle the optional worker overlay. Also accepts `open`, `close`, and a `wrk_...` ID. |
+
+Mode, executor, thinking, consent, and advisor choices are stored in the session journal. Fast mode is the exception: its command saves a preference for current and future sessions.
+
+## Working with workers
+
+The Lead uses these tools to delegate and review work. They are model tools, not slash commands.
+
+Workers receive a task brief and a short language cue by default (`context_mode: "none"`). Set `context_mode: "recent"` on `fusion_spawn` to attach bounded recent user and assistant text; `context_turns` defaults to 4 and accepts 1 to 10. Workers do not automatically receive the full Lead conversation.
+
+| Tool | Behavior |
+| --- | --- |
+| `fusion_spawn` | Start a persistent worker and return `worker_id` and `turn_id` immediately. Supply `task`, an optional `label`, and an optional `worktree` name. |
+| `fusion_followup` | Send a `message` to the same `worker_id`, preserving its history. Busy workers support `steer`, `queue`, and `interrupt`. |
+| `fusion_status` | Inspect a worker (`wrk_`), turn (`trn_`), inquiry (`inq_`), or inquiry turn (`iqt_`) by `id`. |
+| `fusion_ask` | Ask a read-only `question` using `worker_id`, or continue the side conversation using `thread_id`. |
+| `fusion_interrupt` | Stop a worker's active turn without retiring it or counting a failure. Pending updates and queued follow-ups are cancelled by default. |
+| `fusion_close` | Retire a worker and interrupt its active turn. Its worktree is preserved unless `remove: true` is supplied. |
+| `fusion_merge` | Commit a worker's worktree changes and merge its branch into the project. The worker remains available for follow-ups. |
+
+Completion returns the visible result to the Lead automatically. If the Lead is busy, delivery waits for the next safe checkpoint; if idle, it starts a Lead turn. The Lead should inspect the actual changes and verification evidence, then send corrections to the same worker.
+
+### Updating a busy worker
+
+Choose `when_busy` on `fusion_followup` according to the intent:
+
+| Value | Use it for | Effect |
+| --- | --- | --- |
+| `steer` (default) | “Also cover this edge case.” | Add the instruction to the active turn after the current model response or tool batch finishes. |
+| `queue` | “After that, benchmark the result.” | Start a separate turn after the current work settles. |
+| `interrupt` | “Stop, this is the wrong repository.” | Abort, wait for cleanup, and start the replacement instruction first. Existing side effects are not rolled back. |
+
+Steering is cooperative: a running tool must finish before it can receive the update. A steer that arrives after the final checkpoint becomes a queued turn. Accepted updates survive a provider failure as a queued retry.
+
+### Worktrees
+
+For independent write tasks, give each worker a separate `worktree` name. Checkouts live under `~/.pi/agent/fusion-worktrees/` by default, with branches named `pi-fusion/<name>`. Names must be 1 to 64 letters, digits, underscores, or hyphens and begin with a letter or digit.
+
+Workers sharing a checkout serialize mutating turns. Workers in separate worktrees can write concurrently. A worktree sets the default working directory; it is not a filesystem sandbox.
+
+`fusion_merge` requires an idle worker, a clean project checkout, and the original project branch. It stages and commits the worktree's changes before attempting the merge. Review those changes first.
+
+**`fusion_close` with `remove: true` forcibly deletes the checkout and branch, including uncommitted or unmerged work.** Omit `remove` to preserve them.
+
+### History and recovery
+
+Completed model responses, tool results, and received usage are checkpointed, including progress from failed or interrupted turns. Unknown tool outcomes are marked so the worker can inspect side effects before retrying. Worker and inquiry snapshots are restored from the session journal when resuming.
+
+Before each worker request, token limits or `maxHistoryMessages` can trigger semantic summarization. It preserves the first handoff, latest instruction, and recent complete tool batches. Summary usage counts toward worker cost. If summarization fails or the context still does not fit, the turn stops and retains the original history.
+
+Session switches, reloads, and shutdown interrupt active workers and inquiries and cancel pending updates. Workers run inside pi; there is no separate worker daemon.
+
+## Lead advisor and worker inquiries
+
+These serve different purposes:
+
+| | Lead advisor | Worker inquiry |
+| --- | --- | --- |
+| Entry point | `ask_advisor()` after selecting `/advisor-model` | `fusion_ask` or `/fusion-ask` |
+| Context | Current Lead conversation | Snapshot of one worker's history and visible activity |
+| Model | Explicitly selected advisor model | Worker's executor, with executor fallback if unavailable |
+| Conversation | One stateless opinion per call | Persistent side conversation using `thread_id` |
+| Tools | None | None |
+
+The Lead can call `ask_advisor()` without arguments for a consequential decision, repeated failure, or complex review. Routine work does not require advice. The Lead checks the advice against evidence and makes the final decision. Workers cannot call the advisor, and `/fusion off` does not disable it.
+
+Advisor requests include the Lead's effective instructions, active compaction summary, current conversation, and full textual tool evidence. Private thinking and signatures are excluded, and images are marked unavailable. Oversized context is rejected without truncation: compact the Lead conversation or choose a larger model. Advisor reasoning follows the Lead's setting, clamped to the selected model's supported levels. An unavailable advisor never falls back to a different model.
+
+Worker inquiries run alongside the worker without changing its instructions. The worker never sees or remembers that side conversation. To act on an inquiry result, send a separate `fusion_followup`.
+
+## Status and monitoring
+
+The idle status line keeps the executor model short and shows advisor state without another model name:
+
+```text
+Fusion available • gpt-5.6-luna (max) • fast • Advisor on
+Fusion off • Advising…
+```
+
+`fast` appears only when enabled for a supported model. Active workers show their current tool or visible response, elapsed time, and pending updates. Private thinking is never shown. `/advisor-model status` reports advisor attempts, tokens, and cost for the current branch.
+
+For more detail, open `/fusion-monitor`. On macOS it uses Ghostty when available, then Terminal.app. The separate window shows workers, visible conversation and tool output, steering and queue state, and usage.
+
+| Monitor key | Action |
+| --- | --- |
+| `j` / `k`, Tab / Shift-Tab | Select a worker |
+| Up / Down, Page Up / Page Down | Scroll output |
+| `f` | Follow live activity |
+| `r` | Refresh |
+| `q` | Close the window |
+
+The monitor reads a local snapshot accessible only to the current user. It has no control socket or network listener and exits when the publisher stops. `/fusion-monitor close` stops publication and closes connected monitors.
+
+`/fusion-pane` provides a smaller, optional overlay inside pi. It keeps the editor usable, can cover part of the transcript, and hides below 110 terminal columns. Closing it does not stop the worker.
+
+## Configuration
+
+Use `.pi/fusion.json` for a trusted project or `~/.pi/agent/fusion.json` for global defaults. If `PI_CODING_AGENT_DIR` is set, the global file is under that directory.
+
+The first valid config file wins: trusted project first, global second. **The files are not merged.** An empty project config therefore uses built-in defaults rather than inheriting the global file's keys, except for the global fast preference described under [Priority processing](#priority-processing). Session overrides take precedence over the selected file.
+
+For example, replace these model IDs with ones available in your pi setup:
 
 ```json
 {
-  "executor": "opencode-go/deepseek-v4-flash",
-  "fallbackExecutors": ["opencode-go/deepseek-v4-pro"],
-  "maxEscalations": 1
+  "executor": "provider/worker-model",
+  "advisorModel": "provider/advisor-model",
+  "thinkingLevel": "off",
+  "executorTools": "all"
 }
 ```
 
-Effective ladder = `[executor, ...fallbacks]` (unavailable entries skipped with
-a warning, duplicates collapsed, capped at `1 + maxEscalations`). Rung is
-`min(consecutive_failures, ladder_top)`: one rung up per provider failure,
-auto-de-escalation on the next success. Evaluated every turn on purpose — a
-failing cheap model burns more than a cache miss, so waiting for a compaction
-boundary (fusion-ref's rule) is the wrong trade here.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `executor` | Automatic | First authenticated text model other than the Lead, falling back to the Lead if necessary. An unavailable configured executor also falls back to automatic selection. |
+| `advisorModel` | Off | Explicit `provider/model`; `false` disables it. |
+| `executorTools` | `"all"` | `"none"`, `"readonly"`, `"all"`, or a list of tool names. |
+| `executorToolsConsent` | `false` | Skip worker write confirmations when `true`; the project must still be trusted. |
+| `leadMutations` | `"allow"` | `"delegate"` blocks the Lead's `bash`, `edit`, and `write` tools, even with Fusion off. Reads remain available. |
+| `thinkingLevel` | `"off"` | Executor reasoning effort; clamped to each model's supported levels. |
+| `fastMode` | `false` | Request priority processing for supported OpenAI models. |
+| `fallbackExecutors` | `[]` | Ordered executor models used after failures. |
+| `maxEscalations` | `2` | Maximum fallback steps, from 0 to 5. |
+| `maxToolCalls` | `1024` | Tool-call ceiling per turn, from 1 to 1024. Repeated identical calls or consecutive tool errors also stop the loop after three attempts. |
+| `maxExecutorOutputTokens` | `4096` | Output-token limit per worker model request. |
+| `temperature` | `0.2` | Sampling temperature, from 0 to 2. |
+| `maxHistoryMessages` | `40` | Message-count trigger for compaction, from 4 to 200. Token limits can trigger it earlier. |
 
-Escalation is visible in the result header (`(escalated rung N)`), in
-`details` (`rung`, `escalated`, `ladder`), and in `fusion_status`
-(`consecutive_failures`). `fusion_interrupt` stops a runaway turn without
-recording a failure, so interrupting never causes false escalation.
+Available worker tools are `read`, `grep`, `find`, `ls`, `bash`, `edit`, and `write`. The `readonly` set contains the first four. A toolset containing `bash`, `edit`, or `write` requires trust and consent when a spawn or follow-up is requested. `/fusion-consent allow` skips the confirmation, but cannot bypass trust.
 
-## Modes (v0.4)
+### Model fallback
 
-```
-/fusion              -> toggle available <-> forced
-/fusion on           -> forced: every prompt goes through plan/delegate/review
-/fusion available    -> lead decides per task (default)
-/fusion off          -> all fusion_* tools mechanically blocked
-/fusion <prompt>     -> one-off forced send without changing mode
-```
+Each consecutive worker failure selects the next available model in `[executor, ...fallbackExecutors]`, up to `maxEscalations`. Unavailable and duplicate fallback entries are skipped. Success resets selection to the base executor; an explicit interruption does not count as a failure. The chosen fallback applies on the next turn, not as an immediate replay of the failed request.
 
-Forced mode hooks `input`: normal prompts are rewritten with the planner
-prefix before the lead sees them (commands and already-forced prompts pass
-through). Mode persists in the session journal (`fusion-mode` entry) and shows
-in the footer (`Fusion forced • executor ...`).
+### Priority processing
 
-## Executor picker (v0.5)
+`/fusion-fast on` and `off` save `fastMode` globally and clear the current session's older fast override. The global boolean takes precedence over a project's `fastMode`. `default` removes that global preference and returns to the selected config's value or the built-in `false` default. Older restored sessions can still carry their own fast override.
 
-```
-/fusion-model                  -> interactive picker (TUI) or current display (print)
-/fusion-model <provider/id>    -> set session override (beats fusion.json)
-/fusion-model auto             -> ignore the configured executor for this session
-/fusion-model clear            -> drop the override, back to fusion.json
-```
+Priority processing applies to direct OpenAI Responses and OpenAI Codex models. Unsupported fallback providers use their normal tier. It affects subsequent worker and inquiry turns, independently of Lead and Advisor settings. Priority pricing and availability depend on the provider and account.
 
-Resolution order: `/fusion-model` override > `fusion.json` > auto (first
-non-lead authed text model). Override lives in the session journal
-(`fusion-executor` entry); `/fusion-status` shows the effective executor.
+## Development
 
-## Executor thinking (v0.8)
-
-```
-/fusion-thinking                  -> interactive picker (TUI) or current display (print)
-/fusion-thinking high             -> set a session override for the sidekick
-/fusion-thinking off              -> disable sidekick reasoning
-/fusion-thinking clear            -> return to fusion.json (default: off)
+```bash
+git clone https://github.com/oakkim/pi-fusion.git
+cd pi-fusion
+npm install
+npm run check
+npm test
 ```
 
-The picker only offers levels supported by the effective executor. The requested
-level is clamped again for each escalation rung, so switching to a fallback model
-cannot send an unsupported reasoning effort. Calls normally use Pi's
-provider-neutral `streamSimple` path, which maps the level to each provider's
-native thinking API; OpenAI fast mode uses the full stream with the equivalent
-reasoning effort. The override is journaled as a `fusion-thinking` entry and applies to existing
-persistent workers on their next turn.
+Load the checkout for one session with `pi -e ./src/index.ts`, or install it locally with `pi install .`. pi loads the TypeScript source directly; no build step is required.
 
-## OpenAI fast mode (v0.15; persistent command in v0.17)
-
-```
-/fusion-fast                 -> interactive picker (TUI) or current status
-/fusion-fast on              -> persist priority processing for current and future sessions
-/fusion-fast off             -> persist the provider's default tier for all sessions
-/fusion-fast default         -> remove the persisted preference and use config/built-in default
-/fusion-fast status          -> show effective mode, source, and model support
-```
-
-Fast mode sends `service_tier: "priority"` through the full provider stream for
-direct `openai` Responses and `openai-codex` models, while preserving thinking,
-tool streaming, and provider-side cost accounting. It is independent from the
-Lead's setting and is re-evaluated for the actual escalation rung: unsupported
-fallback providers simply use their normal service tier. A toggle applies when
-the next worker or inquiry turn starts; it does not rewrite an already in-flight
-request. `on` and `off` atomically update the global `fusion.json` preference
-while preserving its other keys, then clear any older session-only override
-in the current session. The next Pi session therefore inherits the selected
-value automatically.
-`default` removes only the global `fastMode` key, allowing a trusted project
-config or the built-in `off` default to apply. `"fastMode"` can still be managed
-manually in `fusion.json`.
-
-Priority processing is faster but consumes the higher OpenAI priority tier
-(pi-ai currently prices it at 2x, or 2.5x for GPT-5.5). Availability and plan
-usage still depend on the authenticated OpenAI account.
-
-## Executor tool consent
-
-```
-/fusion-consent                 -> choose allow, ask, or config default
-/fusion-consent allow           -> skip spawn/followup mutation prompts for this session
-/fusion-consent ask             -> require a prompt for every mutating executor turn
-/fusion-consent default         -> return to fusion.json (default: ask)
-/fusion-consent status          -> show the effective mode and source
-```
-
-Session consent is journaled as `fusion-consent` and affects both new workers
-and persistent-worker followups. `allow` is rejected for untrusted projects;
-config-file consent is also loaded only from trusted projects.
-
-## Asynchronous turns and busy-worker control (v0.14)
-
-`fusion_spawn` and `fusion_followup` complete their tool call as soon as work is
-accepted. The sidekick then runs independently from the Lead turn's abort
-signal.
-
-A follow-up sent to a busy worker has three deliberately different modes:
-
-- `when_busy: "steer"` (default): fold a related correction or addition into the **same active turn**. The call returns a `str_...` ID. Pending updates are batched and injected after the current model response or complete tool batch, before the next model call; they become part of persistent worker history and final integrated validation.
-- `when_busy: "queue"`: preserve the active turn unchanged and dispatch a **distinct sequential turn** FIFO after it settles. Use this when the next task depends on the completed result rather than refining it.
-- `when_busy: "interrupt"`: abort the active turn, wait for background cleanup, then dispatch the new instruction at the front of the queue. Use this only when continuing is invalid, unsafe, or wasteful. Filesystem and command side effects are not rolled back, so the sidekick is told to inspect current state first. Accepted steering updates are carried into the replacement instruction instead of being lost.
-
-Rule of thumb: “also add this test/constraint” is `steer`; “after that,
-benchmark the finished result” is `queue`; “stop, this is the wrong repo or a
-destructive path” is `interrupt`.
-
-Steering is cooperative, not mid-call cancellation: a long-running tool must
-return before the sidekick can see an update. If a response has already crossed
-its final steering checkpoint, a requested steer safely falls back to the next
-queued turn. If a provider failure ends a turn after updates were accepted,
-those updates are promoted to a queued retry.
-
-Queued calls return a `qfu_...` ID instead of failing with `worker is busy`.
-The completion handoff identifies the automatically started turn so the Lead
-does not resend it. `fusion_status` reports `steering_updates` and queued
-entries; the status line shows `steer N`, `updates N`, and `queued N`.
-Standalone `fusion_interrupt` cancels pending steering updates and queued
-follow-ups by default; close, session switch, reload, and shutdown cancel them
-as well.
-
-When the worker finishes, pi-fusion shows a TUI notification and hands a small
-`fusion-result` custom message with the visible result back to the Lead
-(`deliverAs: "steer", triggerTurn: true`). If the Lead is busy, the result is
-inserted at the next safe checkpoint after the current tool batch and before the
-next model call; it never cancels a running tool. If idle, it starts a Lead turn
-immediately. This preserves the brief -> result -> review/feedback loop without
-blocking conversation or encouraging status polling. Session switch, reload,
-and shutdown interrupt active background workers and inquiries, then wait
-briefly for cleanup.
-
-## Read-only worker inquiries (v0.13)
-
-The Lead can ask what a worker is doing without steering or interrupting it:
-
-```text
-fusion_ask { worker_id: "wrk_...", question: "What are you doing and what remains?" }
-fusion_ask { thread_id: "inq_...", question: "Why did that command fail?" }
-/fusion-ask wrk_... What are you doing?
-/fusion-ask inq_... What remains?
-```
-
-Each `inq_...` is a separate persistent side-chat thread. Every question rebases
-that thread over a point-in-time snapshot of the worker's completed history and
-bounded public live telemetry (visible response, tool names/arguments/output,
-phase, steering updates, and queued follow-ups). Inquiry calls use the worker's executor model
-with no tools, run concurrently with the worker, and return asynchronously as a
-`fusion-inquiry-result`. Inquiry results use the same safe-checkpoint `steer`
-delivery, so a completed answer does not wait behind the rest of an active Lead
-turn. `fusion_status` accepts both `inq_...` and `iqt_...`.
-
-**The main worker never sees or remembers inquiry questions or answers.** The
-side chat is observational only and is never merged into worker history. If the
-answer should change the work, the Lead must send a separate `fusion_followup`.
-Private thinking is stripped from the snapshot and never exposed; questions
-about unobservable intent are answered as unknown or clearly labeled inference.
-The result also reports when the worker advanced after the captured snapshot.
-
-## Live status line (v0.11)
-
-The default TUI view stays unobstructed. While a worker runs, the Pi status line
-shows one compact view of its existing live stream:
-
-- tool call: a compact deterministic view such as `▶ bash · npm test`, `▶ read · src/index.ts:40`, or `✓ edit · src/index.ts · 2 edits`
-- tool state: `▶` running, `✓` succeeded, `✗` failed
-- visible response: the worker's latest visible words, unchanged
-- otherwise: `waiting`, `thinking`, or `starting`
-- elapsed time as `42s`, `3m 07s`, or `1h 02m 09s`, plus `steer N`, `updates N`, `queued N`, and `+N` when applicable
-
-Tool arguments are formatted locally by tool type; there is no extra model call
-or semantic summary. Visible response text is passed through directly, so the
-worker's conversation language
-naturally appears in the status line. Each handoff includes a bounded copy of
-the latest end-user message only as a language cue, so sidekick prose follows
-the current conversation while code, paths, commands, and raw output stay
-unchanged. Private thinking text is never exposed. Updates are throttled and
-the elapsed timer stops when no workers are active.
-
-## Read-only monitor sidecar (v0.18)
-
-```text
-/fusion-monitor              -> publish telemetry and open a separate monitor window
-/fusion-monitor open         -> open another monitor window
-/fusion-monitor status       -> show publisher state and snapshot path
-/fusion-monitor close        -> stop publishing and close connected sidecars
-```
-
-On macOS, pi-fusion opens a dedicated Ghostty window when available and falls
-back to Terminal.app. The sidecar uses `@earendil-works/pi-tui` in an alternate
-screen with a full-width worker list and scrollable detail view:
-
-- `j` / `k` or Tab / Shift-Tab selects a worker
-- Up / Down and Page Up / Page Down scroll output
-- `f` follows the newest live activity, `r` refreshes, and `q` closes
-- Lead/user messages use Pi-style user cards, visible Sidekick markdown uses Pi's
-  public assistant renderer, and tool calls/results are paired into compact
-  pending/success/error cards with bounded arguments/output
-- a fixed selected-worker coordination strip always shows `Steering N · Queue N`,
-  pending versus injected steering, and the latest/next bounded preview; worker
-  list badges and header totals remain visible while transcript follow mode scrolls
-- a fixed Pi-shaped usage footer shows cumulative `↑input ↓output RcacheRead
-  WcacheWrite CH% $cost (sub) context/window (auto)` plus the latest actual executor
-  when there is room; context is unknown before provider usage and immediately after
-  Fusion compaction
-- private thinking is removed before publication and terminal control sequences
-  from model/tool text are stripped before rendering; snapshots use a structured,
-  tool-call/result-paired schema and remain owner-only/read-only
-
-The bridge is read-only and local: the extension atomically writes a bounded,
-owner-only (`0600`) session snapshot under the OS temporary directory, and the
-sidecar only reads it. No control socket or network listener is opened. Updates
-are throttled and serialized. A lightweight heartbeat lets the sidecar exit if
-the owning Pi process dies or stops publishing; normal session shutdown marks
-the snapshot closed immediately. The monitor improves observability; it does
-not change worker execution speed.
-
-## Optional worker conversation pane (v0.9)
-
-```
-/fusion-pane                 -> toggle the detailed worker pane
-/fusion-pane open            -> show the latest/running worker
-/fusion-pane close           -> close the pane
-/fusion-pane wrk_...         -> show a specific worker
-```
-
-The non-capturing right-side overlay is now opt-in because it can obscure the
-transcript. When explicitly opened, it shows recent LEAD, SIDEKICK, and TOOL
-messages plus live phase, elapsed time, visible answer text, tool arguments,
-partial built-in tool output, and tool success/error. Live activity is
-transient: it is not added to worker history or the session journal, and is
-cleared when a turn finishes, fails, is interrupted, or the session shuts down.
-Closing the pane only hides it, so reopening during an active turn restores the
-current live view. Explicit pane visibility remains journaled; old auto-open
-journal entries restore closed. The pane automatically hides below 110 terminal
-columns.
-
-This is an overlay, not a true split: Pi's extension API cannot shrink or
-reflow the main transcript area. The overlay stays unfocused so the normal
-editor remains usable.
-
-## Lead discipline (v0.7)
-
-Two layers, following what others found (opencode-fusion's systemic Main edit
-ban beats prompt-only rules, which our bench showed the lead ignores):
-
-1. Planner prompt: delegate broad exploration and implementation, but require
-   the Lead to personally inspect the actual diff and relevant code before
-   approval. Sidekick reports are evidence, not a substitute for review.
-   Corrections use the same worker: steer related refinements, queue distinct
-   sequential work, and interrupt only invalid/unsafe/wasteful work. Repeated
-   failure or judgment-heavy work can trigger an explicit Lead takeover.
-2. `leadMutations: "allow" | "delegate"` (default allow). `"delegate"`
-   mechanically blocks lead bash/edit/write at the tool_call hook — reads and
-   fusion_* stay open specifically so mandatory Lead review remains possible.
-   Bench result: the block guarantees delegation but the lead burns retry loops
-   fighting it (suggest+enforce was the priciest arm); telling it upfront
-   (forced+enforce) halves the flailing. So: default allow, enforce only where
-   the guarantee matters. See `bench/results/manual-003.md`.
-
-## Cost harness (v0.6, `bench/`)
-
-Same task x 3 modes (`cheap` / `frontier` / `fusion`), comparing cost,
-success, and lead context load. Lead cost comes from `--mode json` stdout;
-sidekick cost comes from `fusion-cost` journal entries the extension writes
-per executor turn (see `bench/results/`).
+The optional [cost harness](bench/run.mjs) compares the same tasks across standalone models and Fusion. It calls configured providers and temporarily changes pi's trust and Fusion config, restoring both when finished. Review the model IDs in the runner before using it.
 
 ```bash
 node bench/run.mjs --tasks fix-offbyone,add-export --modes cheap,frontier,fusion --reps 1
 ```
 
-Environment quirk: spawning `pi` from node hangs silently (0 bytes, idle),
-while python-subprocess or direct shell works — so the runner goes through
-`bench/spawn.py`. The runner also backs up/restores `trust.json` +
-`fusion.json` and seeds per-run trust + a mutating bench config.
+Historical benchmark notes are in [bench/results](bench/results/).
 
-## What v0 does NOT do (deliberate)
+## Credits
 
-- No daemon/SQLite (opencode-agent has it; pi extension keeps in-memory + session journal).
-- No independent cache-warming daemon for sidekick sessions.
-- No automatic task-complexity classifier; the Lead decides when to delegate.
-- Background workers are asynchronous, but Pi does not run two interactive Lead transcripts at once.
+Inspired by [Devin Fusion](https://cognition.ai/blog/devin-fusion), with ideas adapted from:
 
-## Install
+- [pi-devin-fusion](https://github.com/khanhdeptraivaicachuong/pi-devin-fusion): pi extension patterns, consent, and tool limits.
+- [opencode-agent](https://github.com/rink3y/opencode-agent): persistent worker lifecycle and worktrees.
+- [Kylejeong2/fusion](https://github.com/Kylejeong2/fusion): task handoffs and model routing.
+- [llm-fusion](https://github.com/przemekzur/llm-fusion): verification, escalation, and cost comparisons.
 
-```bash
-pi install git:github.com/oakkim/pi-fusion
-# or clone for hacking
-# git clone https://github.com/oakkim/pi-fusion
-# pi install ./pi-fusion        # from a local checkout
-# pi -e ./pi-fusion/src/index.ts # ephemeral, no install
-```
-
-## Config (`.pi/fusion.json`, trusted projects only)
-
-```json
-{
-  "executor": "openai/gpt-4.1-mini",
-  "executorTools": "all",
-  "maxToolCalls": 1024,
-  "maxExecutorOutputTokens": 4096,
-  "temperature": 0.2,
-  "thinkingLevel": "off",
-  "fastMode": false,
-  "executorToolsConsent": false,
-  "maxHistoryMessages": 40
-}
-```
-
-`executorTools`: `"none" | "readonly" | "all" | ["read","grep","find","ls","bash","edit","write"]`.
-
-`maxToolCalls` defaults to 1024 as an emergency ceiling rather than a normal
-working budget. Repeated identical calls and consecutive tool failures still
-stop after three attempts, and the lead can interrupt a running worker.
-
-`thinkingLevel`: `"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"`.
-
-`fastMode`: OpenAI/OpenAI Codex Responses models only. `true` requests the
-priority service tier; other providers ignore it.
-
-`executorToolsConsent`: set `true` to skip per-turn mutating-tool confirmation
-for every session in this trusted project, or use `/fusion-consent allow` for a
-session-scoped grant.
-
-## Check
-
-```bash
-cd pi-fusion && npm install --omit=dev 2>/dev/null; npx tsc --noEmit
-```
+[MIT license](LICENSE).

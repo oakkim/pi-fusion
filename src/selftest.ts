@@ -421,12 +421,49 @@ eq("consent override ask", applyConsentOverride({ executorToolsConsent: true }, 
 eq("consent override clear", applyConsentOverride({ executorToolsConsent: true }, {}), { executorToolsConsent: true });
 
 // --- 8b. cost accounting ---
-import { addUsage, formatCompactTokens, formatUsageFooter, zeroUsage } from "../src/cost.ts";
+import { addUsage, formatCompactTokens, formatUsageFooter, nativeUsage, recordNativeUsage, zeroUsage } from "../src/cost.ts";
 const c0 = zeroUsage();
 const c1 = addUsage(c0, { input: 10, output: 5, totalTokens: 15, cost: { total: 1 } });
 const c2 = addUsage(c1, { input: 3, cost: { total: 2 } });
 const c3 = addUsage(c2, undefined);
 eq("usage sum", c3, { input: 13, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: 3 });
+
+// Native session usage records carry only the unrecorded part of each turn.
+const nativeEntries: any[] = [];
+let failAfterNativeAppend = false;
+const nativeManager = {
+  getEntries: () => nativeEntries,
+  appendUsage(kind: string, provider: string, model: string, usage: unknown, note?: string) {
+    if (this !== nativeManager) throw new Error("lost receiver");
+    nativeEntries.push({ type: "usage", kind, provider, model, usage, note });
+    if (failAfterNativeAppend) throw new Error("saved before notification failed");
+  },
+};
+const nativeContext = { sessionManager: nativeManager };
+const nativeModel = { provider: "test", id: "executor" };
+const recordCheckpoint = (usage: any, turn = "turn-a") => recordNativeUsage(nativeContext, turn, nativeModel, usage);
+const nativeCumulative = { input: 10, output: 2, cacheRead: 3, cacheWrite: 1, cacheWrite1h: 1, reasoning: 1, totalTokens: 16, cost: 0.1 };
+eq("native accounting ignores unavailable usage and older hosts", [
+  nativeUsage(undefined), nativeUsage({}), recordCheckpoint(undefined), recordCheckpoint({ input: -1, cost: -1 }),
+  recordNativeUsage({ sessionManager: { getEntries: () => [] } }, "old", nativeModel, nativeCumulative), nativeEntries.length,
+], [undefined, undefined, false, false, false, 0]);
+eq("native checkpoint records once with the SDK receiver", [recordCheckpoint(nativeCumulative), recordCheckpoint(nativeCumulative), nativeEntries.length], [true, false, 1]);
+const nativeNext = { ...nativeCumulative, input: 20, output: 4, cacheWrite1h: 2, reasoning: 3, totalTokens: 28, cost: 0.3 };
+eq("native checkpoint records only cumulative deltas", [recordCheckpoint(nativeNext), nativeEntries.at(-1).usage.input,
+  nativeEntries.at(-1).usage.totalTokens, nativeEntries.at(-1).usage.cacheWrite1h, nativeEntries.at(-1).usage.reasoning,
+  Math.abs(nativeEntries.at(-1).usage.cost.total - 0.2) < 1e-12,
+], [true, 10, 12, 1, 2, true]);
+eq("native accounting rejects repeats decreases and rounding dust", [recordCheckpoint(nativeNext), recordCheckpoint(nativeCumulative),
+  recordCheckpoint({ ...nativeNext, cost: 0.1 + 0.2 }), nativeEntries.length], [false, false, false, 2]);
+// A new helper invocation restores deduplication from all session entries, not a branch cache.
+eq("native accounting restores recorded usage and separates turns", [
+  recordNativeUsage({ sessionManager: { ...nativeManager, appendUsage: nativeManager.appendUsage.bind(nativeManager) } }, "turn-a", nativeModel, nativeNext),
+  recordCheckpoint(nativeCumulative, "turn-b"), nativeEntries.length,
+], [false, true, 3]);
+failAfterNativeAppend = true;
+eq("native append errors cannot double charge saved usage on retry", [recordCheckpoint(nativeCumulative, "turn-c"), recordCheckpoint(nativeCumulative, "turn-c"), nativeEntries.length], [false, false, 4]);
+failAfterNativeAppend = false;
+eq("native advisor usage stays distinct from worker accounting", [recordNativeUsage(nativeContext, "turn-a", nativeModel, nativeCumulative, "fusion-advisor"), nativeEntries.length], [true, 5]);
 eq("Pi compact token formatter", [
   formatCompactTokens(999), formatCompactTokens(1_000), formatCompactTokens(9_999),
   formatCompactTokens(10_000), formatCompactTokens(1_000_000), formatCompactTokens(10_000_000),
@@ -1055,9 +1092,11 @@ try {
   advisorAppend({ type: "message", message: { role: "user", content: [{ type: "text", text: "CURRENT_USER_TASK" }, { type: "image", data: "PRIVATE_IMAGE_BYTES", mimeType: "image/png" }], timestamp: 3 } });
   advisorAppend({ type: "message", message: responseWithUsage([{ type: "toolCall", id: "lead-read", name: "read", arguments: { path: "source.ts" } }], "toolUse") });
   advisorAppend({ type: "message", message: { role: "toolResult", toolCallId: "lead-read", toolName: "read", content: [{ type: "text", text: `evidence ${"x".repeat(35_000)} END_OF_LONG_TOOL_EVIDENCE` }], isError: false, timestamp: 4 } });
+  advisorAppend({ type: "custom_message", customType: "fusion-result", content: "WORKER_REVIEW_EVIDENCE", display: true });
   advisorAppend({ type: "message", message: responseWithUsage([{ type: "thinking", thinking: "PRIVATE_LEAD_REASONING", thinkingSignature: "PRIVATE_SIGNATURE" }, { type: "text", text: "CURRENT_VISIBLE_PLAN", textSignature: "PRIVATE_TEXT_SIGNATURE" }, { type: "toolCall", id: "current-advisor", name: "ask_advisor", arguments: {} }], "toolUse") });
   const advisorTools = new Map<string, any>();
   const advisorCommands = new Map<string, any>();
+  const manualAdvisorMessages: any[] = [];
   let activeAdvisorTools = ["read", "ask_advisor", "fusion_spawn"];
   let advisorNotice = "";
   const advisorModel = { provider: "opencode-go", id: "advisor", api: "openai-completions", input: ["text"], reasoning: true, contextWindow: 100_000, maxTokens: 8192 };
@@ -1069,7 +1108,8 @@ try {
     cwd: advisorDir, hasUI: false, mode: "rpc", model: { provider: "other", id: "lead" }, thinkingLevel: "high", isProjectTrusted: () => true,
     getSystemPrompt: () => "CURRENT_EFFECTIVE_INSTRUCTIONS",
     ui: { notify: (message: string) => { advisorNotice = message; } },
-    sessionManager: { getEntries: () => advisorEntries, getLeafId: () => advisorLeaf, getBranch: () => advisorEntries, getSessionId: () => "advisor-session" },
+    sessionManager: { getEntries: () => advisorEntries, getLeafId: () => advisorLeaf, getBranch: () => advisorEntries, getSessionId: () => "advisor-session",
+      appendUsage: (kind: string, provider: string, model: string, usage: unknown, note: string) => advisorAppend({ type: "usage", kind, provider, model, usage, note }) },
     modelRegistry: { getAll: () => [advisorModel], getAvailable: () => [advisorModel], hasConfiguredAuth: () => true,
       streamSimple: (model: any, context: any, options: any) => { advisorModelCalls++; advisorRequest = context; advisorOptions = options; return resultStream(advisorComplete(model, context, options)); } },
   };
@@ -1077,6 +1117,7 @@ try {
     registerTool: (tool: any) => advisorTools.set(tool.name, tool), registerCommand: (command: string, definition: any) => advisorCommands.set(command, definition),
     getActiveTools: () => activeAdvisorTools, setActiveTools: (names: string[]) => { activeAdvisorTools = names; },
     appendEntry: (customType: string, data: unknown) => advisorAppend({ type: "custom", customType, data }),
+    sendMessage: (message: any, options: any) => { manualAdvisorMessages.push({ message, options }); advisorAppend({ type: "custom_message", ...message }); },
   } as never, advisorDir);
   const advise = advisorTools.get("ask_advisor");
   const advisorQuestion = { question: "Which boundary must be verified before this migration?" };
@@ -1090,11 +1131,11 @@ try {
   const callsBeforeInvalidQuestion = advisorModelCalls;
   const entriesBeforeInvalidQuestion = advisorEntries.length;
   const invalidQuestions = [];
-  for (const params of [undefined, null, {}, { question: "" }, { question: " \n\t " }, { question: 42 }]) {
+  for (const params of [{ question: null }, { question: 42 }, { question: [] }, { question: {} }]) {
     const result = await advise.execute("invalid-question", params, undefined, undefined, advisorContext);
     invalidQuestions.push(result.isError && result.content[0].text.toLowerCase().includes("question"));
   }
-  eq("advisor requires a visible question before any provider call", [invalidQuestions.every(Boolean), advisorModelCalls, advisorEntries.length], [true, callsBeforeInvalidQuestion, entriesBeforeInvalidQuestion]);
+  eq("advisor rejects non-string questions before any provider call", [invalidQuestions.every(Boolean), advisorModelCalls, advisorEntries.length], [true, callsBeforeInvalidQuestion, entriesBeforeInvalidQuestion]);
   const selectedOptions = { selectedTools: ["ask_advisor"], sections: {} as Record<string, string> };
   advisor.preparePrompt(selectedOptions, "system", advisorContext);
   const advisorProgress: any[] = [];
@@ -1102,22 +1143,22 @@ try {
   const requestText = JSON.stringify(advisorRequest);
   eq("advisor receives effective compacted Lead evidence without private reasoning", [
     activeAdvisorTools.includes("ask_advisor"), requestText.includes("CURRENT_EFFECTIVE_INSTRUCTIONS"), requestText.includes("COMPACTION_DECISION"),
-    requestText.includes("CURRENT_USER_TASK"), requestText.includes("CURRENT_VISIBLE_PLAN"), requestText.includes("END_OF_LONG_TOOL_EVIDENCE"),
+    requestText.includes("CURRENT_USER_TASK"), requestText.includes("CURRENT_VISIBLE_PLAN"), requestText.includes("END_OF_LONG_TOOL_EVIDENCE"), requestText.includes("WORKER_REVIEW_EVIDENCE"),
     requestText.includes("DISCARDED_OLD_TRANSCRIPT"), requestText.includes("PRIVATE_LEAD_REASONING"), requestText.includes("PRIVATE_SIGNATURE"), requestText.includes("PRIVATE_TEXT_SIGNATURE"), requestText.includes("PRIVATE_IMAGE_BYTES"),
     advisorRequest.tools, advisorOptions.reasoning, advisorOptions.headers?.["x-opencode-session"], JSON.stringify(advice).includes("PRIVATE_ADVISOR_REASONING"), advice.details.usage.cost,
-  ], [true, true, true, true, true, true, false, false, false, false, false, undefined, "high", "advisor-session", false, 0.25]);
+  ], [true, true, true, true, true, true, true, false, false, false, false, false, undefined, "high", "advisor-session", false, 0.25]);
   eq("displayed consultation question reaches the provider as its latest request", [
     advisorProgress.some((update) => update.content[0].text.includes(advisorQuestion.question)),
     advisorRequest.messages.at(-1).role,
     advisorRequest.messages.at(-1).content.includes(advisorQuestion.question),
     advice.details.question,
   ], [true, "user", true, advisorQuestion.question]);
-  eq("advisor guidance is conditional and advisory", [selectedOptions.sections.pi_advisor.includes("Routine work does not require"), advise.parameters.additionalProperties, Object.keys(advise.parameters.properties), advise.parameters.required], [true, false, ["question"], ["question"]]);
+  eq("advisor guidance is conditional and permits general reviews", [selectedOptions.sections.pi_advisor.includes("not a mandatory gate"), advise.parameters.additionalProperties, Object.keys(advise.parameters.properties), advise.parameters.required ?? []], [true, false, ["question"], []]);
   const advisorTheme = { bold: (text: string) => text, fg: (_color: string, text: string) => text };
   const renderAdvisorCall = (args: unknown, expanded = false) => advise.renderCall(args, advisorTheme, { expanded }).render(200).map((line: string) => line.trimEnd()).join("\n");
   eq("advisor call shows a readable question without expanding", renderAdvisorCall(advisorQuestion).includes(`question: ${advisorQuestion.question}`), true);
   eq("expanded advisor call preserves multiline questions", renderAdvisorCall({ question: "Which approach?\nCompare the two options." }, true).includes("Which approach?\nCompare the two options."), true);
-  eq("advisor call handles partial and legacy arguments", [renderAdvisorCall(null).includes("question:"), renderAdvisorCall({}).includes("question:")], [true, true]);
+  eq("advisor call labels general reviews without inventing a question", [renderAdvisorCall(null).includes("General review"), renderAdvisorCall({}).includes("General review")], [true, true]);
   const unsafeAdvisorCall = renderAdvisorCall({ question: "Visible\u001b]2;INJECTED\u0007 question" });
   eq("advisor call removes terminal controls", [unsafeAdvisorCall.includes("INJECTED"), unsafeAdvisorCall.includes("\u001b")], [false, false]);
   const longAdvisorQuestion = `${"x".repeat(300)} END_OF_QUESTION`;
@@ -1166,6 +1207,112 @@ try {
   eq("advisor ignores untrusted project config", activeAdvisorTools.includes("ask_advisor"), false);
   await advisorCommand.handler("status", advisorContext);
   eq("advisor status reports recorded usage", advisorNotice.includes("$1.0000"), true);
+
+  advisor.start(advisorContext);
+  advisorComplete = async () => responseWithUsage([{ type: "text", text: "Review the verification boundary." }]);
+  const generalAdvice = await advise.execute("general", {}, undefined, undefined, advisorContext);
+  eq("advisor accepts general reviews and shows per-call usage", [generalAdvice.details.status,
+    advisorRequest.messages.at(-1).content.includes("Review the current task"), generalAdvice.content[0].text.includes("12 tokens"),
+    generalAdvice.content[0].text.includes("$0.2500"), generalAdvice.usage.cost.total,
+  ], ["completed", true, true, true, 0.25]);
+  const blankAdvice = await advise.execute("blank", { question: "  \n " }, undefined, undefined, advisorContext);
+  eq("blank advisor questions select general review", [blankAdvice.details.status, blankAdvice.details.question], ["completed", ""]);
+  eq("tool success error and cancellation expose native usage without side entries", [advice.usage.cost.total,
+    failedAdvice.usage.cost.total, cancelledAdvice.usage.cost.total, advisorEntries.filter((entry) => entry.type === "usage").length,
+  ], [0.25, 0.25, 0.25, 0]);
+  advisorComplete = async () => streamAssistant([{ type: "text", text: "Advice without pricing." }], "stop");
+  const unpricedAdvice = await advise.execute("unpriced", {}, undefined, undefined, advisorContext);
+  eq("advisor missing usage stays unavailable rather than free", [unpricedAdvice.usage,
+    unpricedAdvice.content[0].text.includes("tokens unavailable"), unpricedAdvice.content[0].text.includes("cost unavailable"),
+    unpricedAdvice.content[0].text.includes("$0.0000"),
+  ], [undefined, true, true, false]);
+
+  const savedAdvisorStream = advisorContext.modelRegistry.streamSimple;
+  const liveAdvisorStream = createAssistantMessageEventStream();
+  advisorContext.modelRegistry.streamSimple = () => liveAdvisorStream;
+  const liveUpdates: any[] = [];
+  const liveAdvicePromise = advise.execute("stream", {}, undefined, (update: any) => liveUpdates.push(update), advisorContext);
+  liveAdvisorStream.push({ type: "thinking_delta", contentIndex: 0, delta: "SECRET_THINKING", partial: streamAssistant([{ type: "thinking", thinking: "SECRET_THINKING" }]) } as any);
+  liveAdvisorStream.push({ type: "text_delta", contentIndex: 1, delta: "VISIBLE_BEFORE_DONE", partial: streamAssistant([{ type: "thinking", thinking: "SECRET_THINKING" }, { type: "text", text: "VISIBLE_BEFORE_DONE" }]) } as any);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  eq("advisor streams visible advice before final usage without private thinking", [JSON.stringify(liveUpdates).includes("VISIBLE_BEFORE_DONE"), JSON.stringify(liveUpdates).includes("SECRET_THINKING")], [true, false]);
+  liveAdvisorStream.push({ type: "done", reason: "stop", message: responseWithUsage([{ type: "text", text: "VISIBLE_BEFORE_DONE" }]) } as any);
+  await liveAdvicePromise;
+  advisorContext.modelRegistry.streamSimple = savedAdvisorStream;
+
+  advisorComplete = async () => responseWithUsage([{ type: "text", text: "MANUAL_REVIEW_EVIDENCE" }]);
+  const beforeManualCalls = advisorModelCalls;
+  await advisorCommand.handler("ask", advisorContext);
+  const manualMessage = manualAdvisorMessages.at(-1);
+  eq("manual general review saves one visible response without another Lead turn", [advisorModelCalls - beforeManualCalls,
+    manualMessage.message.customType, manualMessage.message.display, manualMessage.options.triggerTurn,
+    manualMessage.message.content.includes("General review"), manualMessage.message.content.includes("MANUAL_REVIEW_EVIDENCE"),
+    advisorEntries.filter((entry) => entry.type === "usage").length,
+  ], [1, "fusion-advisor-result", true, false, true, true, 1]);
+  await advisorCommand.handler("ask Which boundary?\nCheck the rollback path.", advisorContext);
+  eq("manual questions preserve multiline text and preceding advisor evidence", [advisorRequest.messages.at(-1).content,
+    advisorRequest.messages[0].content.includes("MANUAL_REVIEW_EVIDENCE"), advisorEntries.filter((entry) => entry.type === "usage").length,
+    (await advisorCommand.getArgumentCompletions("a"))[0].value,
+  ], ["Which boundary?\nCheck the rollback path.", true, 2, "ask "]);
+  const longManualQuestion = `Check ${"risk ".repeat(60)}\nIMPORTANT_FINAL_CONSTRAINT`;
+  await advisorCommand.handler(`ask ${longManualQuestion}`, advisorContext);
+  eq("manual review preserves the full question for the next Lead turn", manualAdvisorMessages.at(-1).message.content.includes(longManualQuestion), true);
+
+  // Drive the actual native TUI component without opening a terminal or making an API call.
+  initTheme("dark");
+  const dialogStream = createAssistantMessageEventStream();
+  let dialogSignal: AbortSignal | undefined;
+  let dialog: any;
+  let dialogRenders = 0;
+  advisorContext.modelRegistry.streamSimple = (_model: unknown, _context: unknown, options: any) => { dialogSignal = options.signal; return dialogStream; };
+  const dialogContext = { ...advisorContext, mode: "tui", hasUI: true, ui: { ...advisorContext.ui,
+    custom: (factory: any) => new Promise((done) => {
+      dialog = factory({ terminal: { rows: 24 }, requestRender: () => { dialogRenders++; } }, advisorTheme, getKeybindings(), (result: any) => { dialog.dispose(); done(result); });
+    }),
+  } };
+  const dialogPromise = advisorCommand.handler("ask inspect the running task", dialogContext);
+  const dialogText = "streamed response line\n".repeat(40);
+  dialogStream.push({ type: "text_delta", contentIndex: 0, delta: dialogText, partial: streamAssistant([{ type: "text", text: dialogText }]) } as any);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const dialogLines = dialog.render(80);
+  eq("manual advisor streams within the terminal viewport", [dialogRenders > 0, dialogLines.length <= 24, dialogLines.some((line: string) => line.includes("streamed response line"))], [true, true, true]);
+  dialog.handleInput("\x1b");
+  eq("Escape aborts the manual advisor request", dialogSignal?.aborted, true);
+  const nativeBeforeCancel = advisorEntries.filter((entry) => entry.type === "usage").length;
+  dialogStream.push({ type: "error", reason: "aborted", error: responseWithUsage([{ type: "text", text: "LATE_DIALOG_SUCCESS" }], "aborted") } as any);
+  await dialogPromise;
+  const cancelledManualMessage = manualAdvisorMessages.at(-1).message;
+  eq("manual cancellation records received usage once and labels partial advice", [cancelledManualMessage.details.status,
+    cancelledManualMessage.content.includes("Partial response (incomplete)"), cancelledManualMessage.content.includes("LATE_DIALOG_SUCCESS"),
+    advisorEntries.filter((entry) => entry.type === "usage").length - nativeBeforeCancel,
+  ], ["interrupted", true, false, 1]);
+  advisorContext.modelRegistry.streamSimple = savedAdvisorStream;
+
+  let earlyLoaderDisposals = 0;
+  await advisorCommand.handler("ask", { ...dialogContext,
+    modelRegistry: { ...advisorContext.modelRegistry, hasConfiguredAuth: () => false },
+    ui: { ...dialogContext.ui, custom: (factory: any) => new Promise((done) => {
+      // Match Pi's factory-before-install ordering: early completion has no host-owned component to dispose.
+      let closed = false;
+      let installed: any;
+      const component = factory({ terminal: { rows: 24 }, requestRender() {} }, advisorTheme, getKeybindings(), (result: any) => {
+        closed = true; installed?.dispose(); done(result);
+      });
+      const dispose = component.dispose.bind(component);
+      component.dispose = () => { earlyLoaderDisposals++; dispose(); };
+      Promise.resolve(component).then((value) => { if (!closed) installed = value; });
+    }) },
+  });
+  eq("unavailable manual advisor disposes its loader before UI installation", earlyLoaderDisposals, 1);
+
+  advisorComplete = async () => new Promise((resolve) => { releaseAdvisor = resolve; });
+  const staleManual = advisorCommand.handler("ask review old branch", advisorContext);
+  await Promise.resolve();
+  const beforeStaleManual = [advisorEntries.length, manualAdvisorMessages.length];
+  advisor.stop(); advisor.start(advisorContext);
+  releaseAdvisor(responseWithUsage([{ type: "text", text: "STALE_MANUAL_ADVICE" }]));
+  await staleManual;
+  eq("manual session replacement cannot publish or charge another session", [advisorEntries.length, manualAdvisorMessages.length], beforeStaleManual);
 
   // Independent advisor effort and priority must reach the provider, not just the UI.
   advisor.start(advisorContext);
@@ -1331,7 +1478,7 @@ try {
   });
   eq("dynamic Pi prompt keeps advisor and routing sections without forcing stale text", [
     dynamicPromptResult,
-    dynamicPromptEvent.systemPrompt.includes("consequential approach decision"),
+    dynamicPromptEvent.systemPrompt.includes("consequential design choice"),
     dynamicPromptEvent.systemPrompt.includes("Before substantial exploration"),
   ], [undefined, true, true]);
   const customPromptOptions = { customPrompt: "Do not delegate in this project", selectedTools: ["fusion_spawn"], sections: {} as Record<string, string> };

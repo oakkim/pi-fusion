@@ -44,7 +44,7 @@ import {
   type MonitorSnapshotPayload,
 } from "./monitor.ts";
 import { getTextContent, runExecutorTurn, supportsOpenAIFastMode, type ExecutorCheckpoint } from "./llm.ts";
-import { addUsage, zeroUsage, type UsageLike } from "./cost.ts";
+import { addUsage, recordNativeUsage, zeroUsage, type UsageLike } from "./cost.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
 import { WorkerRuntime, type WorkerContextTelemetry, type WorkerRecord } from "./runtime.ts";
@@ -979,6 +979,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
             })) return;
             checkpoint = state;
             persistCurrent();
+            recordNativeUsage(ctx, turnId, executor, state.usage);
           },
         },
       );

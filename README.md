@@ -60,6 +60,7 @@ Type a space after the command to see its subcommands. Start typing to filter su
 | Advisor command | Purpose |
 | --- | --- |
 | `/advisor` or `/advisor status` | Show the model, thinking, fast mode, and this branch's usage. |
+| `/advisor ask [question]` | Ask directly, or omit the question for a general review. |
 | `/advisor model [provider/model]` | Select an authenticated advisor model. |
 | `/advisor thinking [level]` | Select advisor reasoning effort. `clear` forgets the saved choice and restores config or follows the Lead. |
 | `/advisor fast [action]` | Select advisor priority processing. `on` and `off` save a global preference; `default` removes it; `status` shows the setting. |
@@ -124,15 +125,17 @@ These serve different purposes:
 
 | | Lead advisor | Worker inquiry |
 | --- | --- | --- |
-| Entry point | `ask_advisor({ question })` after selecting `/advisor model` | `fusion_ask` or `/fusion ask` |
+| Entry point | `ask_advisor({})`, `ask_advisor({ question })`, or `/advisor ask` after selecting `/advisor model` | `fusion_ask` or `/fusion ask` |
 | Context | Current Lead conversation | Snapshot of one worker's history and visible activity |
 | Model | Explicitly selected advisor model | Worker's executor, with executor fallback if unavailable |
 | Conversation | One stateless opinion per call | Persistent side conversation using `thread_id` |
 | Tools | None | None |
 
-The Lead calls `ask_advisor` with a short question naming the decision, uncertainty, or result to review. For example, `ask_advisor({ "question": "Is this migration safe to apply before updating the API?" })`. The call shows the question immediately, keeps it visible while consulting, and sends that same question to the advisor alongside the full Lead context. Expand the call to read a longer question.
+The Lead can call `ask_advisor({})` for a general review of the current task, approach, risks, and verification. For a specific decision, supply a short question, for example `ask_advisor({ "question": "Is this migration safe to apply before updating the API?" })`. The call shows `General review` or the supplied question, streams visible advice, and shows the recorded token usage and cost when finished. Missing usage is shown as unavailable. Expand the call to read a longer question.
 
-Use advice for a consequential decision, repeated failure, or complex review. Routine work does not require it. The Lead checks the advice against evidence and makes the final decision. Workers cannot call the advisor, and `/fusion off` does not disable it.
+Consider advice before a consequential design choice, after two similar failed attempts or stalled progress, and before declaring a complex change complete. Routine work does not require it. This is guidance for the Lead, not an automatic execution gate. The Lead checks the advice against evidence and makes the final decision. Workers cannot call the advisor, and `/fusion off` does not disable it.
+
+Use `/advisor ask` for a direct general review, or `/advisor ask <question>` to focus it. In the interactive UI, advice streams in a cancellable dialog; Escape cancels the request. The result is saved in the conversation for the Lead's next turn without starting an extra Lead request.
 
 Advisor requests include the Lead's effective instructions, active compaction summary, current conversation, and full textual tool evidence. Private thinking and signatures are excluded, and images are marked unavailable. Oversized context is rejected without truncation: compact the Lead conversation or choose a larger model. An unavailable advisor never falls back to a different model.
 
@@ -152,6 +155,8 @@ Fusion off • Advising…
 `fast` in the status line refers to the executor and appears only when enabled for a supported model. Active workers show their current tool or visible response, elapsed time, and pending updates. Private thinking is never shown. `/advisor status` reports advisor settings, attempts, tokens, and cost for the current branch.
 
 `/fusion status` shows the current branch's recorded cost total with separate Workers, Inquiries, and Advisor amounts. Worker costs include received usage checkpoints, including failed or interrupted turns, without counting the final cost entry again. Lead costs are not included. These are usage costs recorded by the model SDK, not an account invoice; requests with no recorded usage do not contribute an amount.
+
+Advisor tool calls also return usage to Pi's built-in accounting. On hosts with native usage recording, verified with Pi 0.87, background worker checkpoints and manual advisor calls contribute to Pi's session totals and default footer as well. Repeated checkpoints are not charged twice. Older hosts retain Fusion's own recorded totals. Pi's totals cover the whole session, including the Lead; `/fusion status` covers the current branch's Fusion activity, so the two amounts can differ.
 
 For more detail, open `/fusion monitor`. On macOS it prefers Ghostty and falls back to Terminal.app when Ghostty is not installed. The monitor starts as a command rather than opening its script and snapshot as documents, avoiding duplicate file-open prompts in Ghostty 1.3.1. The separate window shows workers, visible conversation and tool output, steering and queue state, and usage.
 

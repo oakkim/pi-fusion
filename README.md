@@ -46,7 +46,7 @@ Type a space after the command to see its subcommands. Start typing to filter su
 
 | Fusion command | Purpose |
 | --- | --- |
-| `/fusion` or `/fusion status` | Show the current mode, executor, workers, and inquiry threads. |
+| `/fusion` or `/fusion status` | Show the current mode, executor, recorded costs, workers, and inquiry threads. |
 | `/fusion on`, `/fusion available`, `/fusion off` | Request delegation for each prompt, let the Lead decide, or block `fusion_*` tools. |
 | `/fusion model [provider/model]` | Select the executor. `auto` uses automatic selection; `clear` restores the config default. |
 | `/fusion thinking [level]` | Select executor reasoning effort. `clear` restores the config default. |
@@ -124,13 +124,15 @@ These serve different purposes:
 
 | | Lead advisor | Worker inquiry |
 | --- | --- | --- |
-| Entry point | `ask_advisor()` after selecting `/advisor model` | `fusion_ask` or `/fusion ask` |
+| Entry point | `ask_advisor({ question })` after selecting `/advisor model` | `fusion_ask` or `/fusion ask` |
 | Context | Current Lead conversation | Snapshot of one worker's history and visible activity |
 | Model | Explicitly selected advisor model | Worker's executor, with executor fallback if unavailable |
 | Conversation | One stateless opinion per call | Persistent side conversation using `thread_id` |
 | Tools | None | None |
 
-The Lead can call `ask_advisor()` without arguments for a consequential decision, repeated failure, or complex review. Routine work does not require advice. The Lead checks the advice against evidence and makes the final decision. Workers cannot call the advisor, and `/fusion off` does not disable it.
+The Lead calls `ask_advisor` with a short question naming the decision, uncertainty, or result to review. For example, `ask_advisor({ "question": "Is this migration safe to apply before updating the API?" })`. The call shows the question immediately, keeps it visible while consulting, and sends that same question to the advisor alongside the full Lead context. Expand the call to read a longer question.
+
+Use advice for a consequential decision, repeated failure, or complex review. Routine work does not require it. The Lead checks the advice against evidence and makes the final decision. Workers cannot call the advisor, and `/fusion off` does not disable it.
 
 Advisor requests include the Lead's effective instructions, active compaction summary, current conversation, and full textual tool evidence. Private thinking and signatures are excluded, and images are marked unavailable. Oversized context is rejected without truncation: compact the Lead conversation or choose a larger model. An unavailable advisor never falls back to a different model.
 
@@ -148,6 +150,8 @@ Fusion off • Advising…
 ```
 
 `fast` in the status line refers to the executor and appears only when enabled for a supported model. Active workers show their current tool or visible response, elapsed time, and pending updates. Private thinking is never shown. `/advisor status` reports advisor settings, attempts, tokens, and cost for the current branch.
+
+`/fusion status` shows the current branch's recorded cost total with separate Workers, Inquiries, and Advisor amounts. Worker costs include received usage checkpoints, including failed or interrupted turns, without counting the final cost entry again. Lead costs are not included. These are usage costs recorded by the model SDK, not an account invoice; requests with no recorded usage do not contribute an amount.
 
 For more detail, open `/fusion monitor`. On macOS it uses Ghostty when available, then Terminal.app. The separate window shows workers, visible conversation and tool output, steering and queue state, and usage.
 

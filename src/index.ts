@@ -11,11 +11,10 @@
  */
 
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai/compat";
-import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   applyConsentOverride,
@@ -45,7 +44,7 @@ import {
   type MonitorSnapshotPayload,
 } from "./monitor.ts";
 import { getTextContent, runExecutorTurn, supportsOpenAIFastMode, type ExecutorCheckpoint } from "./llm.ts";
-import type { UsageLike } from "./cost.ts";
+import { addUsage, zeroUsage, type UsageLike } from "./cost.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
 import { WorkerRuntime, type WorkerContextTelemetry, type WorkerRecord } from "./runtime.ts";
@@ -54,6 +53,7 @@ import { isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, type Fusion
 import { createWorktree, execDirOf, mergeWorktree, removeWorktree } from "./worktree.ts";
 import { runSerialized } from "./mutation-queue.ts";
 import { registerAdvisor } from "./advisor.ts";
+import { fusionCallArgument, fusionCallMetadata, renderFusionRequestCall } from "./tool-call.ts";
 import { modelCompletions, selectModel } from "./model-picker.ts";
 import { registerCommandGroup, type Subcommand } from "./commands.ts";
 
@@ -167,52 +167,6 @@ function clipStatus(value: string, max: number, tail = false): string {
   const text = statusText(value);
   if (text.length <= max) return text;
   return tail ? `…${text.slice(-(max - 1))}` : `${text.slice(0, max - 1)}…`;
-}
-
-const FUSION_CALL_PREVIEW_CHARS = 240;
-const FUSION_CALL_EXPANDED_CHARS = 8_000;
-
-function sanitizeFusionCallText(value: unknown): string {
-  return sanitizeMonitorText(value, Number.MAX_SAFE_INTEGER).trim();
-}
-
-function clipFusionCallText(value: string, max: number): string {
-  if (value.length <= max) return value;
-  return `${value.slice(0, Math.max(0, max - 1))}…`;
-}
-
-function formatFusionCallRequest(value: unknown, expanded: boolean): string {
-  const text = sanitizeFusionCallText(value);
-  if (!text) return "…";
-  if (!expanded) return clipFusionCallText(text.replace(/\s+/g, " "), FUSION_CALL_PREVIEW_CHARS);
-  if (text.length <= FUSION_CALL_EXPANDED_CHARS) return text;
-  const marker = "\n… [truncated]";
-  return `${text.slice(0, FUSION_CALL_EXPANDED_CHARS - marker.length)}${marker}`;
-}
-
-function fusionCallMetadata(name: string, value: unknown): string | undefined {
-  const text = sanitizeFusionCallText(value).replace(/\s+/g, " ");
-  return text ? `${name}=${clipFusionCallText(text, 80)}` : undefined;
-}
-
-function fusionCallArgument(args: unknown, name: string): unknown {
-  if (!args || typeof args !== "object") return undefined;
-  return (args as Record<string, unknown>)[name];
-}
-
-function renderFusionRequestCall(
-  title: string,
-  requestName: "task" | "message",
-  request: unknown,
-  metadata: Array<string | undefined>,
-  theme: Theme,
-  expanded: boolean,
-): Text {
-  const details = metadata.filter((item): item is string => Boolean(item)).join(" · ");
-  let text = theme.fg("toolTitle", theme.bold(title));
-  if (details) text += ` ${theme.fg("muted", details)}`;
-  text += `\n${theme.fg("muted", `${requestName}:`)} ${theme.fg("toolOutput", formatFusionCallRequest(request, expanded))}`;
-  return new Text(text, 0, 0);
 }
 
 export function formatElapsedDuration(elapsedMs: number): string {
@@ -2431,7 +2385,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
 
   fusionCommands.set("status", {
     acceptsArguments: false,
-    description: "List persistent sidekick workers and read-only inquiry threads",
+    description: "Show workers, inquiries, and recorded branch costs",
     handler: async (_args, ctx) => {
       const workers = runtime.list();
       const inquiryThreads = inquiries.list();
@@ -2443,6 +2397,20 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         ? ` • fast ${cfg.fastMode ? "on" : "off"}`
         : cfg.fastMode ? " • fast n/a" : "";
       const head = `${modeLabel(restoreMode(ctx))} • executor ${exec ? modelDisplay(exec) : "unset"} • thinking ${thinkingLevel}${fastLabel}${cfg.fallbackExecutors.length ? ` • fallbacks ${cfg.fallbackExecutors.join(",")}` : ""}`;
+      const recordedWorkers = new Set(workers.filter((worker) => worker.telemetry?.cumulative).map((worker) => worker.id));
+      let workerUsage = workers.reduce((usage, worker) => addUsage(usage, worker.telemetry?.cumulative), zeroUsage());
+      let inquiryUsage = zeroUsage();
+      let advisorUsage = zeroUsage();
+      for (const entry of ctx.sessionManager.getBranch()) {
+        if (entry.type !== "custom" || !entry.data || typeof entry.data !== "object") continue;
+        const data = entry.data as { worker_id?: string; usage?: UsageLike };
+        // Live/restored telemetry already includes its worker's cost journal.
+        if (entry.customType === "fusion-cost" && (!data.worker_id || !recordedWorkers.has(data.worker_id))) workerUsage = addUsage(workerUsage, data.usage);
+        else if (entry.customType === "fusion-inquiry-cost") inquiryUsage = addUsage(inquiryUsage, data.usage);
+        else if (entry.customType === "fusion-advisor-cost") advisorUsage = addUsage(advisorUsage, data.usage);
+      }
+      const totalCost = workerUsage.cost + inquiryUsage.cost + advisorUsage.cost;
+      const costLine = `Recorded cost (current branch): $${totalCost.toFixed(4)} • Workers $${workerUsage.cost.toFixed(4)} • Inquiries $${inquiryUsage.cost.toFixed(4)} • Advisor $${advisorUsage.cost.toFixed(4)}`;
       const body = workers.length
         ? workers.map((w) => {
           const steerCount = steeringFor(w.id, w.activeTurnId ?? undefined).length;
@@ -2454,8 +2422,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       const inquiryBody = inquiryThreads.length
         ? `\nInquiries (worker does not remember these):\n${inquiryThreads.map((thread) => `${thread.id} [${thread.activeTurnId ? "running" : "idle"}] worker=${thread.workerId} g${thread.generation} msgs=${thread.history.length}`).join("\n")}`
         : "";
-      const text = `${head}\n${body}${inquiryBody}`;
-      if (ctx.mode === "print") console.log(text);
+      const text = `${head}\n${costLine}\n${body}${inquiryBody}`;
+      if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
       else ctx.ui.notify(text, "info");
     },
   });

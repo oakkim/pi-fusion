@@ -2629,9 +2629,24 @@ eq("monitor detects dead or stale publisher", [
   shouldTerminateMonitor({ ...monitorSnapshot, updatedAt: Date.now() - 60_000 }),
   shouldTerminateMonitor({ ...monitorSnapshot, updatedAt: Date.now() - 60_000 }, Date.now(), undefined, Date.now()),
 ], [true, false, true, true, false]);
-const ghosttyPlan = buildMonitorLaunchPlan("/pkg/monitor-cli.ts", "/tmp/snapshot.json", { platform: "darwin", ghostty: true, terminal: false });
-eq("monitor Ghostty launch plan", [ghosttyPlan?.kind, ghosttyPlan?.command, ghosttyPlan?.args.includes("-e"), ghosttyPlan?.args.at(-1)], ["ghostty", "/usr/bin/open", true, "/tmp/snapshot.json"]);
+const ghosttyPlan = buildMonitorLaunchPlan("/pkg/monitor-cli.ts", "/tmp/snapshot.json", { platform: "darwin", ghostty: true, terminal: true });
+eq("monitor prefers Ghostty without positional document arguments", [ghosttyPlan?.kind, ghosttyPlan?.command, ghosttyPlan?.args.includes("-e"), ghosttyPlan?.args.slice(ghosttyPlan.args.indexOf("--args") + 1).every((arg) => arg.startsWith("--")), ghosttyPlan?.args.some((arg) => arg.startsWith("--initial-command="))], ["ghostty", "/usr/bin/open", false, true, true]);
+const terminalPlan = buildMonitorLaunchPlan("/pkg/monitor-cli.ts", "/tmp/snapshot.json", { platform: "darwin", ghostty: false, terminal: true });
+eq("monitor falls back to Terminal when Ghostty is absent", [terminalPlan?.kind, terminalPlan?.command, terminalPlan?.args[1]?.startsWith('tell application "Terminal" to do script '), terminalPlan?.args[1]?.includes("/tmp/snapshot.json")], ["terminal", "/usr/bin/osascript", true, true]);
+eq("monitor reports no launcher when both terminals are absent", buildMonitorLaunchPlan("script", "snapshot", { platform: "darwin", ghostty: false, terminal: false }), undefined);
 eq("monitor has no unsupported launcher", buildMonitorLaunchPlan("script", "snapshot", { platform: "linux", ghostty: false, terminal: false }), undefined);
+const launchFixture = mkdtempSync(_join(tmpdir(), "fusion-monitor-launch-"));
+try {
+  const probePath = _join(launchFixture, "probe 'quoted' $(touch injected) `touch injected2` \\ file.cjs");
+  const snapshotArgument = _join(launchFixture, "snapshot ' \" $(touch injected3) `touch injected4`\nline.json");
+  writeFileSync(probePath, 'process.stdout.write(JSON.stringify({ args: process.argv.slice(2), data: require("node:fs").readFileSync(process.argv[2], "utf8") }));');
+  writeFileSync(snapshotArgument, "snapshot contents");
+  const plan = buildMonitorLaunchPlan(probePath, snapshotArgument, { platform: "darwin", ghostty: true })!;
+  const initialCommand = plan.args.find((arg) => arg.startsWith("--initial-command="))!.slice("--initial-command=".length);
+  const { stdout } = await sh("/bin/sh", ["-c", initialCommand], { cwd: launchFixture });
+  const launched = JSON.parse(stdout);
+  eq("monitor command preserves literal paths without shell expansion", [launched.args, launched.data, readdirSync(launchFixture).filter((name) => name.startsWith("injected"))], [[snapshotArgument], "snapshot contents", []]);
+} finally { rmSync(launchFixture, { recursive: true, force: true }); }
 eq("only grouped slash commands are registered", [...commands.keys()].sort(), ["advisor", "fusion"]);
 let monitorNotice = "";
 await commands.get("fusion")!.handler("monitor open", {

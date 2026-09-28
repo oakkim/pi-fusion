@@ -931,11 +931,11 @@ export function buildMonitorLaunchPlan(
         "Ghostty.app",
         "--args",
         "--title=Fusion Monitor",
-        "-e",
-        process.execPath,
-        "--no-warnings",
-        scriptPath,
-        snapshotPath,
+        "--shell-integration=detect",
+        "--quit-after-last-window-closed=true",
+        "--quit-after-last-window-closed-delay=",
+        // Positional paths after -e also open as documents in macOS Ghostty 1.3.
+        `--initial-command=${manualMonitorCommand(scriptPath, snapshotPath)}`,
       ],
     };
   }

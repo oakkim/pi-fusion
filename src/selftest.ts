@@ -1076,16 +1076,26 @@ try {
     appendEntry: (customType: string, data: unknown) => advisorAppend({ type: "custom", customType, data }),
   } as never, advisorDir);
   const advise = advisorTools.get("ask_advisor");
+  const advisorQuestion = { question: "Which boundary must be verified before this migration?" };
   const advisorCommand = advisorCommands.get("advisor");
   advisor.start(advisorContext);
-  const unconfiguredAdvice = await advise.execute("unconfigured", {}, undefined, undefined, advisorContext);
+  const unconfiguredAdvice = await advise.execute("unconfigured", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor is inactive until an explicit model is selected", [activeAdvisorTools.includes("ask_advisor"), unconfiguredAdvice.isError, advisorModelCalls], [false, true, 0]);
   await advisorCommand.handler("model opencode-go/missing", advisorContext);
   eq("advisor rejects invalid explicit models without fallback", [advisorNotice.includes("Unknown"), activeAdvisorTools.includes("ask_advisor"), advisorModelCalls], [true, false, 0]);
   await advisorCommand.handler("model opencode-go/advisor", advisorContext);
+  const callsBeforeInvalidQuestion = advisorModelCalls;
+  const entriesBeforeInvalidQuestion = advisorEntries.length;
+  const invalidQuestions = [];
+  for (const params of [undefined, null, {}, { question: "" }, { question: " \n\t " }, { question: 42 }]) {
+    const result = await advise.execute("invalid-question", params, undefined, undefined, advisorContext);
+    invalidQuestions.push(result.isError && result.content[0].text.toLowerCase().includes("question"));
+  }
+  eq("advisor requires a visible question before any provider call", [invalidQuestions.every(Boolean), advisorModelCalls, advisorEntries.length], [true, callsBeforeInvalidQuestion, entriesBeforeInvalidQuestion]);
   const selectedOptions = { selectedTools: ["ask_advisor"], sections: {} as Record<string, string> };
   advisor.preparePrompt(selectedOptions, "system", advisorContext);
-  const advice = await advise.execute("ask", {}, undefined, undefined, advisorContext);
+  const advisorProgress: any[] = [];
+  const advice = await advise.execute("ask", { question: `  ${advisorQuestion.question}\n` }, undefined, (update: any) => advisorProgress.push(update), advisorContext);
   const requestText = JSON.stringify(advisorRequest);
   eq("advisor receives effective compacted Lead evidence without private reasoning", [
     activeAdvisorTools.includes("ask_advisor"), requestText.includes("CURRENT_EFFECTIVE_INSTRUCTIONS"), requestText.includes("COMPACTION_DECISION"),
@@ -1093,29 +1103,47 @@ try {
     requestText.includes("DISCARDED_OLD_TRANSCRIPT"), requestText.includes("PRIVATE_LEAD_REASONING"), requestText.includes("PRIVATE_SIGNATURE"), requestText.includes("PRIVATE_TEXT_SIGNATURE"), requestText.includes("PRIVATE_IMAGE_BYTES"),
     advisorRequest.tools, advisorOptions.reasoning, advisorOptions.headers?.["x-opencode-session"], JSON.stringify(advice).includes("PRIVATE_ADVISOR_REASONING"), advice.details.usage.cost,
   ], [true, true, true, true, true, true, false, false, false, false, false, undefined, "high", "advisor-session", false, 0.25]);
-  eq("advisor guidance is conditional and advisory", [selectedOptions.sections.pi_advisor.includes("Routine work does not require"), advise.parameters.additionalProperties, Object.keys(advise.parameters.properties).length], [true, false, 0]);
+  eq("displayed consultation question reaches the provider as its latest request", [
+    advisorProgress.some((update) => update.content[0].text.includes(advisorQuestion.question)),
+    advisorRequest.messages.at(-1).role,
+    advisorRequest.messages.at(-1).content.includes(advisorQuestion.question),
+    advice.details.question,
+  ], [true, "user", true, advisorQuestion.question]);
+  eq("advisor guidance is conditional and advisory", [selectedOptions.sections.pi_advisor.includes("Routine work does not require"), advise.parameters.additionalProperties, Object.keys(advise.parameters.properties), advise.parameters.required], [true, false, ["question"], ["question"]]);
+  const advisorTheme = { bold: (text: string) => text, fg: (_color: string, text: string) => text };
+  const renderAdvisorCall = (args: unknown, expanded = false) => advise.renderCall(args, advisorTheme, { expanded }).render(200).map((line: string) => line.trimEnd()).join("\n");
+  eq("advisor call shows a readable question without expanding", renderAdvisorCall(advisorQuestion).includes(`question: ${advisorQuestion.question}`), true);
+  eq("expanded advisor call preserves multiline questions", renderAdvisorCall({ question: "Which approach?\nCompare the two options." }, true).includes("Which approach?\nCompare the two options."), true);
+  eq("advisor call handles partial and legacy arguments", [renderAdvisorCall(null).includes("question:"), renderAdvisorCall({}).includes("question:")], [true, true]);
+  const unsafeAdvisorCall = renderAdvisorCall({ question: "Visible\u001b]2;INJECTED\u0007 question" });
+  eq("advisor call removes terminal controls", [unsafeAdvisorCall.includes("INJECTED"), unsafeAdvisorCall.includes("\u001b")], [false, false]);
+  const longAdvisorQuestion = `${"x".repeat(300)} END_OF_QUESTION`;
+  eq("advisor call collapses long questions without losing expanded content", [renderAdvisorCall({ question: longAdvisorQuestion }).includes("END_OF_QUESTION"), renderAdvisorCall({ question: longAdvisorQuestion }, true).includes("END_OF_QUESTION")], [false, true]);
   const workerSelection = resolveToolDefs("all", advisorDir).map((tool) => tool.name);
   eq("advisor never enters the worker tool allowlist", workerSelection.includes("ask_advisor"), false);
 
   advisorComplete = async () => responseWithUsage([{ type: "toolCall", id: "forbidden", name: "write", arguments: {} }], "toolUse");
   const beforeForbidden = advisorModelCalls;
-  const forbiddenAdvice = await advise.execute("forbidden", {}, undefined, undefined, advisorContext);
+  const forbiddenAdvice = await advise.execute("forbidden", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor rejects tool use without a second model call", [forbiddenAdvice.isError, forbiddenAdvice.content[0].text.includes("no tool was executed"), advisorModelCalls - beforeForbidden], [true, true, 1]);
   advisorComplete = async () => responseWithUsage([{ type: "text", text: "partial" }], "error");
-  const failedAdvice = await advise.execute("failed", {}, undefined, undefined, advisorContext);
+  const failedAdvice = await advise.execute("failed", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor provider failure retains usage", [failedAdvice.isError, failedAdvice.details.status, failedAdvice.details.usage.cost, advisorEntries.at(-1).data.usage.cost], [true, "failed", 0.25, 0.25]);
+  eq("failed advice retains the requested question", failedAdvice.details.question, advisorQuestion.question);
   const advisorCancel = new AbortController();
   advisorComplete = async () => { advisorCancel.abort(); return responseWithUsage([{ type: "text", text: "LATE_SUCCESS_ADVICE" }]); };
-  const cancelledAdvice = await advise.execute("cancelled", {}, advisorCancel.signal, undefined, advisorContext);
+  const cancelledAdvice = await advise.execute("cancelled", advisorQuestion, advisorCancel.signal, undefined, advisorContext);
   eq("advisor cancellation rejects late success but records usage", [cancelledAdvice.isError, cancelledAdvice.details.status, JSON.stringify(cancelledAdvice).includes("LATE_SUCCESS_ADVICE"), cancelledAdvice.details.usage.cost, advisorEntries.at(-1).data.status], [true, "interrupted", false, 0.25, "interrupted"]);
   const beforeOverflow = advisorModelCalls;
   const largeContext = { ...advisorContext, getSystemPrompt: () => "x".repeat(500_000) };
-  const overflowAdvice = await advise.execute("oversized", {}, undefined, undefined, largeContext);
+  const overflowAdvice = await advise.execute("oversized", advisorQuestion, undefined, undefined, largeContext);
   eq("advisor rejects oversized context without truncation or provider call", [overflowAdvice.isError, overflowAdvice.content[0].text.includes("no context was discarded"), advisorModelCalls], [true, true, beforeOverflow]);
+  const oversizedQuestionAdvice = await advise.execute("oversized-question", { question: "x".repeat(500_000) }, undefined, undefined, advisorContext);
+  eq("advisor context budget includes the explicit question", [oversizedQuestionAdvice.isError, oversizedQuestionAdvice.content[0].text.includes("no context was discarded"), advisorModelCalls], [true, true, beforeOverflow]);
 
   let releaseAdvisor!: (response: any) => void;
   advisorComplete = async () => new Promise((resolve) => { releaseAdvisor = resolve; });
-  const staleAdvice = advise.execute("stale", {}, undefined, undefined, advisorContext);
+  const staleAdvice = advise.execute("stale", advisorQuestion, undefined, undefined, advisorContext);
   await Promise.resolve();
   eq("advisor status shows an active consultation", advisor.status(advisorContext), "Advising…");
   advisor.stop();
@@ -1142,21 +1170,21 @@ try {
   writeFileSync(_join(advisorDir, "fusion.json"), JSON.stringify({ fastMode: true, preserved: "yes" }));
   await advisorCommand.handler("thinking low", advisorContext);
   const advisorThinkingEntry = advisorEntries.at(-1);
-  await advise.execute("low", {}, undefined, undefined, advisorContext);
+  await advise.execute("low", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor effort is independent of Lead and executor settings", [advisorThinkingEntry.customType, advisorThinkingEntry.data.thinkingLevel, advisorOptions.reasoning, advisorOptions.serviceTier, advisorContext.thinkingLevel], ["fusion-advisor-thinking", "low", "low", undefined, "high"]);
   await advisorCommand.handler("thinking off", advisorContext);
-  await advise.execute("off", {}, undefined, undefined, advisorContext);
+  await advise.execute("off", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor off effort omits provider reasoning", advisorOptions.reasoning, undefined);
   writeFileSync(_join(advisorDir, ".pi", "fusion.json"), JSON.stringify({ advisorModel: "opencode-go/advisor", advisorThinkingLevel: "medium", advisorFastMode: true }));
   await advisorCommand.handler("thinking clear", advisorContext);
-  await advise.execute("config-effort", {}, undefined, undefined, advisorContext);
+  await advise.execute("config-effort", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor thinking clear restores config and unsupported priority is omitted", [advisorOptions.reasoning, advisorOptions.serviceTier], ["medium", undefined]);
 
   await advisorCommand.handler("fast off", advisorContext);
   const advisorGlobalOff = JSON.parse(readFileSync(_join(advisorDir, "fusion.json"), "utf8"));
   eq("advisor fast preference preserves executor and unknown config keys", [advisorGlobalOff.advisorFastMode, advisorGlobalOff.fastMode, advisorGlobalOff.preserved], [false, true, "yes"]);
   await advisorCommand.handler("fast on", advisorContext);
-  await advise.execute("unsupported-fast", {}, undefined, undefined, advisorContext);
+  await advise.execute("unsupported-fast", advisorQuestion, undefined, undefined, advisorContext);
   eq("unsupported advisor provider never receives priority", [advisorOptions.serviceTier, advisorNotice.toLowerCase().includes("not applied")], [undefined, true]);
 
   const priorityAdvisor = { ...advisorModel, provider: "openai-codex", id: "gpt-5.6-luna", api: "openai-codex-responses" };
@@ -1168,10 +1196,10 @@ try {
   };
   await advisorCommand.handler("model openai-codex/gpt-5.6-luna", advisorContext);
   await advisorCommand.handler("thinking high", advisorContext);
-  await advise.execute("priority", {}, undefined, undefined, advisorContext);
+  await advise.execute("priority", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor priority uses the full provider path with reasoning effort and no tools", [advisorOptions.reasoningEffort, advisorOptions.serviceTier, advisorRequest.tools], ["high", "priority", undefined]);
   await advisorCommand.handler("fast off", advisorContext);
-  await advise.execute("normal-tier", {}, undefined, undefined, advisorContext);
+  await advise.execute("normal-tier", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor fast off restores the simple provider path", [advisorOptions.reasoning, advisorOptions.serviceTier, advisorOptions.reasoningEffort], ["high", undefined, undefined]);
   await advisorCommand.handler("status", advisorContext);
   eq("advisor status exposes its effort and fast setting", [advisorNotice.toLowerCase().includes("thinking high"), advisorNotice.toLowerCase().includes("fast off")], [true, true]);
@@ -1182,10 +1210,10 @@ try {
   eq("invalid advisor options cannot change config or journal", [advisorEntries.length, readFileSync(_join(advisorDir, "fusion.json"), "utf8")], [journalBeforeInvalid, configBeforeInvalid]);
   advisor.stop();
   advisor.start(advisorContext);
-  await advise.execute("resumed-settings", {}, undefined, undefined, advisorContext);
+  await advise.execute("resumed-settings", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor settings survive lifecycle restoration", [advisorOptions.reasoning, advisorOptions.serviceTier], ["high", undefined]);
   await advisorCommand.handler("model opencode-go/plain", advisorContext);
-  await advise.execute("nonreasoner", {}, undefined, undefined, advisorContext);
+  await advise.execute("nonreasoner", advisorQuestion, undefined, undefined, advisorContext);
   eq("switching advisor models clamps an existing effort preference", advisorOptions.reasoning, undefined);
   await advisorCommand.handler("fast default", advisorContext);
   const advisorGlobalDefault = JSON.parse(readFileSync(_join(advisorDir, "fusion.json"), "utf8"));
@@ -1193,7 +1221,7 @@ try {
   await advisorCommand.handler("thinking clear", advisorContext);
   writeFileSync(_join(advisorDir, ".pi", "fusion.json"), JSON.stringify({ advisorModel: "opencode-go/advisor", advisorThinkingLevel: "invalid", advisorFastMode: "yes" }));
   await advisorCommand.handler("clear", advisorContext);
-  await advise.execute("invalid-config", {}, undefined, undefined, advisorContext);
+  await advise.execute("invalid-config", advisorQuestion, undefined, undefined, advisorContext);
   eq("invalid advisor config falls back to Lead effort and normal tier", [advisorOptions.reasoning, advisorOptions.serviceTier], ["high", undefined]);
 
   await advisorCommand.handler("model openai-codex/gpt-5.6-luna", advisorContext);
@@ -1207,7 +1235,7 @@ try {
   const nextContext = { ...advisorContext, thinkingLevel: "off", sessionManager: { getBranch: () => nextEntries, getEntries: () => [], getLeafId: () => null } };
   const nextAdvisor = registerAdvisor({ registerTool: (tool: any) => nextTools.set(tool.name, tool), registerCommand: (name: string, command: any) => nextCommands.set(name, command), appendEntry: (customType: string, data: unknown) => nextEntries.push({ type: "custom", customType, data }) } as never, advisorDir);
   nextAdvisor.start(nextContext);
-  const restoredAdvice = await nextTools.get("ask_advisor").execute("fresh-session", {}, undefined, undefined, nextContext);
+  const restoredAdvice = await nextTools.get("ask_advisor").execute("fresh-session", advisorQuestion, undefined, undefined, nextContext);
   eq("a fresh advisor instance restores the last choices over project defaults", [restoredAdvice.details.model, advisorOptions.reasoningEffort, advisorOptions.serviceTier], ["openai-codex/gpt-5.6-luna", "high", "priority"]);
   await nextCommands.get("advisor").handler("off", nextContext);
   eq("advisor off is remembered for future sessions", loadGlobalConfig(advisorDir).advisorModel, false);
@@ -2089,6 +2117,7 @@ try {
   await fusion.handler("", ctx);
   await advisor.handler("", ctx);
   eq("bare root commands show status without changing state", [journal.length, sentPrompts.length, notices.join("\n").includes("Fusion available"), notices.join("\n").includes("Advisor:")], [0, 0, true, true]);
+  eq("Fusion status shows zero cost before any requests", notices.some((text) => text.includes("Recorded cost (current branch): $0.0000") && text.includes("Workers $0.0000") && text.includes("Inquiries $0.0000") && text.includes("Advisor $0.0000")), true);
   for (const input of ["modle", "fix this file", "run", "off extra"]) await fusion.handler(input, ctx);
   await advisor.handler("modelish", ctx);
   eq("invalid commands cannot change settings or send model prompts", [journal.length, sentPrompts.length], [0, 0]);
@@ -2125,6 +2154,34 @@ try {
   await fusion.handler("off", ctx);
   await fusion.handler("run Must not start", ctx);
   eq("Fusion off still blocks explicit runs", sentPrompts.length, 1);
+
+  const statusRuntime = new WorkerRuntime();
+  const statusWorker = statusRuntime.spawn({ label: "cost status", executorModelId: "test/worker-basic", firstMessage: { role: "user", content: "check costs", timestamp: 1 } });
+  statusRuntime.checkpointTurn(statusWorker.turn.id, statusWorker.worker.history, { ...zeroUsage(), cost: 0.5 });
+  journal.push({ type: "custom", customType: "fusion-worker", data: statusRuntime.snapshot()[0] });
+  statusRuntime.checkpointTurn(statusWorker.turn.id, statusWorker.worker.history, { ...zeroUsage(), cost: 1.25 });
+  journal.push(
+    { type: "custom", customType: "fusion-worker", data: statusRuntime.snapshot()[0] },
+    { type: "custom", customType: "fusion-cost", data: { worker_id: statusWorker.worker.id, usage: { cost: 0.5 } } },
+    { type: "custom", customType: "fusion-cost", data: { worker_id: "wrk_legacy_without_snapshot", usage: { cost: 0.2 } } },
+    { type: "custom", customType: "fusion-inquiry-cost", data: { usage: { cost: { total: 0.3 } } } },
+    { type: "custom", customType: "fusion-advisor-cost", data: { status: "failed", usage: { cost: 0.4 } } },
+    { type: "custom", customType: "fusion-inquiry-cost", data: { usage: { cost: -10 } } },
+  );
+  await events.get("session_start")({}, ctx);
+  await fusion.handler("status", ctx);
+  const expectedCosts = "Recorded cost (current branch): $2.1500 • Workers $1.4500 • Inquiries $0.3000 • Advisor $0.4000";
+  eq("Fusion status counts checkpoints once and separates inquiry and advisor costs", notices.at(-1)?.includes(expectedCosts), true);
+  await fusion.handler("", ctx);
+  eq("bare Fusion exposes the same cost summary", notices.at(-1)?.includes(expectedCosts), true);
+  const branchWithCosts = journal.splice(0);
+  await events.get("session_start")({}, ctx);
+  await fusion.handler("status", ctx);
+  eq("Fusion costs reset when moving to an empty branch", notices.at(-1)?.includes("Recorded cost (current branch): $0.0000"), true);
+  journal.push(...branchWithCosts);
+  await events.get("session_start")({}, ctx);
+  await fusion.handler("status", ctx);
+  eq("Fusion costs restore without double counting after session reload", notices.at(-1)?.includes(expectedCosts), true);
   await events.get("session_shutdown")({}, ctx);
 } finally { rmSync(commandGroupDir, { recursive: true, force: true }); }
 
@@ -2190,7 +2247,7 @@ const cancelledTreeContext: any = {
 };
 await cancelledTreeHandlers.get("session_start")({}, cancelledTreeContext);
 await cancelledTreeHandlers.get("session_before_tree")({}, cancelledTreeContext);
-const afterCancelledTree = await cancelledTreeTool.execute("after-cancelled-tree", {}, undefined, undefined, cancelledTreeContext);
+const afterCancelledTree = await cancelledTreeTool.execute("after-cancelled-tree", { question: "Is this approach still appropriate?" }, undefined, undefined, cancelledTreeContext);
 eq("cancelled tree navigation does not disable advisor", [afterCancelledTree.details.status, cancelledTreeRequests], ["completed", 1]);
 await cancelledTreeHandlers.get("session_shutdown")({}, cancelledTreeContext);
 

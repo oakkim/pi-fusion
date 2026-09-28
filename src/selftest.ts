@@ -984,6 +984,9 @@ let longTurnExecutions = 0;
 let longTurnSummaries = 0;
 let validToolPairs = true;
 const { contextTokens, contextBudget } = await import("./compaction.ts");
+eq("token estimator accepts contexts without a separate system prompt", contextTokens({
+  messages: [{ role: "user", content: "summary input", timestamp: 0 }],
+}), contextTokens({ systemPrompt: "", messages: [{ role: "user", content: "summary input", timestamp: 0 }] }));
 const estimateTool = { name: "read", description: "read source", parameters: {} } as never;
 const estimatedMessages = [
   { role: "user", content: "task", timestamp: 1 },

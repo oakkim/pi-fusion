@@ -1,15 +1,16 @@
 /** Worker-only semantic compaction, using Pi's summary prompt and token estimator. */
-import type { AssistantMessage, Message, Tool } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, Context, Message } from "@earendil-works/pi-ai/compat";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { calculateContextTokens, estimateTokens, generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
 
 const SUMMARY_PREFIX = "<fusion_context_summary>\n";
-export type ExecutorContext = { systemPrompt: string; messages: Message[]; tools?: Tool[] };
+export type ExecutorContext = Context;
 
 export function contextTokens(context: ExecutorContext): number {
   // Use SDK root exports: Pi's extension loader aliases pi-ai to a file, so
   // pi-ai subpath imports cannot load in the installed host.
-  let estimated = estimateTokens({ role: "user", content: context.systemPrompt, timestamp: 0 });
+  // Pi 0.87 summary contexts carry the system prompt as a message instead.
+  let estimated = context.systemPrompt ? estimateTokens({ role: "user", content: context.systemPrompt, timestamp: 0 }) : 0;
   if (context.tools?.length) estimated += estimateTokens({ role: "user", content: JSON.stringify(context.tools), timestamp: 0 });
   let reported = 0;
   let prefixTimestamp = -Infinity;

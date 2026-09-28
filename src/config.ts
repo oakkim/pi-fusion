@@ -56,7 +56,12 @@ export function loadGlobalConfig(agentDir = getAgentDir()): FusionConfig {
 }
 
 /** Persist the slash-command fast preference without replacing unrelated config. */
-export function persistGlobalFastMode(fastMode: boolean | undefined, agentDir = getAgentDir()): void {
+export function persistGlobalFastMode(fastMode: boolean | undefined, agentDir = getAgentDir(), key: "fastMode" | "advisorFastMode" = "fastMode"): void {
+  persistGlobalPreference(key, fastMode, agentDir);
+}
+
+/** Persist last-used preferences atomically, preserving unrelated config. */
+export function persistGlobalPreference<K extends "fastMode" | "advisorFastMode" | "advisorModel" | "advisorThinkingLevel">(key: K, value: FusionConfig[K], agentDir = getAgentDir()): void {
   const configPath = globalFusionConfigPath(agentDir);
   let raw: Record<string, unknown> = {};
   if (existsSync(configPath)) {
@@ -66,8 +71,8 @@ export function persistGlobalFastMode(fastMode: boolean | undefined, agentDir = 
     }
     raw = { ...(parsed as Record<string, unknown>) };
   }
-  if (typeof fastMode === "boolean") raw.fastMode = fastMode;
-  else delete raw.fastMode;
+  if (value !== undefined) raw[key] = value;
+  else delete raw[key];
 
   mkdirSync(agentDir, { recursive: true, mode: 0o700 });
   const temporary = `${configPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
@@ -86,6 +91,8 @@ function normalizeConfig(raw: unknown): FusionConfig {
   const out: FusionConfig = {};
   if (input.advisorModel === false) out.advisorModel = false;
   else if (typeof input.advisorModel === "string" && input.advisorModel.trim()) out.advisorModel = input.advisorModel.trim();
+  if (isFusionThinkingLevel(input.advisorThinkingLevel)) out.advisorThinkingLevel = input.advisorThinkingLevel;
+  if (typeof input.advisorFastMode === "boolean") out.advisorFastMode = input.advisorFastMode;
   if (typeof input.executor === "string") out.executor = input.executor;
   const tools = normalizeToolSelection(input.executorTools);
   if (tools !== undefined) out.executorTools = tools;
@@ -153,7 +160,7 @@ function normalizeToolSelection(value: unknown): ToolSelection | undefined {
   return names;
 }
 
-/** Session override from /fusion-model. `auto` ignores the configured executor. */
+/** Session override from /fusion model. `auto` ignores the configured executor. */
 export interface ExecutorOverride {
   executor?: string;
   auto?: boolean;
@@ -168,7 +175,7 @@ export interface FastModeOverride {
   fastMode?: boolean;
 }
 
-/** Session override from /fusion-consent. */
+/** Session override from /fusion consent. */
 export interface ConsentOverride {
   executorToolsConsent?: boolean;
 }

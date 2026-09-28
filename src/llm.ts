@@ -80,9 +80,10 @@ export function runTextRequest(
   registry: ModelRegistry, model: Model<Api>, systemPrompt: string, messages: Message[],
   maxTokens: number, signal: AbortSignal | undefined, ctx: ExtensionContext,
   thinkingLevel: ModelThinkingLevel = "off",
+  fastMode = false,
 ): Promise<AssistantMessage> {
   return runComplete(registry, model, { systemPrompt, messages },
-    buildCompleteOptions(model, maxTokens, 0.2, thinkingLevel, false, signal, ctx));
+    buildCompleteOptions(model, maxTokens, 0.2, thinkingLevel, fastMode, signal, ctx));
 }
 
 export interface ExecutorCheckpoint {

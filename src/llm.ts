@@ -17,7 +17,7 @@ import { TOOL_OUTPUT_MAX_BYTES } from "./config.ts";
 import type { ExecutorToolDef } from "./tools.ts";
 import { addUsage, zeroUsage, type UsageSummary } from "./cost.ts";
 import { truncateToBytes } from "./utils.ts";
-import { compactExecutorHistory } from "./compaction.ts";
+import { compactExecutorHistory, type ExecutorContext } from "./compaction.ts";
 import { repairIncompleteToolCalls } from "./runtime.ts";
 
 type ToolContent = ToolResultMessage["content"];
@@ -259,7 +259,7 @@ export async function runExecutorTurn(
 
 type ResultOnlyStream = { result(): Promise<AssistantMessage> };
 type CompatibleStream = AssistantMessageEventStream | ResultOnlyStream;
-type StreamContext = { systemPrompt: string; messages: Message[]; tools?: Tool[] };
+type StreamContext = ExecutorContext;
 type PendingToolProgress = { id?: string; name?: string; arguments: string };
 
 async function runComplete(

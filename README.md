@@ -153,7 +153,7 @@ Fusion off • Advising…
 
 `/fusion status` shows the current branch's recorded cost total with separate Workers, Inquiries, and Advisor amounts. Worker costs include received usage checkpoints, including failed or interrupted turns, without counting the final cost entry again. Lead costs are not included. These are usage costs recorded by the model SDK, not an account invoice; requests with no recorded usage do not contribute an amount.
 
-For more detail, open `/fusion monitor`. On macOS it uses Ghostty when available, then Terminal.app. The separate window shows workers, visible conversation and tool output, steering and queue state, and usage.
+For more detail, open `/fusion monitor`. On macOS it prefers Ghostty and falls back to Terminal.app when Ghostty is not installed. The monitor starts as a command rather than opening its script and snapshot as documents, avoiding duplicate file-open prompts in Ghostty 1.3.1. The separate window shows workers, visible conversation and tool output, steering and queue state, and usage.
 
 | Monitor key | Action |
 | --- | --- |

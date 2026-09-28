@@ -17,6 +17,8 @@ import { TOOL_OUTPUT_MAX_BYTES } from "./config.ts";
 import type { ExecutorToolDef } from "./tools.ts";
 import { addUsage, zeroUsage, type UsageSummary } from "./cost.ts";
 import { truncateToBytes } from "./utils.ts";
+import { compactExecutorHistory } from "./compaction.ts";
+import { repairIncompleteToolCalls } from "./runtime.ts";
 
 type ToolContent = ToolResultMessage["content"];
 
@@ -73,6 +75,24 @@ function buildCompleteOptions(
   return options;
 }
 
+/** A single tool-free completion, with the same provider/auth path as workers. */
+export function runTextRequest(
+  registry: ModelRegistry, model: Model<Api>, systemPrompt: string, messages: Message[],
+  maxTokens: number, signal: AbortSignal | undefined, ctx: ExtensionContext,
+  thinkingLevel: ModelThinkingLevel = "off",
+): Promise<AssistantMessage> {
+  return runComplete(registry, model, { systemPrompt, messages },
+    buildCompleteOptions(model, maxTokens, 0.2, thinkingLevel, false, signal, ctx));
+}
+
+export interface ExecutorCheckpoint {
+  history: Message[];
+  usage: UsageSummary;
+  turns: number;
+  toolCalls: number;
+  compacted: boolean;
+}
+
 export interface ToolLoopResult {
   message: AssistantMessage;
   added: Message[]; // everything appended to history this turn (assistant + toolResults + final)
@@ -98,12 +118,13 @@ export async function runExecutorTurn(
   onProgress?: (progress: LiveProgress) => void,
   takeSteeringMessages?: (finalCheckpoint?: boolean) => Message[],
   fastMode = false,
+  persistence?: { maxHistoryMessages: number; checkpoint: (state: ExecutorCheckpoint) => void },
 ): Promise<ToolLoopResult> {
   const options = buildCompleteOptions(model, maxTokens, temperature, thinkingLevel, fastMode, signal, ctx);
   const tools: Tool[] = toolDefs.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }));
   const byName = new Map(toolDefs.map((d) => [d.name, d]));
 
-  const messages: Message[] = [...history];
+  const messages: Message[] = repairIncompleteToolCalls(history);
   const added: Message[] = [];
   const toolCalls: Array<{ name: string; ok: boolean }> = [];
   let usage = zeroUsage();
@@ -112,98 +133,126 @@ export async function runExecutorTurn(
   let lastKey: string | undefined;
   let repeatRun = 0;
   let errorStreak = 0;
+  let compacted = false;
+  const checkpoint = () => persistence?.checkpoint({ history: [...messages], usage, turns, toolCalls: toolCalls.length, compacted });
+  const complete = async (context: StreamContext, outputTokens = maxTokens, summarizing = false) => {
+    const response = await runComplete(registry, model, context, { ...options, maxTokens: outputTokens, ...(summarizing ? { reasoning: undefined } : {}) }, onProgress);
+    usage = addUsage(usage, response.usage);
+    turns++;
+    if (!summarizing) { messages.push(response); added.push(response); }
+    checkpoint();
+    if (response.stopReason === "error" || response.stopReason === "aborted") {
+      throw new Error(response.errorMessage ?? `Model stopped with reason: ${response.stopReason}`);
+    }
+    return response;
+  };
+  const prepareContext = async (system = systemPrompt, selectedTools?: Tool[]) => {
+    signal?.throwIfAborted();
+    if (!persistence) return;
+    const next = await compactExecutorHistory(
+      { systemPrompt: system, messages, tools: selectedTools }, model, maxTokens,
+      persistence.maxHistoryMessages, signal, (context, tokens) => complete(context, tokens, true),
+    );
+    if (next) {
+      messages.splice(0, messages.length, ...next);
+      compacted = true;
+      checkpoint();
+    }
+  };
 
   const takeSteering = (finalCheckpoint = false): Message[] => takeSteeringMessages?.(finalCheckpoint) ?? [];
   const appendSteering = (steering: Message[]): void => {
     if (steering.length === 0) return;
     messages.push(...steering);
     added.push(...steering);
+    checkpoint();
   };
 
-  while (true) {
-    appendSteering(takeSteering());
-    const resp = await runComplete(registry, model, { systemPrompt, messages, tools }, options, onProgress);
-    turns++;
-    usage = addUsage(usage, resp.usage);
-    const calls = resp.content.filter((c): c is ToolCall => c.type === "toolCall");
-    if (resp.stopReason !== "toolUse" || calls.length === 0) {
-      const steering = takeSteering(true);
-      if (steering.length > 0) {
-        // The response completed while a related update was arriving. Preserve
-        // it as an intermediate answer, inject the update, and let the same
-        // worker turn revise its work instead of scheduling another turn.
-        messages.push(resp);
-        added.push(resp);
-        appendSteering(steering);
+  try {
+    checkpoint();
+    while (true) {
+      appendSteering(takeSteering());
+      await prepareContext(systemPrompt, tools);
+      const resp = await complete({ systemPrompt, messages, tools });
+      const calls = resp.content.filter((c): c is ToolCall => c.type === "toolCall");
+      if (resp.stopReason !== "toolUse" || calls.length === 0) {
+        const steering = takeSteering(true);
+        if (steering.length > 0) {
+          // The response completed while a related update was arriving. Preserve
+          // it as an intermediate answer, inject the update, and let the same
+          // worker turn revise its work instead of scheduling another turn.
+          appendSteering(steering);
+          repeatRun = 0;
+          errorStreak = 0;
+          lastKey = undefined;
+          continue;
+        }
+        return { message: resp, added, turns, toolCalls, cappedOut: false, usage };
+      }
+
+      let forceFinalize = false;
+
+      for (const tc of calls) {
+        signal?.throwIfAborted();
+        if (forceFinalize || used >= maxToolCalls) {
+          const reason = forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted";
+          onProgress?.({ kind: "tool_start", toolId: tc.id, name: tc.name, arguments: formatToolArguments(tc.arguments) });
+          const syn = syntheticResult(tc, reason);
+          messages.push(syn);
+          added.push(syn);
+          onProgress?.({ kind: "tool_end", toolId: tc.id, ok: false, output: reason });
+          toolCalls.push({ name: tc.name, ok: false });
+          checkpoint();
+          continue;
+        }
+        const ok = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added, onProgress);
+        used++;
+        toolCalls.push({ name: tc.name, ok });
+        checkpoint();
+        const key = `${tc.name}:${JSON.stringify(tc.arguments)}`;
+        repeatRun = key === lastKey ? repeatRun + 1 : 1;
+        lastKey = key;
+        errorStreak = ok ? 0 : errorStreak + 1;
+        if (repeatRun >= 3 || errorStreak >= 3) forceFinalize = true;
+      }
+
+      const steeringAfterTools = takeSteering();
+      appendSteering(steeringAfterTools);
+      if (steeringAfterTools.length > 0 && used < maxToolCalls) {
+        // A new Lead instruction can legitimately redirect a repeated/failing
+        // tool loop. Give the revised plan a fresh cycle while preserving the
+        // hard total tool-call budget.
+        forceFinalize = false;
         repeatRun = 0;
         errorStreak = 0;
         lastKey = undefined;
-        continue;
       }
-      added.push(resp);
-      return { message: resp, added, turns, toolCalls, cappedOut: false, usage };
-    }
 
-    messages.push(resp);
-    added.push(resp);
-    let forceFinalize = false;
-
-    for (const tc of calls) {
-      signal?.throwIfAborted();
       if (forceFinalize || used >= maxToolCalls) {
-        const reason = forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted";
-        onProgress?.({ kind: "tool_start", toolId: tc.id, name: tc.name, arguments: formatToolArguments(tc.arguments) });
-        const syn = syntheticResult(tc, reason);
-        messages.push(syn);
-        added.push(syn);
-        onProgress?.({ kind: "tool_end", toolId: tc.id, ok: false, output: reason });
-        toolCalls.push({ name: tc.name, ok: false });
-        continue;
-      }
-      const ok = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added, onProgress);
-      used++;
-      toolCalls.push({ name: tc.name, ok });
-      const key = `${tc.name}:${JSON.stringify(tc.arguments)}`;
-      repeatRun = key === lastKey ? repeatRun + 1 : 1;
-      lastKey = key;
-      errorStreak = ok ? 0 : errorStreak + 1;
-      if (repeatRun >= 3 || errorStreak >= 3) forceFinalize = true;
-    }
-
-    const steeringAfterTools = takeSteering();
-    appendSteering(steeringAfterTools);
-    if (steeringAfterTools.length > 0 && used < maxToolCalls) {
-      // A new Lead instruction can legitimately redirect a repeated/failing
-      // tool loop. Give the revised plan a fresh cycle while preserving the
-      // hard total tool-call budget.
-      forceFinalize = false;
-      repeatRun = 0;
-      errorStreak = 0;
-      lastKey = undefined;
-    }
-
-    if (forceFinalize || used >= maxToolCalls) {
-      // No more tools are available, so close the cooperative steering mailbox
-      // before the final no-tools request. A later update is safer as a queued
-      // turn than as an instruction the worker cannot execute.
-      const preFinalSteering = takeSteering(true);
-      appendSteering(preFinalSteering);
-      if (preFinalSteering.length > 0) takeSteering(true);
-      const finalSystem = `${systemPrompt}\n\nYou have reached the tool-call limit. Write your complete final answer now using only what you have already gathered — do not request any more tools.`;
-      while (true) {
-        const finalMsg = await runComplete(registry, model, { systemPrompt: finalSystem, messages }, options, onProgress);
-        turns++;
-        usage = addUsage(usage, finalMsg.usage);
-        const steering = takeSteering(true);
-        if (steering.length === 0) {
-          added.push(finalMsg);
-          return { message: finalMsg, added, turns, toolCalls, cappedOut: true, usage };
+        // No more tools are available, so close the cooperative steering mailbox
+        // before the final no-tools request. A later update is safer as a queued
+        // turn than as an instruction the worker cannot execute.
+        const preFinalSteering = takeSteering(true);
+        appendSteering(preFinalSteering);
+        if (preFinalSteering.length > 0) takeSteering(true);
+        const finalSystem = `${systemPrompt}\n\nYou have reached the tool-call limit. Write your complete final answer now using only what you have already gathered — do not request any more tools.`;
+        while (true) {
+          await prepareContext(finalSystem);
+          const finalMsg = await complete({ systemPrompt: finalSystem, messages });
+          const steering = takeSteering(true);
+          if (steering.length === 0) {
+            return { message: finalMsg, added, turns, toolCalls, cappedOut: true, usage };
+          }
+          appendSteering(steering);
         }
-        messages.push(finalMsg);
-        added.push(finalMsg);
-        appendSteering(steering);
       }
     }
+  } finally {
+    // A provider/tool can fail after side effects. Preserve completed outcomes
+    // and explicitly mark missing results as unknown before any follow-up.
+    const repaired = repairIncompleteToolCalls(messages);
+    messages.splice(0, messages.length, ...repaired);
+    checkpoint();
   }
 }
 
@@ -256,9 +305,6 @@ async function runComplete(
   }
   if (!resp) throw new Error("Fusion executor produced no response.");
 
-  if (resp.stopReason === "error" || resp.stopReason === "aborted") {
-    throw new Error(resp.errorMessage ?? `Model stopped with reason: ${resp.stopReason}`);
-  }
   return resp;
 }
 
@@ -400,7 +446,9 @@ async function executeToolCall(
     return !isError;
   } catch (err) {
     const text = sanitizeError(err instanceof Error ? err.message : String(err));
-    const errorText = `Error: ${text}`;
+    const errorText = signal?.aborted
+      ? `Interrupted: ${text}. The tool outcome and possible side effects are uncertain; inspect the current state before retrying.`
+      : `Error: ${text}`;
     const msg: Message = {
       role: "toolResult",
       toolCallId: tc.id,

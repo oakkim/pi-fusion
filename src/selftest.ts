@@ -1450,7 +1450,7 @@ try {
     registerCommand: () => {},
     appendEntry: (type: string, data: unknown) => { journalEntries.push(type); durableEntries.push({ type: "custom", customType: type, data: structuredClone(data) }); },
     sendMessage: (message: any, options: any) => completionMessages.push({ message, options }),
-  } as never);
+  } as never, { agentDir: fusionDir });
 
   const executorModel = { provider: "test", id: "executor", input: ["text"], contextWindow: 100_000, maxTokens: 4096 };
   const availableModels = [executorModel];

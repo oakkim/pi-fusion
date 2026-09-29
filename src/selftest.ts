@@ -7,7 +7,7 @@ import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext, latestUserText } from "../src/utils.ts";
 import fusionExtension, { deriveWorkerContextTelemetry, executorUsesSubscription } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { convertToLlm, CustomMessageComponent, ExtensionRunner, initTheme } from "@earendil-works/pi-coding-agent";
+import { AgentSession, convertToLlm, createWriteToolDefinition, CustomMessageComponent, ExtensionRunner, initTheme } from "@earendil-works/pi-coding-agent";
 import { CombinedAutocompleteProvider, getKeybindings, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, formatPaneTranscript, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
 import { buildMonitorLaunchPlan, FusionMonitorPublisher, isMonitorOwnerAlive, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, shouldTerminateMonitor, type MonitorSnapshot } from "../src/monitor.ts";
@@ -1164,7 +1164,7 @@ try {
   const longAdvisorQuestion = `${"x".repeat(300)} END_OF_QUESTION`;
   eq("advisor call collapses long questions without losing expanded content", [renderAdvisorCall({ question: longAdvisorQuestion }).includes("END_OF_QUESTION"), renderAdvisorCall({ question: longAdvisorQuestion }, true).includes("END_OF_QUESTION")], [false, true]);
   const workerSelection = resolveToolDefs("all", advisorDir).map((tool) => tool.name);
-  eq("advisor never enters the worker tool allowlist", workerSelection.includes("ask_advisor"), false);
+  eq("standalone builtin resolver cannot invent an advisor registration", workerSelection.includes("ask_advisor"), false);
 
   advisorComplete = async () => responseWithUsage([{ type: "toolCall", id: "forbidden", name: "write", arguments: {} }], "toolUse");
   const beforeForbidden = advisorModelCalls;
@@ -1454,6 +1454,21 @@ try {
     },
     sessionManager: { getBranch: () => [], getSessionId: () => undefined },
   };
+  // Match the native runner context used by a real Pi tool call. The rest of
+  // this fixture still controls the fake provider and journal directly.
+  const hostWrite = createWriteToolDefinition(fusionDir);
+  const toolHost = Object.assign(Object.create(AgentSession.prototype), {
+    agent: { state: { tools: [hostWrite, ...registered.values()] } },
+    getToolDefinition: (name: string) => name === "write" ? hostWrite : registered.get(name),
+  });
+  const toolRunner = new ExtensionRunner([{
+    path: "fusion-test", resolvedPath: "fusion-test",
+    handlers: new Map([...lifecycleHandlers].map(([name, handler]) => [name, [handler]])),
+    tools: new Map([...registered].map(([name, definition]) => [name, { definition, extensionPath: "fusion-test" }])),
+  }] as never, { getActiveTools: () => toolHost.getActiveToolNames() } as never,
+  fusionDir, context.sessionManager as never, context.modelRegistry as never);
+  Object.defineProperty(toolHost, "extensionRunner", { value: toolRunner });
+  Object.setPrototypeOf(context, toolRunner.createContext());
   await lifecycleHandlers.get("session_start")?.({}, context);
   const spawn = registered.get("fusion_spawn")!;
   const followup = registered.get("fusion_followup")!;
@@ -2359,12 +2374,13 @@ try {
     { type: "custom", customType: "fusion-cost", data: { worker_id: "wrk_legacy_without_snapshot", usage: { cost: 0.2 } } },
     { type: "custom", customType: "fusion-inquiry-cost", data: { usage: { cost: { total: 0.3 } } } },
     { type: "custom", customType: "fusion-advisor-cost", data: { status: "failed", usage: { cost: 0.4 } } },
+    { type: "custom", customType: "fusion-advisor-cost", data: { includedInWorkerUsage: true, usage: { cost: 0.3 } } },
     { type: "custom", customType: "fusion-inquiry-cost", data: { usage: { cost: -10 } } },
   );
   await events.get("session_start")({}, ctx);
   await fusion.handler("status", ctx);
   const expectedCosts = "Recorded cost (current branch): $2.1500 • Workers $1.4500 • Inquiries $0.3000 • Advisor $0.4000";
-  eq("Fusion status counts checkpoints once and separates inquiry and advisor costs", notices.at(-1)?.includes(expectedCosts), true);
+  eq("Fusion status counts checkpoints and worker advisor usage once", notices.at(-1)?.includes(expectedCosts), true);
   await fusion.handler("", ctx);
   eq("bare Fusion exposes the same cost summary", notices.at(-1)?.includes(expectedCosts), true);
   const branchWithCosts = journal.splice(0);
@@ -2894,6 +2910,8 @@ rmSync(monitorFixture, { recursive: true, force: true });
 
 await import("./recommendations.test.ts");
 await import("./recommendation-integration.test.ts");
+await import("./worker-tools.test.ts");
+await import("./worker-tool-integration.test.ts");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

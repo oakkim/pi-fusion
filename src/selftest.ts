@@ -1871,6 +1871,22 @@ try {
   releaseAfterCleanup({ role: "assistant", content: [{ type: "text", text: "verification done" }], stopReason: "stop", timestamp: Date.now() });
   await waitForStatus(afterCleanupTurnId, "completed");
 
+  const savedStatusStream = context.modelRegistry.streamSimple;
+  const statusStream = createAssistantMessageEventStream();
+  context.modelRegistry.streamSimple = () => statusStream;
+  const statusRun = await spawn.execute("quiet-running", { task: "review", label: "quiet-review" }, undefined, undefined, context);
+  statusStream.push({ type: "thinking_start", contentIndex: 0, partial: streamAssistant([{ type: "thinking", thinking: "private thinking" }]) } as any);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  eq("thinking worker shows Running and elapsed time without its phase", /^Fusion • Running • quiet-review • \d+s$/.test(fusionStatusLine), true);
+  statusStream.push({ type: "text_delta", contentIndex: 1, delta: "VISIBLE_RESPONSE_DETAIL", partial: streamAssistant([{ type: "text", text: "VISIBLE_RESPONSE_DETAIL" }]) } as any);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  eq("streaming worker keeps the concise running status", [fusionStatusLine.includes("Running"), fusionStatusLine.includes("VISIBLE_RESPONSE_DETAIL")], [true, false]);
+  statusStream.push({ type: "done", reason: "stop", message: responseWithUsage([{ type: "text", text: "review done" }]) } as any);
+  await waitForStatus(statusRun.details.turn_id, "completed");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  eq("completion clears Running and restores settings status", fusionStatusLine, "Fusion available • executor (off)");
+  context.modelRegistry.streamSimple = savedStatusStream;
+
   let executorSignal: AbortSignal | undefined;
   let markStarted!: () => void;
   const started = new Promise<void>((resolve) => { markStarted = resolve; });
@@ -1906,7 +1922,20 @@ try {
   const deferredWorkerId = deferred.details.worker_id as string;
   await started;
   await new Promise((resolve) => setTimeout(resolve, 80));
-  eq("background activity keeps a quiet settings status without opening a pane", [customCalls, fusionStatusLine, fusionStatusLine.includes("status-test"), fusionStatusLine.includes("waiting")], [0, "Fusion available • executor (off)", false, false]);
+  eq("background activity shows Running and elapsed without opening a pane", [customCalls, /^Fusion • Running • status-test • \d+s$/.test(fusionStatusLine), fusionStatusLine.includes("waiting")], [0, true, false]);
+  const beforeTick = Number(/ • (\d+)s$/.exec(fusionStatusLine)?.[1]);
+  await new Promise((resolve) => setTimeout(resolve, 1_150));
+  eq("elapsed status advances without provider progress or user input", Number(/ • (\d+)s$/.exec(fusionStatusLine)?.[1]) > beforeTick, true);
+  context.modelRegistry.streamSimple = (_model, _context, options) => resultStream(new Promise((_resolve, reject) => {
+    options.signal?.addEventListener("abort", () => reject(options.signal?.reason), { once: true });
+  }));
+  const otherRunning = await spawn.execute("other-running", { task: "wait too", label: "other-review" }, undefined, undefined, context);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  eq("concurrent workers show the running count", /^Fusion • Running \(2\) • other-review • \d+s$/.test(fusionStatusLine), true);
+  await interrupt.execute("stop-other", { worker_id: otherRunning.details.worker_id }, undefined, undefined, context);
+  context.modelRegistry.streamSimple = savedStatusStream;
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  eq("interrupting one worker preserves the remaining running indicator", /^Fusion • Running • status-test • \d+s$/.test(fusionStatusLine), true);
 
   const workerBeforeInquiry = await readStatus(deferredWorkerId);
   const inquiryAccepted = await ask.execute(

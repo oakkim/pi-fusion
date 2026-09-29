@@ -7,6 +7,7 @@ import fusionExtension from "./index.ts";
 import { compactExecutorHistory } from "./compaction.ts";
 import { handoffTaskText } from "./prompts.ts";
 import { WorkerRuntime, type WorkerRecord } from "./runtime.ts";
+import { RECOMMENDATION_LEAD_GUIDANCE } from "./recommendations.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "pi-fusion-recommendation-"));
 const originalFetch = globalThis.fetch;
@@ -26,7 +27,7 @@ let runtime: WorkerRuntime | undefined;
 let now = 1_000;
 let maximumHookMs = 0;
 let idle = false;
-const requests: Array<{ signal: AbortSignal; evidence: any; settled: boolean; resolve: (response: Response) => void; reject: (error: Error) => void }> = [];
+const requests: Array<{ signal: AbortSignal; evidence: any; messages: any[]; settled: boolean; resolve: (response: Response) => void; reject: (error: Error) => void }> = [];
 const advisorRequests: Array<{ question: string; signal: AbortSignal; settled: boolean; resolve: (response: any) => void; reject: (error: Error) => void }> = [];
 const model = { provider: "test", id: "advisor", api: "openai-completions", input: ["text"], maxTokens: 8192, contextWindow: 128_000, reasoning: false };
 const context: any = {
@@ -124,8 +125,15 @@ try {
   globalThis.fetch = async (_url, options) => new Promise<Response>((resolve, reject) => {
     assert.equal(requests.filter((request) => !request.settled).length, 0, "never overlap inference requests, including cancelled requests that have not settled");
     const body = JSON.parse(String(options?.body));
+    const evidence = JSON.parse(body.messages[1].content);
+    for (const message of body.messages.slice(2)) {
+      if (message.role !== "user") continue;
+      const update = JSON.parse(message.content);
+      if (update.state) Object.assign(evidence, update.state);
+      if (update.message) evidence.recentContext += `\n${JSON.stringify(update.message)}`;
+    }
     const request = {
-      signal: options!.signal!, evidence: JSON.parse(body.messages[1].content), settled: false,
+      signal: options!.signal!, evidence, messages: body.messages, settled: false,
       resolve: (response: Response) => { request.settled = true; resolve(response); },
       reject: (error: Error) => { request.settled = true; reject(error); },
     };
@@ -144,6 +152,48 @@ try {
   } as never, { agentDir: directory });
   await handlers.get("session_start")!({}, context);
 
+  const preparePrompt = (systemPrompt: string, sections?: Record<string, string>, selectedTools = defaultTools) => handlers.get("before_agent_start")!({
+    systemPrompt, systemPromptOptions: { selectedTools, ...(sections ? { sections } : {}) }, prompt: "Continue the current task",
+  }, context);
+  const nativeSections: Record<string, string> = { other_extension: "Preserve this section" };
+  assert.equal(preparePrompt("Base system rules", nativeSections), undefined);
+  assert.equal(nativeSections.pi_fusion_recommendation_ack, RECOMMENDATION_LEAD_GUIDANCE);
+  assert.ok(nativeSections.pi_fusion_routing);
+  assert.ok(nativeSections.pi_advisor);
+  const routing = nativeSections.pi_fusion_routing;
+  const advisorGuidance = nativeSections.pi_advisor;
+  preparePrompt("Base system rules", nativeSections);
+  assert.equal(nativeSections.pi_fusion_recommendation_ack, RECOMMENDATION_LEAD_GUIDANCE, "native guidance is idempotent");
+  const legacyEnabled = preparePrompt("Base system rules").systemPrompt;
+  assert.match(legacyEnabled, /<pi_fusion_routing>/);
+  assert.match(legacyEnabled, /<pi_advisor>/);
+  assert.ok(legacyEnabled.includes(RECOMMENDATION_LEAD_GUIDANCE));
+  const legacyRepeated = preparePrompt(legacyEnabled)?.systemPrompt ?? legacyEnabled;
+  assert.equal(legacyRepeated, legacyEnabled, "legacy guidance is not duplicated");
+  await commands.get("fusion").handler("recommend off", context);
+  preparePrompt("Base system rules", nativeSections);
+  assert.equal(nativeSections.pi_fusion_recommendation_ack, undefined);
+  assert.equal(nativeSections.pi_fusion_routing, routing);
+  assert.equal(nativeSections.pi_advisor, advisorGuidance);
+  assert.equal(nativeSections.other_extension, "Preserve this section");
+  const legacyDisabled = preparePrompt(legacyEnabled).systemPrompt;
+  assert.doesNotMatch(legacyDisabled, /pi_fusion_recommendation_ack|acknowledgment is required/);
+  assert.match(legacyDisabled, /<pi_fusion_routing>/);
+  assert.match(legacyDisabled, /<pi_advisor>/);
+  await commands.get("fusion").handler("recommend on", context);
+  const getBranch = context.sessionManager.getBranch;
+  context.sessionManager.getBranch = () => [{ type: "custom", customType: "fusion-mode", data: { mode: "off" } }];
+  try {
+    preparePrompt("Base system rules", nativeSections, ["ask_advisor"]);
+    assert.equal(nativeSections.pi_fusion_recommendation_ack, RECOMMENDATION_LEAD_GUIDANCE, "Advisor-only recommendations retain the acknowledgment rule with Fusion off");
+    assert.equal(nativeSections.pi_fusion_routing, undefined);
+    assert.equal(nativeSections.pi_advisor, advisorGuidance);
+    const advisorOnly = preparePrompt("Base system rules", undefined, ["ask_advisor"]).systemPrompt;
+    assert.ok(advisorOnly.includes(RECOMMENDATION_LEAD_GUIDANCE));
+    assert.match(advisorOnly, /<pi_advisor>/);
+    assert.doesNotMatch(advisorOnly, /<pi_fusion_routing>/);
+  } finally { context.sessionManager.getBranch = getBranch; }
+
   const first = start();
   assert.match(first.evidence.prompt, /lock contention/);
   assert.match(first.evidence.recentContext, /deadlock/);
@@ -160,9 +210,18 @@ try {
   const renderer = renderers.get(notices[0]!.customType)!;
   const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
   const rendered = renderer(notices[0], { expanded: false }, theme).render(80).join("\n");
-  assert.equal(rendered.trimEnd(), "Fusion Recommendation - Advisor: yes · Worker: yes · 0.0s");
+  assert.equal(rendered.trimEnd(), "Fusion Worker, Advisor Recommended · 0.0s");
   const legacyNotice = { data: { text: "Advisor: no · Worker: no · default_model · 7279ms · 4115 local tokens · bounded context" } };
-  assert.equal(renderer(legacyNotice, { expanded: false }, theme).render(80).join("\n").trimEnd(), "Fusion Recommendation - Advisor: no · Worker: no · 7.2s");
+  assert.equal(renderer(legacyNotice, { expanded: false }, theme), undefined, "saved non-positive entries stay hidden too");
+  for (const [advisor, worker, expected] of [
+    ["no", "yes", "Fusion Worker"], ["yes", "no", "Advisor"],
+    ["uncertain", "yes", "Fusion Worker"], ["yes", "uncertain", "Advisor"],
+  ]) {
+    const saved = { data: { text: `Advisor: ${advisor} · Worker: ${worker} · local · 8399ms · 120 local tokens` } };
+    const original = saved.data.text;
+    assert.equal(renderer(saved, { expanded: false }, theme).render(100).join("\n").trimEnd(), `${expected} Recommended · 8.3s`);
+    assert.equal(saved.data.text, original, "mixed saved entries hide non-positive labels without changing recorded decisions");
+  }
   assert.doesNotMatch(rendered, /Both unresolved/, "free-form model rationale is not copied into the English UI");
   assert.equal(renderer({ data: null }, { expanded: false }, theme), undefined, "malformed saved entries cannot crash rendering");
   handlers.get("turn_start")!({ turnIndex: 1 });
@@ -174,7 +233,9 @@ try {
   assert.equal(delivered.messages.at(-1).customType, "pi-fusion-recommendation");
   assert.equal(delivered.messages.at(-1).display, false);
   assert.match(delivered.messages.at(-1).content, /earlier checkpoint/);
-  assert.match(delivered.messages.at(-1).content, /Ignore it if newer evidence/);
+  assert.match(delivered.messages.at(-1).content, /Use the current task state to decide whether to accept or decline it/);
+  assert.ok(delivered.messages.at(-1).content.includes(RECOMMENDATION_LEAD_GUIDANCE));
+  assert.doesNotMatch(delivered.messages.at(-1).content, /Ignore it if|not approval or a requirement/, "freshness and tool autonomy cannot silently waive acknowledgment");
   assert.match(JSON.stringify(convertToLlm(delivered.messages).at(-1)), /advisor=yes, worker=yes/);
   assertFilteredOnly(checkpoint(withWakeup), messages);
   assert.equal(checkpoint(), undefined, "consume the ready hint once");
@@ -213,7 +274,8 @@ try {
     await reset();
     const beforeNotice: number = notices.length;
     await finish(start(), answer(advisor, worker));
-    assert.equal(notices.length, beforeNotice + 1, "non-positive verdicts remain visible in the UI");
+    assert.equal(notices.length, beforeNotice + 1, "non-positive verdicts remain recorded for inspection");
+    assert.equal(renderer(notices.at(-1), { expanded: false }, theme), undefined, "non-positive verdicts stay hidden in chat");
     await terminal();
     assert.equal(emitted.length, 0, `${advisor}/${worker} must not follow up the Lead`);
     assert.equal(checkpoint(), undefined, "non-positive verdicts do not inject a hidden hint");
@@ -222,6 +284,7 @@ try {
     await reset();
     const request = start();
     await finish(request, answer(advisor, worker));
+    assert.ok(renderer(notices.at(-1), { expanded: false }, theme), "either yes verdict remains visible in chat");
     assert.equal(emitted.length, 0);
     await terminal();
     assert.equal(emitted.length, 1);
@@ -574,6 +637,49 @@ try {
   assert.match(compactedTask, /<fusion_steer /, "the latest public instruction accompanies the compacted task");
   assert.notEqual(compactedTask, completedTask, "the preserved generation-one handoff cannot become the current task again");
   assert.doesNotMatch(compactedTask, /fusion_handoff generation="1"/);
+
+  // Cache input survives natural agent runs, but not branches, opt-out, or failures.
+  await reset();
+  const historySeed = start();
+  await finish(historySeed, answer("no", "no"));
+  handlers.get("agent_end")!({}, context);
+  handlers.get("before_agent_start")!({ systemPrompt: "", systemPromptOptions: { sections: {} }, prompt: "Continue" }, context);
+  const continuedSource = [...messages, { role: "assistant", content: "The API implementation is ready." }, { role: "user", content: "Continue with the UI fix", timestamp: 10 }];
+  const continuedHistory = start(continuedSource);
+  assert.deepEqual(continuedHistory.messages.slice(0, historySeed.messages.length), historySeed.messages, "new agent runs append to the same session prefix");
+  assert.deepEqual(continuedHistory.messages[historySeed.messages.length], { role: "assistant", content: "" });
+  assert.match(JSON.stringify(continuedHistory.messages), /The API implementation is ready/);
+  assert.equal(continuedHistory.evidence.prompt, "Continue with the UI fix");
+  await finish(continuedHistory, answer("no", "no"));
+  const branchedSource = [...continuedSource];
+  branchedSource[0] = { ...branchedSource[0], content: "Different branch instruction" };
+  handlers.get("turn_start")!({ turnIndex: 4 });
+  const branchedHistory = start(branchedSource);
+  assert.equal(branchedHistory.messages.length, 2, "changed source prefixes cannot retain another branch's cached evidence");
+  await finish(branchedHistory, answer("no", "no"));
+  handlers.get("turn_start")!({ turnIndex: 8 });
+  const compactedSource = [{ role: "compactionSummary", summary: "Only the UI task remains" }, { role: "user", content: "Finish the UI task", timestamp: 11 }];
+  const compactedHistory = start(compactedSource);
+  assert.equal(compactedHistory.messages.length, 2);
+  assert.match(compactedHistory.evidence.recentContext, /Only the UI task remains/);
+  await finish(compactedHistory, answer("no", "no"));
+  await commands.get("fusion").handler("recommend off", context);
+  await commands.get("fusion").handler("recommend on", context);
+  const enabledHistory = start(compactedSource);
+  assert.equal(enabledHistory.messages.length, 2, "off/on clears cached transcript state");
+  await finish(enabledHistory, answer("no", "no"));
+  handlers.get("turn_start")!({ turnIndex: 4 });
+  const failedHistory = start([...compactedSource, { role: "assistant", content: "A new implementation update" }]);
+  failedHistory.reject(new Error("Local transport failed"));
+  await flush();
+  handlers.get("turn_start")!({ turnIndex: 8 });
+  const retryHistory = start([...compactedSource, { role: "assistant", content: "A new implementation update" }]);
+  assert.equal(retryHistory.messages.length, 2, "fresh failures recover with a bounded seed instead of a growing uncached request");
+  await finish(retryHistory, answer("no", "no"));
+  await handlers.get("session_start")!({}, context);
+  const reloadedHistory = start(compactedSource);
+  assert.equal(reloadedHistory.messages.length, 2, "session reloads clear the append-only history");
+  await finish(reloadedHistory, answer("no", "no"));
   console.log(`ok   recommendation integration: nonblocking hook (max ${maximumHookMs.toFixed(2)}ms), terminal-only follow-up, ephemeral advice, advisor activity, worker task/queue/steering and freshness`);
 } finally {
   await handlers.get("session_shutdown")?.({}, context);

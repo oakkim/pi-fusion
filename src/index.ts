@@ -60,7 +60,7 @@ import { registerAdvisor } from "./advisor.ts";
 import { fusionCallArgument, fusionCallMetadata, renderFusionRequestCall } from "./tool-call.ts";
 import { modelCompletions, selectModel } from "./model-picker.ts";
 import { registerCommandGroup, type Subcommand } from "./commands.ts";
-import { requestRecommendation, recommendationEvidence, formatRecommendation, formatRecommendationStatus, type Recommendation } from "./recommendations.ts";
+import { requestRecommendation, recommendationEvidence, RecommendationHistory, RECOMMENDATION_LEAD_GUIDANCE, formatRecommendation, formatRecommendationStatus, type Recommendation } from "./recommendations.ts";
 
 const ContextMode = Type.Union([Type.Literal("none"), Type.Literal("recent")], { default: "none" });
 
@@ -243,6 +243,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   let recommendationKey = "";
   let lastRecommendation: Recommendation | undefined;
   let recommendationError: string | undefined;
+  const recommendationHistory = new RecommendationHistory();
   let monitor!: FusionMonitorPublisher;
   const pane = new FusionPaneController(
     (id) => runtime.getWorker(id),
@@ -254,13 +255,14 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
 
   pi.registerEntryRenderer<{ text: string }>("pi-fusion-recommendation-notice", (entry, _options, theme) => {
     if (typeof entry.data?.text !== "string") return;
-    // Render existing saved entries compactly too; keep full details in /fusion status.
+    // Show only actionable recommendations, including when replaying saved entries.
     const parts = entry.data.text.split(" · ");
+    if (parts[0] !== "Advisor: yes" && parts[1] !== "Worker: yes") return;
     const elapsed = parts.slice(2).find((part) => /^\d+(?:\.\d+)?ms$/.test(part));
     if (!elapsed) return;
     const seconds = (Math.floor(Number.parseFloat(elapsed) / 100) / 10).toFixed(1);
-    const summary = sanitizeMonitorText(parts.slice(0, 2).join(" · "), 160);
-    return new Text(theme.fg("accent", theme.bold(`Fusion Recommendation - ${summary} · ${seconds}s`)), 0, 0);
+    const summary = [parts[1] === "Worker: yes" ? "Fusion Worker" : "", parts[0] === "Advisor: yes" ? "Advisor" : ""].filter(Boolean).join(", ");
+    return new Text(theme.fg("accent", theme.bold(`${summary} Recommended · ${seconds}s`)), 0, 0);
   });
 
   // Only a global opt-in can enable local context screening, never project config.
@@ -278,8 +280,9 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     recommendationError = undefined;
   }
 
-  function resetRecommendations(): void {
+  function resetRecommendations(clearHistory = true): void {
     discardRecommendations();
+    if (clearHistory) recommendationHistory.reset();
     recommendationTurn = 0;
     recommendationKey = "";
   }
@@ -781,8 +784,9 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   // or forcing every conversational request through a worker. Pi 0.87+ patches
   // structured sections; older Pi requires a per-turn system-prompt return.
   pi.on("before_agent_start", (event, ctx) => {
-    resetRecommendations();
-    const systemPrompt = advisor.preparePrompt(event.systemPromptOptions, event.systemPrompt, ctx);
+    resetRecommendations(false);
+    let systemPrompt = advisor.preparePrompt(event.systemPromptOptions, event.systemPrompt, ctx);
+    const recommendationsEnabled = recommendationSettings().enabled;
     const enabled = restoreMode(ctx) === "available"
       && event.systemPromptOptions.selectedTools?.includes("fusion_spawn")
       && !isForcePrompt(event.prompt);
@@ -792,10 +796,13 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     if (sections) {
       if (enabled) sections.pi_fusion_routing = AVAILABLE_LEAD_GUIDANCE;
       else delete sections.pi_fusion_routing;
+      if (recommendationsEnabled) sections.pi_fusion_recommendation_ack = RECOMMENDATION_LEAD_GUIDANCE;
+      else delete sections.pi_fusion_recommendation_ack;
       return;
-    } else if (enabled && !systemPrompt.includes("<pi_fusion_routing>")) {
-      return { systemPrompt: `${systemPrompt}\n\n<pi_fusion_routing>\n${AVAILABLE_LEAD_GUIDANCE}\n</pi_fusion_routing>` };
     }
+    if (enabled && !systemPrompt.includes("<pi_fusion_routing>")) systemPrompt += `\n\n<pi_fusion_routing>\n${AVAILABLE_LEAD_GUIDANCE}\n</pi_fusion_routing>`;
+    systemPrompt = systemPrompt.replace(/(?:\n\n)?<pi_fusion_recommendation_ack>[\s\S]*?<\/pi_fusion_recommendation_ack>/g, "");
+    if (recommendationsEnabled) systemPrompt += `\n\n<pi_fusion_recommendation_ack>\n${RECOMMENDATION_LEAD_GUIDANCE}\n</pi_fusion_recommendation_ack>`;
     if (systemPrompt !== event.systemPrompt) return { systemPrompt };
   });
 
@@ -862,7 +869,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     const result = ready ? { messages: [...messages, {
       role: "custom" as const,
       customType: "pi-fusion-recommendation",
-      content: `This optional recommendation reflects an earlier checkpoint. Ignore it if newer evidence has resolved or changed the task. ${formatRecommendation(ready.value)}`,
+      content: `This recommendation reflects an earlier checkpoint. Use the current task state to decide whether to accept or decline it. ${formatRecommendation(ready.value)}`,
       display: false,
       timestamp: Date.now(),
     }] } : cleaned;
@@ -894,7 +901,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     };
     void (async () => {
       try {
-        const recommendation = await requestRecommendation(input, { endpoint: settings.endpoint, signal: check.signal });
+        const recommendation = await requestRecommendation(input, { endpoint: settings.endpoint, signal: check.signal, history: recommendationHistory, sourceMessages: messages });
         if (!fresh(check)) return;
         lastRecommendation = recommendation;
         recommendationError = undefined;

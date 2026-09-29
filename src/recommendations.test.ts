@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { formatRecommendation, formatRecommendationStatus, recommendationEvidence, requestRecommendation, type RecommendationInput } from "./recommendations.ts";
 
-const input: RecommendationInput = { prompt: "Implement the scoped task", recentContext: "Tests fail", advisorAvailable: true, fusionAvailable: true, workers: [] };
+const input: RecommendationInput = { prompt: "Implement the scoped task", recentContext: "Tests fail", advisorAvailable: true, fusionAvailable: true, advisor: { running: [] }, workers: [] };
 const options = { endpoint: "http://127.0.0.1:8788", timeoutMs: 1_000 };
 const response = (content: unknown = { reason: "Unresolved design and independent implementation both need attention.", advisor: "yes", worker: "yes" }) => ({
   model: "openjev", usage: { prompt_tokens: 120, completion_tokens: 40 },
@@ -111,7 +111,8 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
 await fakeLocal(() => Response.json(response()), async (calls) => {
   const result = await requestRecommendation({
     ...input, prompt: `PROMPT_HEAD${"x".repeat(20_000)}PROMPT_TAIL`, recentContext: `OLD${"y".repeat(20_000)}LATEST_TOOL_ERROR`,
-    workers: Array.from({ length: 21 }, (_, i) => ({ id: `worker-${i}`, label: "label".repeat(100), status: "running".repeat(100) })),
+    advisor: { running: Array.from({ length: 9 }, (_, i) => ({ id: `consultation-${i}`, question: "question ".repeat(100) })), last: { id: "latest", question: "", status: "completed" } },
+    workers: Array.from({ length: 21 }, (_, i) => ({ id: `worker-${i}`, label: "label".repeat(100), status: i === 20 ? "running" : "idle", task: "task ".repeat(200), queuedTasks: Array(4).fill("queued ".repeat(100)), steering: Array(4).fill("updated ".repeat(100)) })),
   }, options);
   const evidence = JSON.parse(calls[0]!.body.messages[1].content);
   assert.ok(evidence.prompt.length <= 6_000);
@@ -120,10 +121,50 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
   assert.match(evidence.prompt, /omitted/);
   assert.ok(evidence.recentContext.length <= 8_000);
   assert.match(evidence.recentContext, /LATEST_TOOL_ERROR$/);
-  assert.equal(evidence.workers.length, 20);
-  assert.equal(evidence.omittedWorkers, 1);
+  assert.ok(evidence.workers.length > 0 && evidence.workers.length < 20);
+  assert.equal(evidence.omittedWorkers, 21 - evidence.workers.length);
+  assert.equal(evidence.workers[0].id, "worker-20", "running workers take priority over idle history when bounded");
   assert.ok(evidence.workers.every((worker: any) => worker.label.length <= 160 && worker.status.length <= 40));
+  assert.ok(evidence.workers.every((worker: any) => worker.task.length <= 480 && worker.queuedTasks.length === 3 && worker.steering.length === 3
+    && [...worker.queuedTasks, ...worker.steering].every((task: string) => task.length <= 240) && worker.omittedQueuedTasks === 1 && worker.omittedSteering === 1));
+  assert.ok(evidence.advisor.running.length > 0 && evidence.advisor.running.length <= 8);
+  assert.equal(evidence.advisor.omittedRunning, 9 - evidence.advisor.running.length);
+  assert.ok(evidence.advisor.running.every((request: any) => request.question.length <= 320));
+  assert.equal(evidence.advisor.last.question, "General review");
+  assert.equal(evidence.advisor.last.status, "completed");
+  assert.ok(JSON.stringify({ advisor: evidence.advisor, workers: evidence.workers, omittedWorkers: evidence.omittedWorkers }).length <= 6_000);
   assert.equal(result.inputTruncated, true);
+});
+
+await fakeLocal(() => Response.json(response()), async (calls) => {
+  const workers = Array.from({ length: 21 }, (_, i) => ({ id: `worker-${i}`, label: "", status: "idle", task: "Small task", queuedTasks: [], steering: [] }));
+  await requestRecommendation({ ...input, workers }, options);
+  const evidence = JSON.parse(calls[0]!.body.messages[1].content);
+  assert.equal(evidence.workers[0].id, "worker-20", "recent idle workers remain available for reuse when the inventory is bounded");
+  assert.ok(!evidence.workers.some((worker: any) => worker.id === "worker-0"));
+});
+
+await fakeLocal(() => Response.json(response()), async (calls) => {
+  const text = "\u0000".repeat(800);
+  const result = await requestRecommendation({ ...input,
+    advisor: { running: Array.from({ length: 8 }, (_, i) => ({ id: String(i), question: text })), last: { id: "last", question: text, status: "failed" } },
+    workers: [{ id: text, label: text, status: "running", task: text, queuedTasks: [text, text, text], steering: [text, text, text] }],
+  }, options);
+  const evidence = JSON.parse(calls[0]!.body.messages[1].content);
+  assert.ok(JSON.stringify({ advisor: evidence.advisor, workers: evidence.workers, omittedWorkers: evidence.omittedWorkers }).length <= 6_000, "JSON escaping cannot evade the activity budget");
+  assert.equal(result.inputTruncated, true);
+});
+
+await fakeLocal(() => Response.json(response()), async (calls) => {
+  const activity: RecommendationInput = { ...input,
+    advisor: { running: [{ id: "review-1", question: "Validate the migration boundary" }], last: { id: "review-0", question: "Check cache ownership", status: "failed" } },
+    workers: [{ id: "api-worker", label: "API", status: "running", task: "Implement the migration", queuedTasks: ["Verify rollback"], steering: ["Preserve old clients"] }],
+  };
+  await requestRecommendation(activity, options);
+  assert.deepEqual(JSON.parse(calls[0]!.body.messages[1].content), activity, "the local model receives task ownership and consultation state, not just availability flags");
+  assert.match(calls[0]!.body.messages[0].content, /do not repeat a question already being consulted or answered/);
+  assert.match(calls[0]!.body.messages[0].content, /Do not duplicate running or queued work/);
+  assert.match(calls[0]!.body.messages[0].content, /different independent task/);
 });
 
 const evidence = recommendationEvidence([

@@ -19,6 +19,11 @@ const ADVISOR_SYSTEM = "You advise the Lead on its current task. Answer the late
 const ADVISOR_GUIDANCE = "Consider ask_advisor before a consequential design choice, after two similar failed attempts or stalled progress, and before finishing complex work. Skip routine changes; advice is guidance, not a mandatory gate. Supply a concise public question about the decision or uncertainty, or omit it for a general review. Do not include private reasoning. The current Lead context is attached automatically. Check advice against observed evidence and investigate conflicts before acting; the final decision remains yours.";
 const GENERAL_REVIEW = "Review the current task, progress, and planned next steps. Identify the most consequential risk, missing verification, or decision that needs attention.";
 
+export interface AdvisorActivity {
+  running: Array<{ id: string; question: string }>;
+  last?: { id: string; question: string; status: "completed" | "failed" | "interrupted" };
+}
+
 interface AdvisorDetails {
   status: string;
   question: string;
@@ -54,7 +59,8 @@ export function registerAdvisor(pi: ExtensionAPI, agentDir?: string, onChange?: 
   let epoch = 0;
   let completionContext: ExtensionContext | undefined;
   let active = true;
-  const controllers = new Set<AbortController>();
+  const controllers = new Map<AbortController, AdvisorActivity["running"][number]>();
+  let lastActivity: AdvisorActivity["last"];
   const configured = (ctx: ExtensionContext): string | false | undefined => {
     const entries = ctx.sessionManager.getBranch();
     for (let i = entries.length - 1; i >= 0; i--) {
@@ -117,14 +123,27 @@ export function registerAdvisor(pi: ExtensionAPI, agentDir?: string, onChange?: 
     const requestId = crypto.randomUUID();
     const controller = new AbortController();
     const requestSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-    controllers.add(controller);
+    const activity = { id: requestId, question };
+    controllers.set(controller, activity);
     onChange?.(ctx);
     let usage = zeroUsage();
     let rawUsage: Usage | undefined;
     let usageKnown = false;
     let costKnown = false;
     let text = "";
-    let status = "failed";
+    let status: NonNullable<AdvisorActivity["last"]>["status"] = "failed";
+    const finishActivity = (outcome: typeof status) => {
+      // Abort settles the activity immediately. A late response must not replace
+      // a newer completion, even when its provider ignores cancellation.
+      if (!controllers.delete(controller)) return;
+      if (active && requestEpoch === epoch) {
+        lastActivity = { ...activity, status: outcome };
+        onChange?.(ctx);
+      }
+    };
+    const onAbort = () => { status = "interrupted"; finishActivity(status); };
+    requestSignal.addEventListener("abort", onAbort, { once: true });
+    if (requestSignal.aborted) onAbort();
     const usageLabel = () => `Usage: ${usageKnown ? `${usage.totalTokens} tokens` : "tokens unavailable"} • ${costKnown ? `$${usage.cost.toFixed(4)} recorded cost` : "cost unavailable"}`;
     const result = (content: string, isError = false): AdvisorResult => ({ content: [{ type: "text", text: content }], ...(isError ? { isError: true } : {}), ...(rawUsage ? { usage: rawUsage } : {}), details: { status, question, model: modelDisplay(model), usage, usageKnown, costKnown } });
     const progress = (visible: string) => {
@@ -168,9 +187,9 @@ export function registerAdvisor(pi: ExtensionAPI, agentDir?: string, onChange?: 
       const message = sanitizeError(error instanceof Error ? error.message : String(error));
       return result(`Advisor ${status}: ${message}\n${usageLabel()}${text && active && requestEpoch === epoch ? `\n\nPartial response (incomplete):\n${sanitizeMonitorText(text, Number.MAX_SAFE_INTEGER)}` : ""}`, true);
     } finally {
-      controllers.delete(controller);
+      requestSignal.removeEventListener("abort", onAbort);
+      finishActivity(status);
       if (active && requestEpoch === epoch) {
-        onChange?.(ctx);
         if (manual && rawUsage) recordNativeUsage(ctx, requestId, model, rawUsage, "fusion-advisor");
         try { pi.appendEntry("fusion-advisor-cost", { request_id: requestId, model: modelDisplay(model), thinking_level: requestSettings.thinkingLevel, fast_mode: requestSettings.fastApplied, status, usage, usageKnown, costKnown, includedInWorkerUsage: isWorkerToolContext(ctx), timestamp: Date.now() }); }
         catch { /* The tool result still exposes usage if journaling is unavailable. */ }
@@ -345,9 +364,10 @@ export function registerAdvisor(pi: ExtensionAPI, agentDir?: string, onChange?: 
   registerCommandGroup(pi, "advisor", advisorCommands);
 
   return {
+    activity(): AdvisorActivity { return { running: [...controllers.values()].map((request) => ({ ...request })), ...(lastActivity ? { last: { ...lastActivity } } : {}) }; },
     status(ctx: ExtensionContext): string | undefined { return !active ? undefined : controllers.size > 0 ? "Advising…" : resolve(ctx) ? "Advisor on" : undefined; },
-    start(ctx: ExtensionContext) { completionContext = ctx; epoch++; for (const controller of controllers) controller.abort(); controllers.clear(); active = true; refresh(ctx); },
-    stop() { epoch++; active = false; for (const controller of controllers) controller.abort(); controllers.clear(); },
+    start(ctx: ExtensionContext) { completionContext = ctx; epoch++; for (const controller of controllers.keys()) controller.abort(); controllers.clear(); lastActivity = undefined; active = true; refresh(ctx); },
+    stop() { epoch++; active = false; for (const controller of controllers.keys()) controller.abort(); controllers.clear(); lastActivity = undefined; },
     preparePrompt(options: { selectedTools?: string[]; sections?: Record<string, string> }, systemPrompt: string, ctx: ExtensionContext): string {
       completionContext = ctx;
       const enabled = options.selectedTools?.includes("ask_advisor") && !!resolve(ctx);

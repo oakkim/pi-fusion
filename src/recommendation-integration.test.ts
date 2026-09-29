@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import fusionExtension from "./index.ts";
+import { compactExecutorHistory } from "./compaction.ts";
+import { handoffTaskText } from "./prompts.ts";
 import { WorkerRuntime, type WorkerRecord } from "./runtime.ts";
 
 const directory = mkdtempSync(join(tmpdir(), "pi-fusion-recommendation-"));
@@ -12,6 +14,7 @@ const originalNow = Date.now;
 const originalList = WorkerRuntime.prototype.list;
 const handlers = new Map<string, (...args: any[]) => any>();
 const commands = new Map<string, any>();
+const registeredTools = new Map<string, any>();
 const notifications: string[] = [];
 const emitted: Array<[{ customType: string; content: string; display: boolean }, { deliverAs?: string; triggerTurn?: boolean }]> = [];
 const notices: Array<{ customType: string; data: { text: string } }> = [];
@@ -19,18 +22,36 @@ const renderers = new Map<string, (...args: any[]) => any>();
 const defaultTools = ["fusion_spawn", "fusion_followup", "ask_advisor"];
 let activeTools = [...defaultTools];
 let workers: WorkerRecord[] = [];
+let runtime: WorkerRuntime | undefined;
 let now = 1_000;
 let maximumHookMs = 0;
 let idle = false;
 const requests: Array<{ signal: AbortSignal; evidence: any; settled: boolean; resolve: (response: Response) => void; reject: (error: Error) => void }> = [];
-const model = { provider: "test", id: "advisor", input: ["text"] };
+const advisorRequests: Array<{ question: string; signal: AbortSignal; settled: boolean; resolve: (response: any) => void; reject: (error: Error) => void }> = [];
+const model = { provider: "test", id: "advisor", api: "openai-completions", input: ["text"], maxTokens: 8192, contextWindow: 128_000, reasoning: false };
 const context: any = {
   cwd: directory, mode: "tui", hasUI: false,
   isProjectTrusted: () => false,
   isIdle: () => idle,
   ui: { notify: (text: string) => notifications.push(text) },
-  modelRegistry: { getAll: () => [model], getAvailable: () => [model], hasConfiguredAuth: () => true },
-  sessionManager: { getBranch: () => [], getSessionId: () => "recommendation-test" },
+  getSystemPrompt: () => "Review only public evidence.",
+  modelRegistry: {
+    getAll: () => [model], getAvailable: () => [model], hasConfiguredAuth: () => true,
+    streamSimple: (requestedModel: typeof model, input: any, options: any) => {
+      assert.equal(requestedModel, model);
+      const promise = new Promise<any>((resolve, reject) => {
+        const request = {
+          question: input.messages.at(-1).content, signal: options.signal, settled: false,
+          resolve: (response: any) => { request.settled = true; resolve(response); },
+          reject: (error: Error) => { request.settled = true; reject(error); },
+        };
+        advisorRequests.push(request);
+        options.signal.addEventListener("abort", () => request.reject(options.signal.reason), { once: true });
+      });
+      return { result: () => promise };
+    },
+  },
+  sessionManager: { getBranch: () => [], getEntries: () => [], getLeafId: () => undefined, getSessionId: () => "recommendation-test" },
 };
 const messages: any[] = [
   { role: "user", content: "Investigate the lock contention and implement the independent API and UI fixes.", timestamp: 1 },
@@ -60,6 +81,23 @@ const checkpoint = (input = messages) => {
   return result;
 };
 const finish = async (request = requests.at(-1)!, response = answer()) => { request.resolve(response); await flush(); };
+const recommendationNotices = () => notices.filter((entry) => entry.customType === "pi-fusion-recommendation-notice").length;
+const beginAdvisor = (question: string) => {
+  const controller = new AbortController();
+  const count = advisorRequests.length;
+  const result = registeredTools.get("ask_advisor").execute(`advisor-${count}`, { question }, controller.signal, undefined, context);
+  assert.equal(advisorRequests.length, count + 1, "real ask_advisor reaches only the deferred fixture provider");
+  return { controller, result, request: advisorRequests.at(-1)! };
+};
+const settleAdvisor = async (call: ReturnType<typeof beginAdvisor>, status: "completed" | "failed" | "interrupted" = "completed") => {
+  if (status === "interrupted") call.controller.abort(new Error("Fixture advisor interrupted"));
+  else if (status === "failed") call.request.reject(new Error("Fixture advisor failed"));
+  else call.request.resolve({ role: "assistant", content: [{ type: "text", text: "Public fixture advice." }], stopReason: "stop", timestamp: now,
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+  const result = await call.result;
+  assert.equal(result.details.status, status);
+  return result;
+};
 const start = (input = messages) => {
   const before = requests.length;
   assert.equal(checkpoint(input), undefined);
@@ -81,8 +119,8 @@ const reset = async () => {
 
 try {
   Date.now = () => now;
-  WorkerRuntime.prototype.list = () => workers;
-  writeFileSync(join(directory, "fusion.json"), JSON.stringify({ recommendations: true, advisorModel: "test/advisor", preserved: "yes" }));
+  WorkerRuntime.prototype.list = function () { runtime = this; return workers; };
+  writeFileSync(join(directory, "fusion.json"), JSON.stringify({ recommendations: true, advisorModel: "test/advisor", executorTools: "none", preserved: "yes" }));
   globalThis.fetch = async (_url, options) => new Promise<Response>((resolve, reject) => {
     assert.equal(requests.filter((request) => !request.settled).length, 0, "never overlap inference requests, including cancelled requests that have not settled");
     const body = JSON.parse(String(options?.body));
@@ -97,7 +135,7 @@ try {
   fusionExtension({
     on: (name: string, handler: (...args: any[]) => any) => handlers.set(name, handler),
     registerCommand: (name: string, command: any) => commands.set(name, command),
-    registerTool: () => {},
+    registerTool: (tool: any) => registeredTools.set(tool.name, tool),
     registerEntryRenderer: (name: string, renderer: (...args: any[]) => any) => renderers.set(name, renderer),
     getActiveTools: () => activeTools,
     setActiveTools: (tools: string[]) => { activeTools = tools; },
@@ -373,10 +411,174 @@ try {
   await handlers.get("session_start")!({}, context);
   assert.equal(checkpoint(), undefined, "a new session cannot receive an old result");
   assert.equal(emitted.length, 0, "a shutdown request cannot wake the Lead after switching sessions");
-  console.log(`ok   recommendation integration: nonblocking hook (max ${maximumHookMs.toFixed(2)}ms), terminal-only follow-up, natural hint consumption, ephemeral advice, marker filtering, cadence and freshness`);
+
+  // The actual advisor tool drives activity, while its provider is only a deferred fixture.
+  await reset();
+  const beforeAdvisor = start();
+  assert.deepEqual(beforeAdvisor.evidence.advisor.running, []);
+  const question = "Which retry boundary avoids duplicate writes?";
+  const consult = beginAdvisor(question);
+  const beforeAdvisorNotice = recommendationNotices();
+  await finish(beforeAdvisor);
+  assert.equal(recommendationNotices(), beforeAdvisorNotice, "starting advice invalidates a screening response based on idle advisor state");
+  await terminal();
+  assert.equal(emitted.length, 0);
+  const whileAdvising = start();
+  assert.equal(whileAdvising.evidence.advisor.running.length, 1);
+  assert.equal(whileAdvising.evidence.advisor.running[0].question, question);
+  const consultationId = whileAdvising.evidence.advisor.running[0].id;
+  assert.equal(typeof consultationId, "string");
+  assert.ok(consultationId.length > 0);
+  await settleAdvisor(consult);
+  await finish(whileAdvising);
+  assert.equal(recommendationNotices(), beforeAdvisorNotice, "advisor completion invalidates unfinished screening before displaying its result");
+  const afterAdvising = start();
+  assert.deepEqual(afterAdvising.evidence.advisor.running, []);
+  assert.deepEqual(afterAdvising.evidence.advisor.last, { id: consultationId, question, status: "completed" });
+
+  for (const status of ["completed", "failed", "interrupted"] as const) {
+    await reset();
+    const ongoing = beginAdvisor(`Fixture consultation ending ${status}`);
+    const screen = start();
+    const activity = screen.evidence.advisor.running[0];
+    assert.equal(activity.question, ongoing.request.question);
+    const beforeNotice = recommendationNotices();
+    await settleAdvisor(ongoing, status);
+    await finish(screen);
+    assert.equal(recommendationNotices(), beforeNotice, `${status} advisor cannot produce a stale recommendation entry`);
+    await terminal();
+    assert.equal(emitted.length, 0);
+    const current = start();
+    assert.deepEqual(current.evidence.advisor.running, []);
+    assert.deepEqual(current.evidence.advisor.last, { id: activity.id, question: activity.question, status });
+  }
+
+  // Finished advice must also invalidate an already-ready hint without a new context event.
+  for (const status of ["completed", "interrupted"] as const) {
+    await reset();
+    const finishing = beginAdvisor("Review the final retry design.");
+    await finish(start());
+    await settleAdvisor(finishing, status);
+    await terminal();
+    assert.equal(emitted.length, 0, `${status} advice invalidates a pending terminal hint immediately`);
+    assert.equal(checkpoint(), undefined, `${status} advice cannot inject its stale pending hint`);
+  }
+
+  await reset();
+  await finish(start());
+  const newlyRunning = beginAdvisor("Review the recommendation before applying it.");
+  await terminal();
+  assert.equal(emitted.length, 0, "a newly running advisor invalidates advice prepared while the advisor was idle");
+  assert.equal(checkpoint(), undefined);
+  await settleAdvisor(newlyRunning);
+
+  await reset();
+  const transient = start();
+  const previousAdvisorId = transient.evidence.advisor.last?.id;
+  const shortConsult = beginAdvisor("Check the bounded retry decision once.");
+  await settleAdvisor(shortConsult);
+  const beforeTransientNotice = recommendationNotices();
+  await finish(transient);
+  assert.equal(recommendationNotices(), beforeTransientNotice, "idle to busy to idle still invalidates the old snapshot via last consultation identity");
+  const afterTransient = start();
+  assert.deepEqual(afterTransient.evidence.advisor.running, []);
+  assert.notEqual(afterTransient.evidence.advisor.last.id, previousAdvisorId);
+  assert.equal(afterTransient.evidence.advisor.last.question, shortConsult.request.question);
+
+  // Real follow-up tools populate the private queue and steering maps. The native
+  // runtime holds a busy fixture worker, so no worker model turn is launched.
+  await reset();
+  const oldTask = "Previous task already completed.";
+  const currentTask = "Implement retry backoff and retry tests.";
+  const spawned = runtime!.spawn({ label: "Retry worker", executorModelId: "test/worker",
+    firstMessage: { role: "user", content: handoffTaskText(1, oldTask), timestamp: now } });
+  spawned.worker.history.push({ role: "user", content: handoffTaskText(2, currentTask), timestamp: now + 1 });
+  spawned.worker.generation = 2;
+  workers = [spawned.worker];
+  const workerSnapshot = start();
+  const workerEvidence = workerSnapshot.evidence.workers[0];
+  assert.equal(workerEvidence.id, spawned.worker.id);
+  assert.equal(workerEvidence.label, "Retry worker");
+  assert.equal(workerEvidence.task, currentTask);
+  assert.doesNotMatch(workerEvidence.task, /Previous task|fusion_handoff/);
+  assert.deepEqual(workerEvidence.queuedTasks, []);
+  assert.deepEqual(workerEvidence.steering, []);
+  const followup = (message: string, when_busy: "queue" | "steer") => registeredTools.get("fusion_followup").execute(
+    `followup-${when_busy}`, { worker_id: spawned.worker.id, message, when_busy }, undefined, undefined, context);
+  const queuedTask = "Benchmark retry latency after implementation.";
+  const queued = await followup(queuedTask, "queue");
+  assert.equal(queued.details.status, "queued");
+  const beforeWorkerNotice = recommendationNotices();
+  await finish(workerSnapshot);
+  assert.equal(recommendationNotices(), beforeWorkerNotice, "queue changes invalidate screening even when the worker status and active turn stay unchanged");
+  const withQueue = start();
+  assert.deepEqual(withQueue.evidence.workers[0].queuedTasks, [queuedTask]);
+  const steering = "Keep write retries idempotent and add regression coverage.";
+  const steeredWorker = await followup(steering, "steer");
+  assert.equal(steeredWorker.details.status, "steering");
+  await finish(withQueue);
+  assert.equal(recommendationNotices(), beforeWorkerNotice, "new steering invalidates in-flight screening");
+  const withSteering = start();
+  assert.deepEqual(withSteering.evidence.workers[0].queuedTasks, [queuedTask]);
+  assert.deepEqual(withSteering.evidence.workers[0].steering, [steering]);
+  assert.equal(withSteering.evidence.workers[0].task, currentTask);
+  await finish(withSteering);
+  const repeatedSteer = await followup(steering, "steer");
+  assert.notEqual(repeatedSteer.details.steer_id, steeredWorker.details.steer_id);
+  await terminal();
+  assert.equal(emitted.length, 0, "a newly accepted steer invalidates pending advice even with the same instruction text");
+  assert.equal(checkpoint(), undefined, "steering changes discard ready advice at natural checkpoints too");
+  assert.equal(advisorRequests.every((request) => request.settled), true, "no fixture advisor requests remain running");
+
+  // Real compaction preserves the original handoff even after that generation's
+  // task completed. A later handoff may survive only in the public summary.
+  await reset();
+  const completedTask = "Completed old API task";
+  const currentUiTask = "Implement CURRENT UI task";
+  const latestUiConstraint = "Keep backwards compatibility";
+  const user = (content: string, timestamp: number) => ({ role: "user" as const, content, timestamp });
+  const assistant = (text: string, timestamp: number) => ({
+    role: "assistant" as const, content: [{ type: "text" as const, text }], stopReason: "stop" as const, timestamp,
+    api: "openai-completions" as const, provider: "test", model: "advisor",
+    usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+  });
+  const beforeCompaction = [
+    user(handoffTaskText(1, completedTask), 1), assistant(`done ${"x".repeat(1_000)}`, 2),
+    user(handoffTaskText(2, currentUiTask), 3), assistant(`progress ${"x".repeat(1_000)}`, 4),
+    assistant(`progress ${"x".repeat(1_000)}`, 5),
+    user(`<fusion_steer turn="t2">${latestUiConstraint}</fusion_steer>`, 6),
+    assistant(`more ${"x".repeat(1_000)}`, 7), assistant(`latest ${"x".repeat(1_000)}`, 8),
+  ];
+  let summaryCalls = 0;
+  const compacted = await compactExecutorHistory({ systemPrompt: "Worker fixture", messages: beforeCompaction }, model as never, 1024, 4, undefined, async (summaryContext) => {
+    summaryCalls++;
+    assert.match(JSON.stringify(summaryContext), /Implement CURRENT UI task/);
+    return assistant(`Old API task completed. Current task: ${currentUiTask}. Latest constraint: ${latestUiConstraint}.`, 9);
+  });
+  assert.equal(summaryCalls, 1);
+  assert.ok(compacted);
+  const compactedUsers = compacted.filter((message) => message.role === "user").map((message) => message.content);
+  assert.ok(compactedUsers.includes(handoffTaskText(1, completedTask)), "actual compaction retains the first generation's original handoff");
+  assert.ok(!compactedUsers.includes(handoffTaskText(2, currentUiTask)), "fixture reaches the boundary where the current handoff was summarized away");
+  assert.ok(compactedUsers.some((content) => typeof content === "string" && content.startsWith("<fusion_context_summary>")));
+  assert.ok(compactedUsers.some((content) => typeof content === "string" && content.startsWith("<fusion_steer ")));
+  const compactedWorker = runtime!.spawn({ label: "UI worker", executorModelId: "test/worker", firstMessage: beforeCompaction[0]! });
+  compactedWorker.worker.generation = 2;
+  compactedWorker.worker.history = compacted;
+  workers = [compactedWorker.worker];
+  const compactedRequest = start();
+  const compactedTask = compactedRequest.evidence.workers[0].task;
+  assert.match(compactedTask, /Implement CURRENT UI task/, "recommendations retain the current task from the actual compaction summary");
+  assert.match(compactedTask, /Keep backwards compatibility/);
+  assert.match(compactedTask, /<fusion_steer /, "the latest public instruction accompanies the compacted task");
+  assert.notEqual(compactedTask, completedTask, "the preserved generation-one handoff cannot become the current task again");
+  assert.doesNotMatch(compactedTask, /fusion_handoff generation="1"/);
+  console.log(`ok   recommendation integration: nonblocking hook (max ${maximumHookMs.toFixed(2)}ms), terminal-only follow-up, ephemeral advice, advisor activity, worker task/queue/steering and freshness`);
 } finally {
   await handlers.get("session_shutdown")?.({}, context);
   for (const request of requests) if (!request.settled) request.reject(new Error("Test cleanup"));
+  for (const request of advisorRequests) if (!request.settled) request.reject(new Error("Test cleanup"));
   await flush();
   globalThis.fetch = originalFetch;
   Date.now = originalNow;

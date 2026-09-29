@@ -1174,6 +1174,7 @@ try {
   const failedAdvice = await advise.execute("failed", advisorQuestion, undefined, undefined, advisorContext);
   eq("advisor provider failure retains usage", [failedAdvice.isError, failedAdvice.details.status, failedAdvice.details.usage.cost, advisorEntries.at(-1).data.usage.cost], [true, "failed", 0.25, 0.25]);
   eq("failed advice retains the requested question", failedAdvice.details.question, advisorQuestion.question);
+  eq("advisor activity retains a failed call without its response body", [advisor.activity().running, advisor.activity().last?.question, advisor.activity().last?.status, Object.keys(advisor.activity().last!).sort()], [[], advisorQuestion.question, "failed", ["id", "question", "status"]]);
   const advisorCancel = new AbortController();
   advisorComplete = async () => { advisorCancel.abort(); return responseWithUsage([{ type: "text", text: "LATE_SUCCESS_ADVICE" }]); };
   const cancelledAdvice = await advise.execute("cancelled", advisorQuestion, advisorCancel.signal, undefined, advisorContext);
@@ -1193,9 +1194,11 @@ try {
   advisor.stop();
   const entriesBeforeStale = advisorEntries.length;
   advisor.start(advisorContext);
+  eq("advisor lifecycle replacement clears transient activity", advisor.activity(), { running: [] });
   releaseAdvisor(responseWithUsage([{ type: "text", text: "OLD_BRANCH_ADVICE" }]));
   const staleResult = await staleAdvice;
   eq("advisor session replacement cannot journal or return old advice", [staleResult.details.status, JSON.stringify(staleResult).includes("OLD_BRANCH_ADVICE"), advisorEntries.length, staleResult.details.usage.cost], ["interrupted", false, entriesBeforeStale, 0.25]);
+  eq("old session completion cannot repopulate advisor activity", advisor.activity(), { running: [] });
   await advisorCommand.handler("off", advisorContext);
   const offOptions = { selectedTools: ["ask_advisor"], sections: { pi_advisor: "old" } as Record<string, string> };
   advisor.preparePrompt(offOptions, "system", advisorContext);
@@ -1373,6 +1376,32 @@ try {
   await advisorCommand.handler("clear", advisorContext);
   await advise.execute("invalid-config", advisorQuestion, undefined, undefined, advisorContext);
   eq("invalid advisor config falls back to Lead effort and normal tier", [advisorOptions.reasoning, advisorOptions.serviceTier], ["high", undefined]);
+
+  const activityReleases: Array<(response: any) => void> = [];
+  advisorComplete = async () => new Promise((resolve) => { activityReleases.push(resolve); });
+  const activityCancel = new AbortController();
+  const firstActivityCall = advise.execute("activity-first", { question: "Check the rollback boundary." }, activityCancel.signal, undefined, advisorContext);
+  const secondActivityCall = advise.execute("activity-second", {}, undefined, undefined, advisorContext);
+  await Promise.resolve();
+  const activitySnapshot = advisor.activity();
+  const [firstActivity, secondActivity] = activitySnapshot.running;
+  eq("advisor activity tracks concurrent calls and general reviews", [activitySnapshot.running.length, firstActivity?.question, secondActivity?.question, firstActivity?.id !== secondActivity?.id], [2, "Check the rollback boundary.", "", true]);
+  activitySnapshot.running[0]!.question = "mutated snapshot";
+  activitySnapshot.running.pop();
+  eq("advisor activity snapshots do not expose live request records", [advisor.activity().running.length, advisor.activity().running[0]?.question], [2, "Check the rollback boundary."]);
+  activityCancel.abort();
+  eq("advisor cancellation updates activity before the provider settles", advisor.activity(), { running: [secondActivity], last: { id: firstActivity!.id, question: "Check the rollback boundary.", status: "interrupted" } });
+  activityReleases[1]!(responseWithUsage([{ type: "text", text: "Newer completed advice." }]));
+  await secondActivityCall;
+  const completedActivity = advisor.activity();
+  eq("advisor completion leaves only the latest result metadata", completedActivity, { running: [], last: { ...secondActivity, status: "completed" } });
+  completedActivity.last!.question = "mutated completion";
+  activityReleases[0]!(responseWithUsage([{ type: "text", text: "Late cancelled advice." }]));
+  const lateActivityResult = await firstActivityCall;
+  eq("late cancelled responses preserve usage without replacing newer activity", [lateActivityResult.details.status, lateActivityResult.details.usage.cost, advisor.activity().last], ["interrupted", 0.25, { ...secondActivity, status: "completed" }]);
+  advisor.start(advisorContext);
+  eq("starting an advisor session clears completed activity", advisor.activity(), { running: [] });
+  advisorComplete = async () => responseWithUsage([{ type: "text", text: "Advisor settings fixture." }]);
 
   await advisorCommand.handler("model openai-codex/gpt-5.6-luna", advisorContext);
   await advisorCommand.handler("thinking high", advisorContext);

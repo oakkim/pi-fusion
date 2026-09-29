@@ -156,7 +156,7 @@ function horizontal(width: number): string {
   return style(DIM, "─".repeat(Math.max(1, width)));
 }
 
-function formatDuration(ms: number): string {
+export function formatDuration(ms: number): string {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);

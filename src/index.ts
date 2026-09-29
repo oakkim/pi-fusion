@@ -37,6 +37,7 @@ import { AVAILABLE_LEAD_GUIDANCE, SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTE
 import { FusionPaneController, formatPaneTranscript, type PaneState } from "./pane.ts";
 import {
   FusionMonitorPublisher,
+  formatDuration,
   launchMonitorWindow,
   manualMonitorCommand,
   MONITOR_SCHEMA_VERSION,
@@ -234,7 +235,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   const pane = new FusionPaneController(
     (id) => runtime.getWorker(id),
     () => {
-      if (sessionActive && activeContext) monitor.refresh();
+      if (sessionActive && activeContext) refreshStatus(activeContext);
     },
   );
   monitor = new FusionMonitorPublisher(() => buildMonitorPayload());
@@ -592,6 +593,16 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       if (!ctx.hasUI) return;
       const advisorStatus = advisor.status(ctx);
       const advisorLabel = advisorStatus ? ` • ${advisorStatus}` : "";
+      const running = runtime.list().filter((worker) => worker.status === "running");
+      if (running.length) {
+        const worker = running.find((item) => item.id === pane.state.workerId) ?? running.at(-1)!;
+        const activity = pane.getLive(worker.id);
+        const label = clipStatus(worker.label || worker.id.slice(4, 12), 24);
+        const elapsed = formatDuration(activity ? Date.now() - activity.startedAt : 0);
+        const count = running.length > 1 ? ` (${running.length})` : "";
+        ctx.ui.setStatus("fusion", `Fusion • Running${count} • ${label} • ${elapsed}${advisorLabel}`);
+        return;
+      }
       const mode = restoreMode(ctx);
       if (mode === "off") { ctx.ui.setStatus("fusion", `${modeLabel(mode)}${advisorLabel}`); return; }
       const warnings: string[] = [];

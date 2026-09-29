@@ -21,7 +21,6 @@ export const MIN_ESCALATIONS = 0;
 export const MAX_ESCALATIONS = 5;
 export const TOOL_OUTPUT_MAX_BYTES = 12_000;
 
-const TOOL_NAMES = ["read", "grep", "find", "ls", "bash", "edit", "write"] as const;
 const TOOL_MODES = ["none", "readonly", "all"] as const;
 export const FUSION_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
 
@@ -153,8 +152,8 @@ function normalizeToolSelection(value: unknown): ToolSelection | undefined {
   const names: string[] = [];
   for (const item of value) {
     if (typeof item !== "string") continue;
-    const name = item.toLowerCase();
-    if ((TOOL_NAMES as readonly string[]).includes(name) && !seen.has(name)) {
+    const name = item.trim();
+    if (name && !seen.has(name)) {
       seen.add(name);
       names.push(name);
     }

@@ -8,6 +8,7 @@ import { isFusionThinkingLevel, loadConfig, loadGlobalConfig, persistGlobalFastM
 import { contextBudget, contextTokens } from "./compaction.ts";
 import { addUsage, recordNativeUsage, zeroUsage, type UsageSummary } from "./cost.ts";
 import { getTextContent, runTextRequest, sanitizeError, supportsOpenAIFastMode } from "./llm.ts";
+import { isWorkerToolContext } from "./worker-tool-runtime.ts";
 import { sanitizeMonitorText } from "./monitor.ts";
 import { modelDisplay, resolveModelIdentifier } from "./models.ts";
 import { modelCompletions, selectModel } from "./model-picker.ts";
@@ -171,7 +172,7 @@ export function registerAdvisor(pi: ExtensionAPI, agentDir?: string, onChange?: 
       if (active && requestEpoch === epoch) {
         onChange?.(ctx);
         if (manual && rawUsage) recordNativeUsage(ctx, requestId, model, rawUsage, "fusion-advisor");
-        try { pi.appendEntry("fusion-advisor-cost", { request_id: requestId, model: modelDisplay(model), thinking_level: requestSettings.thinkingLevel, fast_mode: requestSettings.fastApplied, status, usage, usageKnown, costKnown, timestamp: Date.now() }); }
+        try { pi.appendEntry("fusion-advisor-cost", { request_id: requestId, model: modelDisplay(model), thinking_level: requestSettings.thinkingLevel, fast_mode: requestSettings.fastApplied, status, usage, usageKnown, costKnown, includedInWorkerUsage: isWorkerToolContext(ctx), timestamp: Date.now() }); }
         catch { /* The tool result still exposes usage if journaling is unavailable. */ }
       }
     }

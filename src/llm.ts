@@ -15,7 +15,7 @@ import type { AgentToolUpdateCallback, ExtensionContext, ModelRegistry } from "@
 import type { LiveProgress } from "./pane.ts";
 import { TOOL_OUTPUT_MAX_BYTES } from "./config.ts";
 import type { ExecutorToolDef } from "./tools.ts";
-import { addUsage, zeroUsage, type UsageSummary } from "./cost.ts";
+import { addUsage, zeroUsage, type UsageLike, type UsageSummary } from "./cost.ts";
 import { truncateToBytes } from "./utils.ts";
 import { compactExecutorHistory, type ExecutorContext } from "./compaction.ts";
 import { repairIncompleteToolCalls } from "./runtime.ts";
@@ -114,7 +114,7 @@ export async function runExecutorTurn(
   maxTokens: number,
   temperature: number,
   signal: AbortSignal | undefined,
-  toolDefs: ExecutorToolDef[],
+  toolDefs: ExecutorToolDef[] | (() => ExecutorToolDef[]),
   maxToolCalls: number,
   ctx: ExtensionContext,
   thinkingLevel: ModelThinkingLevel = "off",
@@ -124,8 +124,6 @@ export async function runExecutorTurn(
   persistence?: { maxHistoryMessages: number; checkpoint: (state: ExecutorCheckpoint) => void },
 ): Promise<ToolLoopResult> {
   const options = buildCompleteOptions(model, maxTokens, temperature, thinkingLevel, fastMode, signal, ctx);
-  const tools: Tool[] = toolDefs.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters }));
-  const byName = new Map(toolDefs.map((d) => [d.name, d]));
 
   const messages: Message[] = repairIncompleteToolCalls(history);
   const added: Message[] = [];
@@ -174,9 +172,16 @@ export async function runExecutorTurn(
   try {
     checkpoint();
     while (true) {
+      // MCP gateways can activate tools during a call. Refresh before each
+      // model request rather than freezing the Lead's registry for the turn.
+      const selected = typeof toolDefs === "function" ? toolDefs() : toolDefs;
+      const tools: Tool[] = selected.map((d) => ({ name: d.name, description: d.description, parameters: d.parameters, constrainedSampling: d.constrainedSampling }));
+      const byName = new Map(selected.map((d) => [d.name, d]));
+      const guidelines = selected.flatMap((d) => d.promptGuidelines ?? []);
+      const turnSystem = guidelines.length ? `${systemPrompt}\n\nTool guidelines:\n${[...new Set(guidelines)].join("\n")}` : systemPrompt;
       appendSteering(takeSteering());
-      await prepareContext(systemPrompt, tools);
-      const resp = await complete({ systemPrompt, messages, tools });
+      await prepareContext(turnSystem, tools);
+      const resp = await complete({ systemPrompt: turnSystem, messages, tools });
       const calls = resp.content.filter((c): c is ToolCall => c.type === "toolCall");
       if (resp.stopReason !== "toolUse" || calls.length === 0) {
         const steering = takeSteering(true);
@@ -194,10 +199,12 @@ export async function runExecutorTurn(
       }
 
       let forceFinalize = false;
+      let terminateBatch = true;
 
       for (const tc of calls) {
         signal?.throwIfAborted();
         if (forceFinalize || used >= maxToolCalls) {
+          terminateBatch = false;
           const reason = forceFinalize ? "stopped: repeated or failing tool calls" : "tool-call budget exhausted";
           onProgress?.({ kind: "tool_start", toolId: tc.id, name: tc.name, arguments: formatToolArguments(tc.arguments) });
           const syn = syntheticResult(tc, reason);
@@ -208,7 +215,10 @@ export async function runExecutorTurn(
           checkpoint();
           continue;
         }
-        const ok = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added, onProgress);
+        const outcome = await executeToolCall(tc, byName.get(tc.name), signal, ctx, messages, added, onProgress);
+        const { ok } = outcome;
+        usage = addUsage(usage, outcome.usage);
+        terminateBatch &&= outcome.terminate === true;
         used++;
         toolCalls.push({ name: tc.name, ok });
         checkpoint();
@@ -230,6 +240,7 @@ export async function runExecutorTurn(
         errorStreak = 0;
         lastKey = undefined;
       }
+      forceFinalize ||= terminateBatch;
 
       if (forceFinalize || used >= maxToolCalls) {
         // No more tools are available, so close the cooperative steering mailbox
@@ -238,7 +249,7 @@ export async function runExecutorTurn(
         const preFinalSteering = takeSteering(true);
         appendSteering(preFinalSteering);
         if (preFinalSteering.length > 0) takeSteering(true);
-        const finalSystem = `${systemPrompt}\n\nYou have reached the tool-call limit. Write your complete final answer now using only what you have already gathered — do not request any more tools.`;
+        const finalSystem = `${turnSystem}\n\nTool execution has stopped because of a tool policy, repeated failures, or the tool-call limit. Write your complete final answer now using only what you have already gathered. Do not request any more tools.`;
         while (true) {
           await prepareContext(finalSystem);
           const finalMsg = await complete({ systemPrompt: finalSystem, messages });
@@ -424,7 +435,7 @@ async function executeToolCall(
   messages: Message[],
   added: Message[],
   onProgress?: (progress: LiveProgress) => void,
-): Promise<boolean> {
+): Promise<{ ok: boolean; usage?: UsageLike; terminate?: boolean }> {
   const argumentsText = formatToolArguments(tc.arguments);
   onProgress?.({ kind: "tool_start", toolId: tc.id, name: tc.name, arguments: argumentsText });
   try {
@@ -440,13 +451,15 @@ async function executeToolCall(
       toolCallId: tc.id,
       toolName: tc.name,
       content,
+      details: out.details,
+      usage: out.usage,
       isError,
       timestamp: Date.now(),
     };
     messages.push(msg);
     added.push(msg);
     onProgress?.({ kind: "tool_end", toolId: tc.id, ok: !isError, output: toolResultText(content) });
-    return !isError;
+    return { ok: !isError, usage: out.usage, terminate: out.terminate };
   } catch (err) {
     const text = sanitizeError(err instanceof Error ? err.message : String(err));
     const errorText = signal?.aborted
@@ -463,7 +476,7 @@ async function executeToolCall(
     messages.push(msg);
     added.push(msg);
     onProgress?.({ kind: "tool_end", toolId: tc.id, ok: false, output: errorText });
-    return false;
+    return { ok: false };
   }
 }
 

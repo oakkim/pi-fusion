@@ -232,7 +232,7 @@ For example, replace these model IDs with ones available in your pi setup:
 | `recommendationEndpoint` | `http://127.0.0.1:8788` | Global loopback inference server base URL. |
 | `advisorThinkingLevel` | Follow Lead | Advisor reasoning effort; clamped to the advisor model's supported levels. |
 | `advisorFastMode` | `false` | Request priority processing for a supported advisor model. |
-| `executorTools` | `"all"` | `"none"`, `"readonly"`, `"all"`, or a list of tool names. |
+| `executorTools` | `"all"` | All active Lead tools, including MCP and extensions. Also accepts `"none"`, `"readonly"` (read/grep/find/ls), or an exact list of active tool names. Fusion orchestration tools are excluded to prevent recursive workers. |
 | `executorToolsConsent` | `false` | Skip worker write confirmations when `true`; the project must still be trusted. |
 | `leadMutations` | `"allow"` | `"delegate"` blocks the Lead's `bash`, `edit`, and `write` tools, even with Fusion off. Reads remain available. |
 | `thinkingLevel` | `"off"` | Executor reasoning effort; clamped to each model's supported levels. |
@@ -244,7 +244,9 @@ For example, replace these model IDs with ones available in your pi setup:
 | `temperature` | `0.2` | Sampling temperature, from 0 to 2. |
 | `maxHistoryMessages` | `40` | Message-count trigger for compaction, from 4 to 200. Token limits can trigger it earlier. |
 
-Available worker tools are `read`, `grep`, `find`, `ls`, `bash`, `edit`, and `write`. The `readonly` set contains the first four. A toolset containing `bash`, `edit`, or `write` requires trust and consent when a spawn or follow-up is requested. `/fusion consent allow` skips the confirmation, but cannot bypass trust.
+Workers inherit the Lead's active MCP and extension tools, including overridden builtins and `ask_advisor` when enabled. Tool availability refreshes between model calls, so MCP discovery can expose new tools within the same worker turn. Only `fusion_*` orchestration tools are excluded. The `readonly` mode uses active builtin `read`, `grep`, `find`, and `ls` implementations. Both `all` and nonempty explicit lists require trust and consent because active tool implementations can change during a turn. `/fusion consent allow` skips Fusion's confirmation, but cannot bypass project trust or a tool's existing approval checks. Costs returned by inherited tools are included in worker totals; worker Advisor calls are counted once in the combined Fusion total.
+
+Inherited tools run through Pi's argument validation and tool-call/result hooks, preserving the Lead's builtin settings such as shell prefixes. Builtin paths and extension `ctx.cwd` use the worker's checkout; extensions that capture a directory at initialization retain their own behavior. Tool connections and approvals remain shared with the Lead. Pi does not yet expose executable tools through `ExtensionAPI`, so Fusion uses a compatibility bridge around `ExtensionRunner.createContext` and `AgentSession.getActiveToolNames`, verified with Pi 0.85.1 and 0.87. If that bridge is unavailable, execution fails explicitly instead of silently bypassing hooks. Reload Pi with `/reload` after updating Fusion.
 
 ### Model fallback
 

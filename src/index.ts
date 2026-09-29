@@ -50,6 +50,7 @@ import { getTextContent, runExecutorTurn, supportsOpenAIFastMode, type ExecutorC
 import { addUsage, recordNativeUsage, zeroUsage, type UsageLike } from "./cost.ts";
 import { modelDisplay, resolveExecutorModel, resolveLadder, resolveModelIdentifier, rungFor } from "./models.ts";
 import { clampMaxToolCalls, isMutatingSelection, resolveToolDefs } from "./tools.ts";
+import { isWorkerToolContext } from "./worker-tool-runtime.ts";
 import { WorkerRuntime, type WorkerContextTelemetry, type WorkerRecord } from "./runtime.ts";
 import { InquiryRuntime, type InquiryThread, type InquiryTurn } from "./inquiry.ts";
 import { isForcePrompt, forceFusionPrompt, modeLabel, normalizeMode, type FusionMode } from "./mode.ts";
@@ -746,10 +747,11 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   // Delegate enforcement (opencode-fusion style): when leadMutations is
   // "delegate", the lead's own bash/edit/write are blocked so implementation
   // can only flow through the sidekick. Reads and fusion_* are never blocked
-  // (review needs reads; blocking fusion_* would deadlock). The executor loop
-  // calls models directly, so this hook only ever sees lead calls.
+  // (review needs reads; blocking fusion_* would deadlock). Workers also pass
+  // through tool hooks, but this particular policy applies only to the Lead.
   const LEAD_BLOCKED_MUTATORS = ["bash", "edit", "write"];
   pi.on("tool_call", async (event, ctx) => {
+    if (isWorkerToolContext(ctx)) return;
     if (event.toolName.startsWith("fusion_")) {
       if (restoreMode(ctx) === "off") {
         return { block: true, reason: "Fusion is off for this session. Use /fusion available or /fusion on to re-enable." };
@@ -930,7 +932,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     if (ctx.hasUI) {
       const ok = await ctx.ui.confirm(
         "Enable sidekick mutating tools?",
-        "The persistent sidekick will be able to run bash and edit/write files. Mutating runs are serialized. Continue?",
+        "The persistent sidekick can use the selected tools, including active MCP and extension tools. Runs that may change data are serialized per checkout. Existing tool permissions still apply. Continue?",
       );
       return ok ? { ok: true } : { ok: false, error: "executor mutating tools require consent" };
     }
@@ -993,7 +995,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     const fastMode = cfg.fastMode && supportsOpenAIFastMode(executor);
 
     const execCwd = worker.worktree ? execDirOf(worker.worktree) : ctx.cwd;
-    const toolDefs = resolveToolDefs(cfg.executorTools, execCwd);
+    const toolDefs = () => resolveToolDefs(cfg.executorTools, execCwd, ctx, { abort: () => controller.abort() });
 
     liveToken = pane.beginLive(workerId);
     pane.refresh();
@@ -1005,7 +1007,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       return runExecutorTurn(
         ctx.modelRegistry,
         executor,
-        SIDEKICK_SYSTEM_PROMPT,
+        `${SIDEKICK_SYSTEM_PROMPT}\n\nWorking directory: ${execCwd}`,
         [...worker.history],
         cfg.maxExecutorOutputTokens,
         cfg.temperature,
@@ -2480,11 +2482,11 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       let advisorUsage = zeroUsage();
       for (const entry of ctx.sessionManager.getBranch()) {
         if (entry.type !== "custom" || !entry.data || typeof entry.data !== "object") continue;
-        const data = entry.data as { worker_id?: string; usage?: UsageLike };
+        const data = entry.data as { worker_id?: string; usage?: UsageLike; includedInWorkerUsage?: boolean };
         // Live/restored telemetry already includes its worker's cost journal.
         if (entry.customType === "fusion-cost" && (!data.worker_id || !recordedWorkers.has(data.worker_id))) workerUsage = addUsage(workerUsage, data.usage);
         else if (entry.customType === "fusion-inquiry-cost") inquiryUsage = addUsage(inquiryUsage, data.usage);
-        else if (entry.customType === "fusion-advisor-cost") advisorUsage = addUsage(advisorUsage, data.usage);
+        else if (entry.customType === "fusion-advisor-cost" && !data.includedInWorkerUsage) advisorUsage = addUsage(advisorUsage, data.usage);
       }
       const totalCost = workerUsage.cost + inquiryUsage.cost + advisorUsage.cost;
       const costLine = `Recorded cost (current branch): $${totalCost.toFixed(4)} • Workers $${workerUsage.cost.toFixed(4)} • Inquiries $${inquiryUsage.cost.toFixed(4)} • Advisor $${advisorUsage.cost.toFixed(4)}`;

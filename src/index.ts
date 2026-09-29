@@ -16,6 +16,7 @@ import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-codin
 import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Message } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
+import { Text } from "@earendil-works/pi-tui";
 import {
   applyConsentOverride,
   applyDefaults,
@@ -27,6 +28,7 @@ import {
   loadConfig,
   loadGlobalConfig,
   persistGlobalFastMode,
+  persistGlobalPreference,
   type ConsentOverride,
   type ExecutorOverride,
   type FastModeOverride,
@@ -57,6 +59,7 @@ import { registerAdvisor } from "./advisor.ts";
 import { fusionCallArgument, fusionCallMetadata, renderFusionRequestCall } from "./tool-call.ts";
 import { modelCompletions, selectModel } from "./model-picker.ts";
 import { registerCommandGroup, type Subcommand } from "./commands.ts";
+import { requestRecommendation, recommendationEvidence, formatRecommendation, formatRecommendationStatus, type Recommendation } from "./recommendations.ts";
 
 const ContextMode = Type.Union([Type.Literal("none"), Type.Literal("recent")], { default: "none" });
 
@@ -231,6 +234,14 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   let activeContext: ExtensionContext | undefined;
   let sessionActive = true;
   let sessionEpoch = 0;
+  type RecommendationCheck = { controller: AbortController; signal: AbortSignal; epoch: number; turn: number; startedAt: number; key: string };
+  let recommendationRequest: RecommendationCheck | undefined;
+  let pendingRecommendation: { check: RecommendationCheck; value: Recommendation } | undefined;
+  let recommendationTurn = 0;
+  let lastRecommendationTurn = -Infinity;
+  let recommendationKey = "";
+  let lastRecommendation: Recommendation | undefined;
+  let recommendationError: string | undefined;
   let monitor!: FusionMonitorPublisher;
   const pane = new FusionPaneController(
     (id) => runtime.getWorker(id),
@@ -239,6 +250,46 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   );
   monitor = new FusionMonitorPublisher(() => buildMonitorPayload());
+
+  pi.registerEntryRenderer<{ text: string }>("pi-fusion-recommendation-notice", (entry, _options, theme) => {
+    if (typeof entry.data?.text !== "string") return;
+    // Render existing saved entries compactly too; keep full details in /fusion status.
+    const parts = entry.data.text.split(" · ");
+    const elapsed = parts.slice(2).find((part) => /^\d+(?:\.\d+)?ms$/.test(part));
+    if (!elapsed) return;
+    const seconds = (Math.floor(Number.parseFloat(elapsed) / 100) / 10).toFixed(1);
+    const summary = sanitizeMonitorText(parts.slice(0, 2).join(" · "), 160);
+    return new Text(theme.fg("accent", theme.bold(`Fusion Recommendation - ${summary} · ${seconds}s`)), 0, 0);
+  });
+
+  // Only a global opt-in can enable local context screening, never project config.
+  function recommendationSettings() {
+    const config = loadGlobalConfig(options.agentDir);
+    return { enabled: config.recommendations === true, endpoint: config.recommendationEndpoint ?? "http://127.0.0.1:8788" };
+  }
+
+  function discardRecommendations(): void {
+    recommendationRequest?.controller.abort();
+    // Keep the slot occupied until cancellation settles, even if a transport is slow to abort.
+    pendingRecommendation = undefined;
+    lastRecommendationTurn = -Infinity;
+    lastRecommendation = undefined;
+    recommendationError = undefined;
+  }
+
+  function resetRecommendations(): void {
+    discardRecommendations();
+    recommendationTurn = 0;
+    recommendationKey = "";
+  }
+
+  function recommendationStatus(): string {
+    if (!recommendationSettings().enabled) return "Local recommendations: off";
+    if (recommendationError) return `Local recommendations: unavailable (${recommendationError}); Lead decides as usual`;
+    if (recommendationRequest && !recommendationRequest.signal.aborted) return "Local recommendations: screening in background; Lead continues";
+    if (!lastRecommendation) return "Local recommendations: on (local); awaiting a checkpoint";
+    return `Local recommendations: on (local)\nLast: ${formatRecommendationStatus(lastRecommendation)}`;
+  }
 
   function restoreMode(ctx: ExtensionContext): FusionMode {
     try {
@@ -641,6 +692,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   }
 
   async function suspendSession(): Promise<void> {
+    resetRecommendations();
     if (sessionActive) {
       sessionActive = false;
       sessionEpoch += 1;
@@ -654,6 +706,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    resetRecommendations();
     advisor.start(ctx);
     sessionEpoch += 1;
     sessionActive = true;
@@ -713,6 +766,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
 
   // Forced mode: every normal prompt goes through the planner/sidekick split.
   pi.on("input", async (event, ctx) => {
+    // A queued user steer supersedes the snapshot before the next context hook runs.
+    discardRecommendations();
     if (event.source === "extension") return { action: "continue" };
     if (event.text.trim().startsWith("/")) return { action: "continue" };
     if (isForcePrompt(event.text.trim())) return { action: "continue" };
@@ -724,6 +779,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   // or forcing every conversational request through a worker. Pi 0.87+ patches
   // structured sections; older Pi requires a per-turn system-prompt return.
   pi.on("before_agent_start", (event, ctx) => {
+    resetRecommendations();
     const systemPrompt = advisor.preparePrompt(event.systemPromptOptions, event.systemPrompt, ctx);
     const enabled = restoreMode(ctx) === "available"
       && event.systemPromptOptions.selectedTools?.includes("fusion_spawn")
@@ -739,6 +795,89 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       return { systemPrompt: `${systemPrompt}\n\n<pi_fusion_routing>\n${AVAILABLE_LEAD_GUIDANCE}\n</pi_fusion_routing>` };
     }
     if (systemPrompt !== event.systemPrompt) return { systemPrompt };
+  });
+
+  pi.on("turn_start", (event) => { recommendationTurn = event.turnIndex; });
+  pi.on("agent_end", () => {
+    recommendationRequest?.controller.abort();
+    pendingRecommendation = undefined;
+    // Keep the last outcome available to /fusion recommend status after the Lead finishes.
+  });
+  pi.on("context", (event, ctx) => {
+    const settings = recommendationSettings();
+    if (!settings.enabled || !sessionActive) { resetRecommendations(); return; }
+    const capabilities = () => {
+      const tools = pi.getActiveTools?.() ?? [];
+      return {
+        advisorAvailable: tools.includes("ask_advisor") && !!advisor.status(ctx),
+        fusionAvailable: tools.includes("fusion_spawn") && restoreMode(ctx) !== "off",
+      };
+    };
+    const { advisorAvailable, fusionAvailable } = capabilities();
+    if (!advisorAvailable && !fusionAvailable) { resetRecommendations(); return; }
+    const checkpoint = [...event.messages].reverse().find((message) => message.role === "user"
+      || (message.role === "custom" && message.customType === "pi-fusion-worker-result"));
+    const checkpointKey = checkpoint ? JSON.stringify([checkpoint.role, checkpoint.timestamp, recommendationEvidence([checkpoint])]) : "";
+    const stateKey = () => JSON.stringify([
+      checkpointKey, recommendationSettings().endpoint, capabilities(),
+      runtime.list().map(({ id, label, status, generation, activeTurnId }) => [id, label, status, generation, activeTurnId]),
+    ]);
+    const key = stateKey();
+    if (key !== recommendationKey) {
+      discardRecommendations();
+      recommendationKey = key;
+    }
+    const fresh = (check: RecommendationCheck) => sessionActive && sessionEpoch === check.epoch
+      && !check.signal.aborted && recommendationSettings().enabled
+      && check.key === recommendationKey && stateKey() === check.key
+      && recommendationTurn >= check.turn && recommendationTurn - check.turn < 4
+      && Date.now() - check.startedAt < 30_000;
+    if (recommendationRequest && !fresh(recommendationRequest)) discardRecommendations();
+    if (pendingRecommendation && !fresh(pendingRecommendation.check)) discardRecommendations();
+    const ready = pendingRecommendation;
+    pendingRecommendation = undefined;
+    // Snapshot a completed hint only at a later checkpoint. Never mutate a captured event or start a turn.
+    const result = ready ? { messages: [...event.messages, {
+      role: "custom" as const,
+      customType: "pi-fusion-recommendation",
+      content: `This optional recommendation reflects an earlier checkpoint. Ignore it if newer evidence has resolved or changed the task. ${formatRecommendation(ready.value)}`,
+      display: false,
+      timestamp: Date.now(),
+    }] } : undefined;
+    if (recommendationRequest || recommendationTurn - lastRecommendationTurn < 4) return result;
+    const controller = new AbortController();
+    const check: RecommendationCheck = {
+      controller, signal: ctx.signal ? AbortSignal.any([controller.signal, ctx.signal]) : controller.signal,
+      epoch: sessionEpoch, turn: recommendationTurn, startedAt: Date.now(), key,
+    };
+    recommendationRequest = check;
+    lastRecommendationTurn = recommendationTurn;
+    const input = {
+      ...recommendationEvidence(event.messages), advisorAvailable, fusionAvailable,
+      workers: runtime.list().filter((worker) => worker.status !== "closed").map(({ id, label, status }) => ({ id, label: label ?? "", status })),
+    };
+    void (async () => {
+      try {
+        const recommendation = await requestRecommendation(input, { endpoint: settings.endpoint, signal: check.signal });
+        if (!fresh(check)) return;
+        lastRecommendation = recommendation;
+        recommendationError = undefined;
+        pendingRecommendation = { check, value: recommendation };
+        try {
+          // Native custom entries render in chat without steering or entering model context.
+          pi.appendEntry("pi-fusion-recommendation-notice", { text: formatRecommendationStatus(recommendation) });
+        } catch { /* A display failure must not discard the pending hint. */ }
+      } catch (error) {
+        if (fresh(check)) {
+          lastRecommendation = undefined;
+          recommendationError = clipStatus(error instanceof Error ? error.message : String(error), 160);
+        }
+        // Background screening never holds up or restarts the Lead.
+      } finally {
+        if (recommendationRequest === check) recommendationRequest = undefined;
+      }
+    })();
+    return result;
   });
 
   function persist(ctx: ExtensionContext, workerId: string): void {
@@ -2278,6 +2417,33 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     },
   });
 
+  fusionCommands.set("recommend", {
+    description: "Local advisor and worker recommendations: /fusion recommend [on|off|status]",
+    getArgumentCompletions: (prefix) => ["on", "off", "status"].filter((value) => value.startsWith(prefix.trim().toLowerCase())).map((value) => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      const choice = args.trim().toLowerCase() || "status";
+      let text: string;
+      let error = false;
+      if (!["on", "off", "status"].includes(choice)) {
+        text = "Usage: /fusion recommend on|off|status";
+        error = true;
+      } else {
+        try {
+          if (choice !== "status") {
+            persistGlobalPreference("recommendations", choice === "on", options.agentDir);
+            resetRecommendations();
+          }
+          text = recommendationStatus();
+        } catch (cause) {
+          text = `Could not save local recommendations: ${clipStatus(String(cause), 160)}`;
+          error = true;
+        }
+      }
+      if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
+      else ctx.ui.notify(text, error ? "error" : "info");
+    },
+  });
+
   fusionCommands.set("status", {
     acceptsArguments: false,
     description: "Show workers, inquiries, and recorded branch costs",
@@ -2317,7 +2483,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       const inquiryBody = inquiryThreads.length
         ? `\nInquiries (worker does not remember these):\n${inquiryThreads.map((thread) => `${thread.id} [${thread.activeTurnId ? "running" : "idle"}] worker=${thread.workerId} g${thread.generation} msgs=${thread.history.length}`).join("\n")}`
         : "";
-      const text = `${head}\n${costLine}\n${body}${inquiryBody}`;
+      const text = `${head}\n${costLine}\n${recommendationStatus()}\n${body}${inquiryBody}`;
       if (ctx.mode === "print" || ctx.mode === "json") console.log(text);
       else ctx.ui.notify(text, "info");
     },

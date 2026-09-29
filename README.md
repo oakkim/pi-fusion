@@ -52,6 +52,7 @@ Type a space after the command to see its subcommands. Start typing to filter su
 | `/fusion thinking [level]` | Select executor reasoning effort. `clear` restores the config default. |
 | `/fusion fast [action]` | Select OpenAI priority processing. `on` and `off` save a global preference; `default` removes it; `status` shows the setting. |
 | `/fusion consent [action]` | Select worker write consent. `allow` and `ask` apply to the session; `default` restores config; `status` shows the setting. |
+| `/fusion recommend [on\|off\|status]` | Save the local advisor and worker recommendation setting, or inspect the latest recommendation. |
 | `/fusion ask <id> <question>` | Ask about a worker using its `wrk_...` ID, or continue an inquiry using its `inq_...` ID. |
 | `/fusion monitor [action]` | Open a separate read-only monitor. Accepts `open`, `close`, or `status`. |
 | `/fusion pane [target]` | Toggle the optional worker overlay. Accepts `open`, `close`, `toggle`, or a worker ID. |
@@ -143,6 +144,36 @@ Advisor reasoning follows the Lead unless set with `/advisor thinking` or `advis
 
 Worker inquiries run alongside the worker without changing its instructions. The worker never sees or remembers that side conversation. To act on an inquiry result, send a separate `fusion_followup`.
 
+## Local recommendations
+
+An optional local model separately evaluates whether the Lead should consult the Advisor and whether it should delegate to a Fusion worker. Either, both, or neither can be recommended; uncertain judgments stay optional. It also sees active workers and favors reusing a related worker. The Lead still decides; recommendations never invoke, block, or skip tools. Explicit user instructions and Fusion mode take precedence.
+
+Inspired by [OpenJev / SemIf](https://openjev.com/), this runs an open model through a local MLX or llama.cpp server, without a browser or a TypeSafe API key. It asks for a brief reason and separate advisor/worker decisions in one JSON response. This performed better in local routing checks than forcing a single choice token. The result is a fallible suggestion, not a confidence score. Invalid responses, timeouts and inference failures leave the Lead's normal behavior intact.
+
+On Apple Silicon, use [MLX LM](https://github.com/ml-explore/mlx-lm) with the [Qwen3.5-4B 4bit model](https://huggingface.co/mlx-community/Qwen3.5-4B-4bit):
+
+```bash
+pip install mlx-lm==0.31.3
+mlx_lm.server --model mlx-community/Qwen3.5-4B-4bit \
+  --host 127.0.0.1 --port 8788 --allowed-origins http://127.0.0.1:8788 \
+  --decode-concurrency 1 --prompt-concurrency 1 --prefill-step-size 512 \
+  --prompt-cache-size 1 --prompt-cache-bytes 67108864 \
+  --chat-template-args '{"enable_thinking":false}'
+```
+
+Keep the prompt cache small: this router does not need multiple full conversation caches. The client uses the server's default model, so it will not trigger a model download by name. MLX 0.31.3 does not enforce JSON schemas; malformed output is rejected by the extension.
+
+```text
+/fusion recommend on
+/fusion recommend status
+```
+
+The setting is global and persists across sessions. It is off until enabled. Only loopback endpoints are accepted; a custom local base URL can be set with `recommendationEndpoint` in the global `fusion.json`. The model receives bounded visible conversation evidence, including the latest user instruction, tool results, and worker completion reports. Private thinking and image bytes are excluded. Existing conversation messages are never edited.
+
+Screening runs in the background alongside the Lead, starting at the first request, after a new user instruction or worker result, and otherwise every four Lead turns. The Lead never waits for it. A completed hint can be included once in a later request while the same task and capabilities remain current; it reflects an earlier checkpoint, so newer evidence takes precedence. New instructions, worker changes, finished work, and expired results discard pending hints. Each completed, current result appears once in the conversation as a single **Fusion Recommendation** line showing only the advisor and worker decisions and elapsed seconds. The entry is saved for display only and excluded from model context. Free-form model rationale is reserved for the Lead; the visible labels stay in English. Recommendations never wake the Lead or create a turn. `/fusion status` also shows the latest result; the footer keeps its existing running indicator and elapsed time. Local inference has no provider API charge.
+
+The demo's 2,048-token window is its runtime configuration, not a WebGPU or model limit. Qwen3.5-4B advertises a 262,144-token native context. The extension bounds its evidence and gives background inference up to 10 seconds, without delaying the Lead. Larger inputs increase memory and prompt-processing time; reducing prefill step size limits temporary memory without imposing a 2,048-token input cap.
+
 ## Status and monitoring
 
 The status line shows running workers and the selected worker's elapsed time. When idle, it keeps the executor model short and shows advisor state without another model name:
@@ -197,6 +228,8 @@ For example, replace these model IDs with ones available in your pi setup:
 | --- | --- | --- |
 | `executor` | Automatic | First authenticated text model other than the Lead, falling back to the Lead if necessary. An unavailable configured executor also falls back to automatic selection. |
 | `advisorModel` | Off | Explicit `provider/model`; `false` disables it. |
+| `recommendations` | `false` | Global opt-in for local advisor and worker recommendations. |
+| `recommendationEndpoint` | `http://127.0.0.1:8788` | Global loopback inference server base URL. |
 | `advisorThinkingLevel` | Follow Lead | Advisor reasoning effort; clamped to the advisor model's supported levels. |
 | `advisorFastMode` | `false` | Request priority processing for a supported advisor model. |
 | `executorTools` | `"all"` | `"none"`, `"readonly"`, `"all"`, or a list of tool names. |

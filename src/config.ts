@@ -61,7 +61,7 @@ export function persistGlobalFastMode(fastMode: boolean | undefined, agentDir = 
 }
 
 /** Persist last-used preferences atomically, preserving unrelated config. */
-export function persistGlobalPreference<K extends "fastMode" | "advisorFastMode" | "advisorModel" | "advisorThinkingLevel">(key: K, value: FusionConfig[K], agentDir = getAgentDir()): void {
+export function persistGlobalPreference<K extends "fastMode" | "advisorFastMode" | "advisorModel" | "advisorThinkingLevel" | "recommendations">(key: K, value: FusionConfig[K], agentDir = getAgentDir()): void {
   const configPath = globalFusionConfigPath(agentDir);
   let raw: Record<string, unknown> = {};
   if (existsSync(configPath)) {
@@ -89,6 +89,8 @@ function normalizeConfig(raw: unknown): FusionConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const input = raw as Record<string, unknown>;
   const out: FusionConfig = {};
+  if (typeof input.recommendations === "boolean") out.recommendations = input.recommendations;
+  if (typeof input.recommendationEndpoint === "string") out.recommendationEndpoint = input.recommendationEndpoint.trim();
   if (input.advisorModel === false) out.advisorModel = false;
   else if (typeof input.advisorModel === "string" && input.advisorModel.trim()) out.advisorModel = input.advisorModel.trim();
   if (isFusionThinkingLevel(input.advisorThinkingLevel)) out.advisorThinkingLevel = input.advisorThinkingLevel;

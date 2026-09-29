@@ -1415,6 +1415,7 @@ try {
   const durableEntries: Array<{ type: string; customType: string; data: any }> = [];
   const completionMessages: Array<{ message: any; options: any }> = [];
   fusionExtension({
+    registerEntryRenderer: () => {},
     on: (event: string, handler: (...args: any[]) => void | Promise<void>) => lifecycleHandlers.set(event, handler),
     registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<any>; renderCall?: (...args: any[]) => any; promptSnippet?: string; promptGuidelines?: string[] }) => registered.set(tool.name, tool),
     registerCommand: () => {},
@@ -2296,6 +2297,7 @@ try {
     modelRegistry: { getAll: () => availableModels, getAvailable: () => availableModels, hasConfiguredAuth: () => true },
   };
   fusionExtension({
+    registerEntryRenderer: () => {},
     registerCommand: (name: string, command: any) => grouped.set(name, command), registerTool() {},
     on: (event: string, handler: any) => events.set(event, handler),
     appendEntry: (customType: string, data: unknown) => journal.push({ type: "custom", customType, data }),
@@ -2379,6 +2381,7 @@ try {
 // --- 10. Fusion augments the built-in footer instead of replacing it ---
 const sessionStartHandlers: Array<(event: unknown, ctx: any) => Promise<void>> = [];
 fusionExtension({
+  registerEntryRenderer: () => {},
   on: (event: string, handler: (event: unknown, ctx: any) => Promise<void>) => {
     if (event === "session_start") sessionStartHandlers.push(handler);
   },
@@ -2426,6 +2429,7 @@ const cancelledTreeEntries: any[] = [
 ];
 let cancelledTreeRequests = 0;
 fusionExtension({
+  registerEntryRenderer: () => {},
   on: (event: string, handler: any) => cancelledTreeHandlers.set(event, handler),
   registerTool: (tool: any) => { if (tool.name === "ask_advisor") cancelledTreeTool = tool; }, registerCommand: () => {},
   appendEntry: (customType: string, data: any) => cancelledTreeEntries.push({ type: "custom", id: `tree-${cancelledTreeEntries.length}`, parentId: cancelledTreeEntries.at(-1).id, customType, data }),
@@ -2447,6 +2451,7 @@ const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<
 const thinkingBranch: unknown[] = [];
 let thinkingNotice = "";
 fusionExtension({
+  registerEntryRenderer: () => {},
   on: () => {},
   registerTool: () => {},
   registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => commands.set(name, command),
@@ -2484,6 +2489,7 @@ const fastCommands = new Map<string, { handler: (args: string, ctx: any) => Prom
 const fastBranch: unknown[] = [];
 let fastNotice = "";
 fusionExtension({
+  registerEntryRenderer: () => {},
   on: () => {},
   registerTool: () => {},
   registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => fastCommands.set(name, command),
@@ -2525,6 +2531,7 @@ eq("fusion fast on persists globally", [
 const futureFastCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
 let futureFastNotice = "";
 fusionExtension({
+  registerEntryRenderer: () => {},
   on: () => {},
   registerTool: () => {},
   registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => futureFastCommands.set(name, command),
@@ -2547,6 +2554,7 @@ const failedJournalCommands = new Map<string, { handler: (args: string, ctx: any
 const failedJournalBranch = [{ type: "custom", customType: "fusion-fast", data: { fastMode: false, timestamp: Date.now() } }];
 let failedJournalNotice = "";
 fusionExtension({
+  registerEntryRenderer: () => {},
   on: () => {},
   registerTool: () => {},
   registerCommand: (name: string, command: { handler: (args: string, ctx: any) => Promise<void> }) => failedJournalCommands.set(name, command),
@@ -2883,6 +2891,9 @@ eq("monitor never reuses prior session payload on open", [
 await strictPublisher.close("strict capture test complete");
 eq("monitor leaves no temporary snapshots", readdirSync(monitorFixture).filter((name) => name.endsWith(".tmp")), []);
 rmSync(monitorFixture, { recursive: true, force: true });
+
+await import("./recommendations.test.ts");
+await import("./recommendation-integration.test.ts");
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

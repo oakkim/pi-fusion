@@ -16,6 +16,10 @@ export type ToolMode = "none" | "readonly" | "all";
 export type ToolSelection = ToolMode | string[];
 
 export interface FusionConfig {
+  /** Local OpenJev recommendations for the Lead. Off unless explicitly enabled. */
+  recommendations?: boolean;
+  /** Loopback inference server base URL. No conversation is sent to a remote endpoint. */
+  recommendationEndpoint?: string;
   /** Explicit Lead advisor model; false/unset disables advice. */
   advisorModel?: string | false;
   /** Advisor reasoning effort. Unset follows the Lead, clamped to the advisor model. */

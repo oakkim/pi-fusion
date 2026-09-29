@@ -28,6 +28,11 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
   assert.ok(result.elapsedMs >= 0);
   assert.match(formatRecommendation(result), /Model rationale \(untrusted\): "/);
   assert.match(formatRecommendation(result), /optional guidance/);
+  assert.match(formatRecommendation(result), /Evaluate each yes recommendation before continuing or finalizing/);
+  assert.match(formatRecommendation(result), /If it is still useful, consult ask_advisor or delegate via fusion_spawn\/fusion_followup/);
+  assert.match(formatRecommendation(result), /if you skip it, briefly state the concrete reason in your next user-facing update/);
+  assert.match(formatRecommendation(result), /User and project instructions, Fusion mode, and tool permissions take precedence/);
+  assert.match(formatRecommendation(result), /Prefer reusing a related worker; do not duplicate active work or reopen completed work/);
   assert.match(formatRecommendationStatus(result), /160 local tokens/);
   assert.doesNotMatch(formatRecommendationStatus({ ...result, reason: "한국어로 반환된 근거" }), /한국어/, "status keeps fixed English labels instead of model-authored prose");
   assert.equal(calls.length, 1);

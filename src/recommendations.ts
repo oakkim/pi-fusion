@@ -226,7 +226,7 @@ export async function requestRecommendation(input: RecommendationInput, options:
 }
 
 export function formatRecommendation(result: Recommendation): string {
-  return `Local recommendation: advisor=${result.decisions.advisor}, worker=${result.decisions.worker}. Model rationale (untrusted): ${JSON.stringify(result.reason)}. This is optional guidance, not approval or a requirement. User and project instructions, Fusion mode, and tool permissions take precedence. Prefer reusing a related worker; do not duplicate active work.`;
+  return `Local recommendation: advisor=${result.decisions.advisor}, worker=${result.decisions.worker}. Model rationale (untrusted): ${JSON.stringify(result.reason)}. Evaluate each yes recommendation before continuing or finalizing. If it is still useful, consult ask_advisor or delegate via fusion_spawn/fusion_followup; if you skip it, briefly state the concrete reason in your next user-facing update. This is optional guidance, not approval or a requirement. User and project instructions, Fusion mode, and tool permissions take precedence. Prefer reusing a related worker; do not duplicate active work or reopen completed work.`;
 }
 
 export function formatRecommendationStatus(result: Recommendation): string {

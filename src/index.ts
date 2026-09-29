@@ -236,7 +236,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   let sessionEpoch = 0;
   type RecommendationCheck = { controller: AbortController; signal: AbortSignal; epoch: number; turn: number; startedAt: number; key: string };
   let recommendationRequest: RecommendationCheck | undefined;
-  let pendingRecommendation: { check: RecommendationCheck; value: Recommendation } | undefined;
+  let pendingRecommendation: { check: RecommendationCheck; value: Recommendation; isFresh: () => boolean } | undefined;
   let recommendationTurn = 0;
   let lastRecommendationTurn = -Infinity;
   let recommendationKey = "";
@@ -798,14 +798,29 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   });
 
   pi.on("turn_start", (event) => { recommendationTurn = event.turnIndex; });
+  pi.on("turn_end", (event, ctx) => {
+    if (event.message.role !== "assistant" || event.message.stopReason !== "stop"
+      || event.message.content.some((part) => part.type === "toolCall")
+      || !pendingRecommendation?.isFresh() || ctx.isIdle()) return;
+    try {
+      // Natural tool-loop checkpoints consume hints first. Only an otherwise
+      // final response needs a follow-up; queued user steering takes priority.
+      // Omit triggerTurn: enqueue during a run, but never restart an idle Lead.
+      pi.sendMessage({ customType: "pi-fusion-recommendation-wakeup", content: "", display: false }, { deliverAs: "followUp" });
+    } catch { /* A later natural checkpoint can still consume the hint. */ }
+  });
   pi.on("agent_end", () => {
     recommendationRequest?.controller.abort();
     pendingRecommendation = undefined;
     // Keep the last outcome available to /fusion recommend status after the Lead finishes.
   });
   pi.on("context", (event, ctx) => {
+    // A follow-up marker requests a checkpoint, but never carries advice into
+    // history. Strip it even when recommendations were disabled or cancelled.
+    const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== "pi-fusion-recommendation-wakeup");
+    const cleaned = messages.length !== event.messages.length ? { messages } : undefined;
     const settings = recommendationSettings();
-    if (!settings.enabled || !sessionActive) { resetRecommendations(); return; }
+    if (!settings.enabled || !sessionActive) { resetRecommendations(); return cleaned; }
     const capabilities = () => {
       const tools = pi.getActiveTools?.() ?? [];
       return {
@@ -814,8 +829,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       };
     };
     const { advisorAvailable, fusionAvailable } = capabilities();
-    if (!advisorAvailable && !fusionAvailable) { resetRecommendations(); return; }
-    const checkpoint = [...event.messages].reverse().find((message) => message.role === "user"
+    if (!advisorAvailable && !fusionAvailable) { resetRecommendations(); return cleaned; }
+    const checkpoint = [...messages].reverse().find((message) => message.role === "user"
       || (message.role === "custom" && message.customType === "pi-fusion-worker-result"));
     const checkpointKey = checkpoint ? JSON.stringify([checkpoint.role, checkpoint.timestamp, recommendationEvidence([checkpoint])]) : "";
     const stateKey = () => JSON.stringify([
@@ -836,14 +851,14 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     if (pendingRecommendation && !fresh(pendingRecommendation.check)) discardRecommendations();
     const ready = pendingRecommendation;
     pendingRecommendation = undefined;
-    // Snapshot a completed hint only at a later checkpoint. Never mutate a captured event or start a turn.
-    const result = ready ? { messages: [...event.messages, {
+    // Advice remains transient and is rechecked at the delivery checkpoint.
+    const result = ready ? { messages: [...messages, {
       role: "custom" as const,
       customType: "pi-fusion-recommendation",
       content: `This optional recommendation reflects an earlier checkpoint. Ignore it if newer evidence has resolved or changed the task. ${formatRecommendation(ready.value)}`,
       display: false,
       timestamp: Date.now(),
-    }] } : undefined;
+    }] } : cleaned;
     if (recommendationRequest || recommendationTurn - lastRecommendationTurn < 4) return result;
     const controller = new AbortController();
     const check: RecommendationCheck = {
@@ -853,7 +868,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     recommendationRequest = check;
     lastRecommendationTurn = recommendationTurn;
     const input = {
-      ...recommendationEvidence(event.messages), advisorAvailable, fusionAvailable,
+      ...recommendationEvidence(messages), advisorAvailable, fusionAvailable,
       workers: runtime.list().filter((worker) => worker.status !== "closed").map(({ id, label, status }) => ({ id, label: label ?? "", status })),
     };
     void (async () => {
@@ -862,7 +877,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         if (!fresh(check)) return;
         lastRecommendation = recommendation;
         recommendationError = undefined;
-        pendingRecommendation = { check, value: recommendation };
+        const positive = Object.values(recommendation.decisions).includes("yes");
+        pendingRecommendation = positive ? { check, value: recommendation, isFresh: () => fresh(check) } : undefined;
         try {
           // Native custom entries render in chat without steering or entering model context.
           pi.appendEntry("pi-fusion-recommendation-notice", { text: formatRecommendationStatus(recommendation) });
@@ -872,7 +888,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           lastRecommendation = undefined;
           recommendationError = clipStatus(error instanceof Error ? error.message : String(error), 160);
         }
-        // Background screening never holds up or restarts the Lead.
+        // Background screening never holds up or restarts an idle Lead.
       } finally {
         if (recommendationRequest === check) recommendationRequest = undefined;
       }

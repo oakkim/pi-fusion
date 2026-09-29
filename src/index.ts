@@ -36,7 +36,7 @@ import {
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
 import { AVAILABLE_LEAD_GUIDANCE, SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
-import { FusionPaneController, formatPaneTranscript, type PaneState } from "./pane.ts";
+import { FusionPaneController, extractHandoffTask, formatPaneTranscript, type PaneState } from "./pane.ts";
 import {
   FusionMonitorPublisher,
   formatDuration,
@@ -835,10 +835,15 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     const checkpoint = [...messages].reverse().find((message) => message.role === "user"
       || (message.role === "custom" && message.customType === "pi-fusion-worker-result"));
     const checkpointKey = checkpoint ? JSON.stringify([checkpoint.role, checkpoint.timestamp, recommendationEvidence([checkpoint])]) : "";
-    const stateKey = () => JSON.stringify([
-      checkpointKey, recommendationSettings().endpoint, capabilities(),
-      runtime.list().map(({ id, label, status, generation, activeTurnId }) => [id, label, status, generation, activeTurnId]),
-    ]);
+    const stateKey = () => {
+      const activity = advisor.activity();
+      return JSON.stringify([
+        checkpointKey, recommendationSettings().endpoint, capabilities(),
+        activity.running.map(({ id }) => id), activity.last && [activity.last.id, activity.last.status],
+        runtime.list().map(({ id, label, status, generation, activeTurnId }) => [id, label, status, generation, activeTurnId,
+          (pendingFollowups.get(id) ?? []).map((entry) => entry.id), steeringFor(id).map((entry) => entry.id)]),
+      ]);
+    };
     const key = stateKey();
     if (key !== recommendationKey) {
       discardRecommendations();
@@ -871,7 +876,21 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     lastRecommendationTurn = recommendationTurn;
     const input = {
       ...recommendationEvidence(messages), advisorAvailable, fusionAvailable,
-      workers: runtime.list().filter((worker) => worker.status !== "closed").map(({ id, label, status }) => ({ id, label: label ?? "", status })),
+      advisor: advisor.activity(),
+      workers: runtime.list().filter((worker) => worker.status !== "closed").map((worker) => {
+        const handoff = [...worker.history].reverse().find((message) => message.role === "user" && typeof message.content === "string" && message.content.startsWith(`<fusion_handoff generation="${worker.generation}">`));
+        // Compaction preserves the first handoff, which may belong to an older
+        // generation. Use the current summary and latest update if ours is gone.
+        const summary = worker.history.find((message) => message.role === "user" && typeof message.content === "string" && message.content.startsWith("<fusion_context_summary>"));
+        const latest = handoff ? "" : recommendationEvidence(worker.history.filter((message) => !(message.role === "user" && typeof message.content === "string" && message.content.startsWith("<fusion_handoff ")))).prompt;
+        return {
+          id: worker.id, label: worker.label ?? "", status: worker.status,
+          task: handoff && typeof handoff.content === "string" ? extractHandoffTask(handoff.content)
+            : [...new Set([summary && typeof summary.content === "string" ? summary.content : "", latest].filter(Boolean))].join("\n") || "Current task unavailable",
+          queuedTasks: (pendingFollowups.get(worker.id) ?? []).map((entry) => entry.message),
+          steering: steeringFor(worker.id).map((entry) => entry.message),
+        };
+      }),
     };
     void (async () => {
       try {

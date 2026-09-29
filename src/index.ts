@@ -34,7 +34,7 @@ import {
 } from "./config.ts";
 import { buildRecentContext, latestUserText } from "./utils.ts";
 import { AVAILABLE_LEAD_GUIDANCE, SIDEKICK_INQUIRY_SYSTEM_PROMPT, SIDEKICK_SYSTEM_PROMPT, handoffTaskText } from "./prompts.ts";
-import { FusionPaneController, formatPaneTranscript, type LiveActivity, type LiveToolActivity, type PaneState } from "./pane.ts";
+import { FusionPaneController, formatPaneTranscript, type PaneState } from "./pane.ts";
 import {
   FusionMonitorPublisher,
   launchMonitorWindow,
@@ -163,106 +163,10 @@ function statusText(value: string): string {
     .trim();
 }
 
-function clipStatus(value: string, max: number, tail = false): string {
+function clipStatus(value: string, max: number): string {
   const text = statusText(value);
   if (text.length <= max) return text;
-  return tail ? `…${text.slice(-(max - 1))}` : `${text.slice(0, max - 1)}…`;
-}
-
-export function formatElapsedDuration(elapsedMs: number): string {
-  const totalSeconds = Number.isFinite(elapsedMs) ? Math.max(0, Math.floor(elapsedMs / 1_000)) : 0;
-  const seconds = totalSeconds % 60;
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  if (totalMinutes === 0) return `${seconds}s`;
-  const minutes = totalMinutes % 60;
-  const secondText = String(seconds).padStart(2, "0");
-  if (totalMinutes < 60) return `${minutes}m ${secondText}s`;
-  const hours = Math.floor(totalMinutes / 60);
-  return `${hours}h ${String(minutes).padStart(2, "0")}m ${secondText}s`;
-}
-
-function parseStatusArguments(value: string): Record<string, unknown> | undefined {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function compactStatusPath(value: unknown): string {
-  if (typeof value !== "string") return "";
-  const path = statusText(value);
-  if (path.length <= 40) return path;
-  const parts = path.split("/").filter(Boolean);
-  return parts.length >= 2 ? `…/${parts.slice(-2).join("/")}` : clipStatus(path, 40, true);
-}
-
-function quotedStatusValue(value: unknown): string {
-  return typeof value === "string" ? JSON.stringify(clipStatus(value, 34)) : "";
-}
-
-function toolStatusDetail(tool: LiveToolActivity): string {
-  const args = parseStatusArguments(tool.arguments);
-  if (!args) {
-    const raw = statusText(tool.arguments);
-    return raw && !raw.startsWith("{") ? clipStatus(raw, 56) : "";
-  }
-  switch (tool.name) {
-    case "bash":
-      return typeof args.command === "string" ? clipStatus(args.command, 56) : "";
-    case "read": {
-      const path = compactStatusPath(args.path);
-      const offset = typeof args.offset === "number" ? `:${args.offset}` : "";
-      return `${path}${offset}`;
-    }
-    case "write":
-      return compactStatusPath(args.path);
-    case "edit": {
-      const path = compactStatusPath(args.path);
-      const count = Array.isArray(args.edits) ? args.edits.length : 0;
-      return `${path}${count ? ` · ${count} edit${count === 1 ? "" : "s"}` : ""}`;
-    }
-    case "grep": {
-      const pattern = quotedStatusValue(args.pattern);
-      const path = compactStatusPath(args.path);
-      return [pattern, path].filter(Boolean).join(" · ");
-    }
-    case "find": {
-      const pattern = quotedStatusValue(args.pattern);
-      const path = compactStatusPath(args.path);
-      return [pattern, path].filter(Boolean).join(" · ");
-    }
-    case "ls":
-      return compactStatusPath(args.path) || ".";
-    default: {
-      const details = Object.entries(args)
-        .filter(([, value]) => typeof value === "string" || typeof value === "number" || typeof value === "boolean")
-        .slice(0, 2)
-        .map(([key, value]) => `${key}=${clipStatus(String(value), 24)}`);
-      return details.join(" · ");
-    }
-  }
-}
-
-export function formatToolStatusAction(tool: LiveToolActivity): string {
-  const marker = tool.status === "running" ? "▶" : tool.status === "success" ? "✓" : "✗";
-  const detail = toolStatusDetail(tool);
-  return clipStatus(`${marker} ${tool.name}${detail ? ` · ${detail}` : ""}`, 72);
-}
-
-export function formatLiveStatusAction(activity: LiveActivity | undefined): string {
-  if (!activity) return "starting";
-  if (activity.phase === "tool") {
-    const tool = [...activity.tools].reverse().find((item) => item.status === "running") ?? activity.tools.at(-1);
-    return tool ? formatToolStatusAction(tool) : "tool";
-  }
-  if (activity.phase === "responding") {
-    // Show the worker's actual visible words. Its response language therefore
-    // appears naturally without translating or summarizing the stream.
-    return clipStatus(activity.text, 72, true) || "responding";
-  }
-  return activity.phase;
+  return `${text.slice(0, max - 1)}…`;
 }
 
 /**
@@ -330,7 +234,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   const pane = new FusionPaneController(
     (id) => runtime.getWorker(id),
     () => {
-      if (sessionActive && activeContext) refreshStatus(activeContext);
+      if (sessionActive && activeContext) monitor.refresh();
     },
   );
   monitor = new FusionMonitorPublisher(() => buildMonitorPayload());
@@ -688,28 +592,6 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       if (!ctx.hasUI) return;
       const advisorStatus = advisor.status(ctx);
       const advisorLabel = advisorStatus ? ` • ${advisorStatus}` : "";
-      const active = runtime.list().filter(
-        (worker) => worker.status === "running" || (pendingFollowups.get(worker.id)?.length ?? 0) > 0,
-      );
-      if (active.length > 0) {
-        const selected = pane.state.workerId;
-        const worker = active.find((item) => item.id === selected) ?? active.at(-1)!;
-        const activity = pane.getLive(worker.id);
-        const label = clipStatus(worker.label || worker.id.slice(4, 12), 24);
-        const elapsed = formatElapsedDuration(activity ? Date.now() - activity.startedAt : 0);
-        const more = active.length > 1 ? ` • +${active.length - 1}` : "";
-        const queued = pendingFollowups.get(worker.id)?.length ?? 0;
-        const queuedText = queued > 0 ? ` • queued ${queued}` : "";
-        const steers = steeringFor(worker.id, worker.activeTurnId ?? undefined);
-        const pendingSteers = steers.filter((entry) => entry.status === "pending").length;
-        const injectedSteers = steers.length - pendingSteers;
-        const steerText = pendingSteers > 0
-          ? ` • steer ${pendingSteers}`
-          : injectedSteers > 0 ? ` • updates ${injectedSteers}` : "";
-        const action = worker.status === "running" ? formatLiveStatusAction(activity) : "settling";
-        ctx.ui.setStatus("fusion", `Fusion • ${label} • ${action} • ${elapsed}${steerText}${queuedText}${more}${advisorLabel}`);
-        return;
-      }
       const mode = restoreMode(ctx);
       if (mode === "off") { ctx.ui.setStatus("fusion", `${modeLabel(mode)}${advisorLabel}`); return; }
       const warnings: string[] = [];
@@ -1100,7 +982,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     try {
       pi.sendMessage(
         {
-          customType: "fusion-result",
+          // Legacy Fusion renderers claim "fusion-result" with a different details schema.
+          customType: "pi-fusion-worker-result",
           content,
           display: true,
           details: { worker_id: workerId, turn_id: turnId, status, ...(next ? { next_turn_id: next.turnId, queue_id: next.queueId } : {}) },

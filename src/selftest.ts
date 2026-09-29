@@ -5,10 +5,10 @@ import { AdaptiveRoutingPolicy } from "../src/routing.ts";
 import { handoffTaskText } from "../src/prompts.ts";
 import { applyDefaults } from "../src/config.ts";
 import { buildRecentContext, latestUserText } from "../src/utils.ts";
-import fusionExtension, { deriveWorkerContextTelemetry, executorUsesSubscription, formatElapsedDuration, formatLiveStatusAction, formatToolStatusAction } from "../src/index.ts";
+import fusionExtension, { deriveWorkerContextTelemetry, executorUsesSubscription } from "../src/index.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import { initTheme } from "@earendil-works/pi-coding-agent";
-import { CombinedAutocompleteProvider, getKeybindings, visibleWidth } from "@earendil-works/pi-tui";
+import { convertToLlm, CustomMessageComponent, ExtensionRunner, initTheme } from "@earendil-works/pi-coding-agent";
+import { CombinedAutocompleteProvider, getKeybindings, Text, visibleWidth } from "@earendil-works/pi-tui";
 import { extractHandoffTask, formatPaneHistory, formatPaneTranscript, FusionPaneController, renderWorkerPane, type LiveActivity, type LiveProgress } from "../src/pane.ts";
 import { buildMonitorLaunchPlan, FusionMonitorPublisher, isMonitorOwnerAlive, parseMonitorSnapshot, renderMonitorScreen, sanitizeMonitorText, shouldTerminateMonitor, type MonitorSnapshot } from "../src/monitor.ts";
 import { runSerialized } from "../src/mutation-queue.ts";
@@ -1613,7 +1613,19 @@ try {
     completionMessages[0]?.message.content.includes("done"),
     completionMessages[0]?.options.deliverAs,
     completionMessages[0]?.options.triggerTurn,
-  ], ["fusion-result", true, "steer", true]);
+  ], ["pi-fusion-worker-result", true, "steer", true]);
+
+  // Pi looks up renderers globally by customType, so unrelated Fusion extensions can coexist.
+  const legacyRenderer = () => new Text("Invalid fusion result details", 0, 0);
+  const rendererRunner = new ExtensionRunner([{ messageRenderers: new Map([["fusion-result", legacyRenderer]]) }] as never, {} as never, fusionDir, {} as never, {} as never);
+  const completion = { ...completionMessages[0]!.message, role: "custom" as const, timestamp: Date.now() };
+  const renderCompletion = (customType: string) => new CustomMessageComponent({ ...completion, customType }, rendererRunner.getMessageRenderer(customType)).render(160).join("\n");
+  eq("worker completion bypasses incompatible legacy Fusion renderers", [
+    renderCompletion("fusion-result").includes("Invalid fusion result details"),
+    renderCompletion(completion.customType).includes("done"),
+    renderCompletion(completion.customType).includes("Invalid fusion result details"),
+    JSON.stringify(convertToLlm([completion])).includes("done"),
+  ], [true, true, false, true]);
 
   writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: ["write"], executorToolsConsent: true }));
   let recoveryRequests = 0;
@@ -1670,7 +1682,7 @@ try {
     pendingSteerStatus.steering_updates.map((entry: { status: string }) => entry.status),
     pendingSteerStatus.queued_followups.length,
     fusionStatusLine.includes("steer 2"),
-  ], ["steering", "steer", activeBeforeSteer.details.turn_id, 1, 2, ["pending", "pending"], 0, true]);
+  ], ["steering", "steer", activeBeforeSteer.details.turn_id, 1, 2, ["pending", "pending"], 0, false]);
   releaseSteerFirst({ role: "assistant", content: [{ type: "text", text: "old draft" }], stopReason: "stop", timestamp: Date.now() });
   await steerSecondStarted;
   const injectedSteerStatus = await readStatus(workerId);
@@ -1723,7 +1735,7 @@ try {
     fusionStatusLine.includes("queued 1"),
     queuedFirstContext.includes("also add the regression test"),
     queuedFirstContext.includes("keep the public API unchanged"),
-  ], ["queued", "queue", 1, activeBeforeQueue.details.turn_id, 1, true, true, true]);
+  ], ["queued", "queue", 1, activeBeforeQueue.details.turn_id, 1, false, true, true]);
   releaseQueuedFirst({ role: "assistant", content: [{ type: "text", text: "first done" }], stopReason: "stop", timestamp: Date.now() });
   await queuedSecondStarted;
   const runningQueuedFollowup = await readStatus(workerId);
@@ -1894,7 +1906,7 @@ try {
   const deferredWorkerId = deferred.details.worker_id as string;
   await started;
   await new Promise((resolve) => setTimeout(resolve, 80));
-  eq("background activity uses status line without auto-opening pane", [customCalls, fusionStatusLine.includes("status-test"), fusionStatusLine.includes("waiting")], [0, true, true]);
+  eq("background activity keeps a quiet settings status without opening a pane", [customCalls, fusionStatusLine, fusionStatusLine.includes("status-test"), fusionStatusLine.includes("waiting")], [0, "Fusion available • executor (off)", false, false]);
 
   const workerBeforeInquiry = await readStatus(deferredWorkerId);
   const inquiryAccepted = await ask.execute(
@@ -2617,29 +2629,6 @@ eq("pane uses expanded line capacity", [expandedPane.some((line) => line.include
 const thinkingActivity: LiveActivity = { phase: "thinking", startedAt: Date.now() - 2_000, text: "", tools: [] };
 const thinkingPane = renderWorkerPane(paneWorker, 42, 20, thinkingActivity);
 eq("live thinking phase without private text", [thinkingPane.some((line) => line.includes("thinking")), thinkingPane.some((line) => line.includes("private chain of thought"))], [true, false]);
-eq("status line passes through visible worker activity", [
-  formatLiveStatusAction({ phase: "responding", startedAt: 0, text: "한국어로 작업 결과를 설명 중", tools: [] }),
-  formatLiveStatusAction({ phase: "tool", startedAt: 0, text: "", tools: [{ id: "1", name: "bash", arguments: '{"command":"git status"}', output: "", status: "running" }] }),
-  formatLiveStatusAction(thinkingActivity),
-], ["한국어로 작업 결과를 설명 중", "▶ bash · git status", "thinking"]);
-eq("status line formats tool calls cleanly", [
-  formatToolStatusAction({ id: "1", name: "read", arguments: '{"path":"src/index.ts","offset":10}', output: "", status: "running" }),
-  formatToolStatusAction({ id: "2", name: "edit", arguments: '{"path":"src/index.ts","edits":[{},{}]}', output: "", status: "success" }),
-  formatToolStatusAction({ id: "3", name: "grep", arguments: '{"pattern":"needle","path":"src"}', output: "", status: "error" }),
-  formatToolStatusAction({ id: "4", name: "bash", arguments: '{"command":"npm test"}', output: "", status: "success" }),
-], [
-  "▶ read · src/index.ts:10",
-  "✓ edit · src/index.ts · 2 edits",
-  '✗ grep · "needle" · src',
-  "✓ bash · npm test",
-]);
-eq("status elapsed uses h/m/s", [
-  formatElapsedDuration(0),
-  formatElapsedDuration(59_999),
-  formatElapsedDuration(60_000),
-  formatElapsedDuration(65_000),
-  formatElapsedDuration(3_661_000),
-], ["0s", "59s", "1m 00s", "1m 05s", "1h 01m 01s"]);
 const crowdedActivity: LiveActivity = {
   phase: "tool",
   startedAt: Date.now() - 2_000,
@@ -2654,7 +2643,7 @@ const liveToken = paneController.beginLive("wrk_test", Date.now() - 3_000);
 paneController.updateLive("wrk_test", { kind: "phase", phase: "queued", replaceText: true }, liveToken);
 eq("pane distinguishes queued mutation from executor wait", paneController.getLive("wrk_test")?.phase, "queued");
 paneController.updateLive("wrk_test", { kind: "phase", phase: "waiting", replaceText: true }, liveToken);
-eq("live status reports executor wait", formatLiveStatusAction(paneController.getLive("wrk_test")), "waiting");
+eq("pane tracks executor wait", paneController.getLive("wrk_test")?.phase, "waiting");
 paneController.updateLive("wrk_test", { kind: "phase", phase: "thinking", replaceText: true }, liveToken);
 paneController.updateLive("wrk_test", { kind: "tool_start", toolId: "call-1", name: "bash", arguments: '{"command":"echo hi"}' }, liveToken);
 paneController.updateLive("wrk_test", { kind: "tool_update", toolId: "call-1", output: "partial output" }, liveToken);
@@ -2663,7 +2652,6 @@ paneController.updateLive("wrk_test", { kind: "tool_start", toolId: "call-2", na
 paneController.updateLive("wrk_test", { kind: "tool_end", toolId: "call-2", ok: false, output: "failed" }, liveToken);
 const liveActivity = paneController.getLive("wrk_test");
 eq("pane live activity lifecycle", [liveActivity?.phase, liveActivity?.tools[0]?.name, liveActivity?.tools[0]?.output, liveActivity?.tools[0]?.status, liveActivity?.tools[1]?.status], ["tool", "bash", "final output", "success", "error"]);
-eq("live status reports queued phase", formatLiveStatusAction({ phase: "queued", startedAt: Date.now(), text: "", tools: [] }), "queued");
 eq("pane live state is transient", [paneController.getLive("wrk_test") !== undefined, paneController.liveTimerActive], [true, true]);
 paneController.clearLive("wrk_test", liveToken);
 eq("pane live state clears", [paneController.getLive("wrk_test"), paneController.liveTimerActive], [undefined, false]);

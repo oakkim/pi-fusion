@@ -145,14 +145,14 @@ Worker inquiries run alongside the worker without changing its instructions. The
 
 ## Status and monitoring
 
-The idle status line keeps the executor model short and shows advisor state without another model name:
+The status line keeps the executor model short and shows advisor state without another model name:
 
 ```text
 Fusion available • gpt-5.6-luna (max) • fast • Advisor on
 Fusion off • Advising…
 ```
 
-`fast` in the status line refers to the executor and appears only when enabled for a supported model. Active workers show their current tool or visible response, elapsed time, and pending updates. Private thinking is never shown. `/advisor status` reports advisor settings, attempts, tokens, and cost for the current branch.
+`fast` in the status line refers to the executor and appears only when enabled for a supported model. Worker phases, tools, response previews, elapsed time, and pending updates stay in `/fusion status`, the worker pane, and the monitor instead of changing the status line. Private thinking is never shown. `/advisor status` reports advisor settings, attempts, tokens, and cost for the current branch.
 
 `/fusion status` shows the current branch's recorded cost total with separate Workers, Inquiries, and Advisor amounts. Worker costs include received usage checkpoints, including failed or interrupted turns, without counting the final cost entry again. Lead costs are not included. These are usage costs recorded by the model SDK, not an account invoice; requests with no recorded usage do not contribute an amount.
 

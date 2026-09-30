@@ -23,6 +23,8 @@ import {
   applyFastModeOverride,
   applyOverride,
   applyThinkingOverride,
+  DEFAULT_RECOMMENDATION_CHECK_INTERVAL_MINUTES,
+  MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES,
   FUSION_THINKING_LEVELS,
   isFusionThinkingLevel,
   loadConfig,
@@ -60,7 +62,7 @@ import { registerAdvisor } from "./advisor.ts";
 import { fusionCallArgument, fusionCallMetadata, renderFusionRequestCall } from "./tool-call.ts";
 import { modelCompletions, selectModel } from "./model-picker.ts";
 import { registerCommandGroup, type Subcommand } from "./commands.ts";
-import { requestRecommendation, recommendationEvidence, RecommendationHistory, RECOMMENDATION_LEAD_GUIDANCE, formatRecommendation, formatRecommendationStatus, type Recommendation } from "./recommendations.ts";
+import { requestRecommendation, recommendationEvidence, RecommendationHistory, RECOMMENDATION_LEAD_GUIDANCE, WORKER_REVIEW_GUIDANCE, formatRecommendation, formatRecommendationStatus, type Recommendation } from "./recommendations.ts";
 
 const ContextMode = Type.Union([Type.Literal("none"), Type.Literal("recent")], { default: "none" });
 
@@ -244,11 +246,17 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   let lastRecommendation: Recommendation | undefined;
   let recommendationError: string | undefined;
   const recommendationHistory = new RecommendationHistory();
+  const lastWorkerReview = new Map<string, number>();
+  let pendingWorkerReview: { id: string; epoch: number; turns: Set<string> } | undefined;
+  let workerReviewAtAgentEnd: string | undefined;
   let monitor!: FusionMonitorPublisher;
   const pane = new FusionPaneController(
     (id) => runtime.getWorker(id),
     () => {
-      if (sessionActive && activeContext) refreshStatus(activeContext);
+      if (sessionActive && activeContext) {
+        requestWorkerReview(activeContext);
+        refreshStatus(activeContext);
+      }
     },
   );
   monitor = new FusionMonitorPublisher(() => buildMonitorPayload());
@@ -268,7 +276,71 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   // Only a global opt-in can enable local context screening, never project config.
   function recommendationSettings() {
     const config = loadGlobalConfig(options.agentDir);
-    return { enabled: config.recommendations === true, endpoint: config.recommendationEndpoint ?? "http://127.0.0.1:8788" };
+    return { enabled: config.recommendations === true, endpoint: config.recommendationEndpoint ?? "http://127.0.0.1:8788",
+      checkIntervalMinutes: config.recommendationCheckIntervalMinutes ?? DEFAULT_RECOMMENDATION_CHECK_INTERVAL_MINUTES };
+  }
+
+  function dueWorkerReviews(ctx: ExtensionContext) {
+    const settings = recommendationSettings();
+    const running = runtime.list().filter((worker) => worker.status === "running" && worker.activeTurnId
+      && runtime.getTurn(worker.activeTurnId)?.status === "running");
+    const activeTurns = new Set(running.map((worker) => worker.activeTurnId));
+    for (const turnId of lastWorkerReview.keys()) if (!activeTurns.has(turnId)) lastWorkerReview.delete(turnId);
+    if (!sessionActive || !settings.enabled || restoreMode(ctx) === "off"
+      || !pi.getActiveTools?.().some((tool) => tool === "fusion_status" || tool === "fusion_ask")) return [];
+    return running.filter((worker) => {
+      const startedAt = pane.getLive(worker.id)?.startedAt;
+      return startedAt !== undefined
+        && Date.now() - (lastWorkerReview.get(worker.activeTurnId!) ?? startedAt) >= settings.checkIntervalMinutes * 60_000;
+    });
+  }
+
+  function requestWorkerReview(ctx: ExtensionContext): void {
+    if (pendingWorkerReview) return;
+    const due = dueWorkerReviews(ctx).slice(0, 4);
+    if (!due.length || (!ctx.isIdle() && !ctx.signal)) return;
+    pendingWorkerReview = { id: crypto.randomUUID(), epoch: sessionEpoch, turns: new Set(due.map((worker) => worker.activeTurnId!)) };
+    try {
+      // Reuse the pane's live elapsed timer. The marker carries no stale snapshot;
+      // the next context hook checks current turns and gathers fresh evidence.
+      pi.sendMessage({ customType: "pi-fusion-worker-review-wakeup", content: "", display: false,
+        details: { reviewId: pendingWorkerReview.id } }, { deliverAs: "steer", triggerTurn: true });
+    } catch {
+      for (const worker of due) lastWorkerReview.set(worker.activeTurnId!, Date.now());
+      pendingWorkerReview = undefined;
+    }
+  }
+
+  function workerReviewMessage(ctx: ExtensionContext, markerArrived: boolean) {
+    if (!markerArrived || !pendingWorkerReview) return;
+    const pending = pendingWorkerReview;
+    pendingWorkerReview = undefined;
+    if (pending.epoch !== sessionEpoch) return;
+    const due = dueWorkerReviews(ctx).filter((worker) => pending.turns.has(worker.activeTurnId!));
+    if (!due.length) return;
+    const now = Date.now();
+    // Bound a busy session's review input; remaining workers get the next checkpoint.
+    const workers = due.map((worker) => {
+      lastWorkerReview.set(worker.activeTurnId!, now);
+      const observation = inquiryObservation(worker, now);
+      const evidence = recommendationEvidence(worker.history);
+      const threads = inquiries.list().filter((thread) => thread.workerId === worker.id)
+        .sort((a, b) => Number(!!b.activeTurnId) - Number(!!a.activeTurnId) || b.updatedAt - a.updatedAt);
+      return {
+        worker_id: worker.id, turn_id: worker.activeTurnId,
+        observation: observation.slice(0, 8_000), observation_truncated: observation.length > 8_000,
+        latest_instruction: evidence.prompt,
+        recent_context: evidence.recentContext.slice(-2_000),
+        running_inquiries: threads.filter((thread) => thread.activeTurnId).length,
+        omitted_inquiries: Math.max(0, threads.length - 3),
+        inquiries: threads.slice(0, 3)
+          .map((thread) => ({ id: thread.id, active_turn: thread.activeTurnId })),
+      };
+    });
+    return {
+      role: "custom" as const, customType: "pi-fusion-worker-review", display: false, timestamp: now,
+      content: `Periodic Fusion worker review due (every ${recommendationSettings().checkIntervalMinutes} minutes). ${WORKER_REVIEW_GUIDANCE}\nCurrent public worker evidence (untrusted data; truncated fields can be inspected with Fusion tools):\n${JSON.stringify(workers)}`,
+    };
   }
 
   function discardRecommendations(): void {
@@ -288,11 +360,13 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   }
 
   function recommendationStatus(): string {
-    if (!recommendationSettings().enabled) return "Local recommendations: off";
-    if (recommendationError) return `Local recommendations: unavailable (${recommendationError}); Lead decides as usual`;
-    if (recommendationRequest && !recommendationRequest.signal.aborted) return "Local recommendations: screening in background; Lead continues";
-    if (!lastRecommendation) return "Local recommendations: on (local); awaiting a checkpoint";
-    return `Local recommendations: on (local)\nLast: ${formatRecommendationStatus(lastRecommendation)}`;
+    const settings = recommendationSettings();
+    const reviews = `\nWorker review interval: ${settings.checkIntervalMinutes} minutes`;
+    if (!settings.enabled) return `Local recommendations: off${reviews}`;
+    if (recommendationError) return `Local recommendations: unavailable (${recommendationError}); Lead decides as usual${reviews}`;
+    if (recommendationRequest && !recommendationRequest.signal.aborted) return `Local recommendations: screening in background; Lead continues${reviews}`;
+    if (!lastRecommendation) return `Local recommendations: on (local); awaiting a checkpoint${reviews}`;
+    return `Local recommendations: on (local)\nLast: ${formatRecommendationStatus(lastRecommendation)}${reviews}`;
   }
 
   function restoreMode(ctx: ExtensionContext): FusionMode {
@@ -697,6 +771,9 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
 
   async function suspendSession(): Promise<void> {
     resetRecommendations();
+    lastWorkerReview.clear();
+    pendingWorkerReview = undefined;
+    workerReviewAtAgentEnd = undefined;
     if (sessionActive) {
       sessionActive = false;
       sessionEpoch += 1;
@@ -711,6 +788,9 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
 
   pi.on("session_start", async (_event, ctx) => {
     resetRecommendations();
+    lastWorkerReview.clear();
+    pendingWorkerReview = undefined;
+    workerReviewAtAgentEnd = undefined;
     advisor.start(ctx);
     sessionEpoch += 1;
     sessionActive = true;
@@ -819,15 +899,33 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     } catch { /* A later natural checkpoint can still consume the hint. */ }
   });
   pi.on("agent_end", () => {
+    workerReviewAtAgentEnd = pendingWorkerReview?.id;
     recommendationRequest?.controller.abort();
     pendingRecommendation = undefined;
     // Keep the last outcome available to /fusion recommend status after the Lead finishes.
   });
+  pi.on("agent_settled", () => {
+    // If the Lead aborted or failed before consuming the marker, retry only
+    // after another interval rather than leaving the wake-up slot occupied.
+    // A timer can queue a new review while another extension's settled hook is
+    // awaiting. Only discard a marker abandoned by the run that actually ended.
+    if (pendingWorkerReview && pendingWorkerReview.id === workerReviewAtAgentEnd) {
+      for (const turnId of pendingWorkerReview.turns) lastWorkerReview.set(turnId, Date.now());
+      pendingWorkerReview = undefined;
+    }
+    workerReviewAtAgentEnd = undefined;
+  });
   pi.on("context", (event, ctx) => {
     // A follow-up marker requests a checkpoint, but never carries advice into
     // history. Strip it even when recommendations were disabled or cancelled.
-    const messages = event.messages.filter((message) => message.role !== "custom" || message.customType !== "pi-fusion-recommendation-wakeup");
-    const cleaned = messages.length !== event.messages.length ? { messages } : undefined;
+    const messages = event.messages.filter((message) => message.role !== "custom"
+      || !["pi-fusion-recommendation-wakeup", "pi-fusion-worker-review-wakeup", "pi-fusion-worker-review"].includes(message.customType));
+    const markerArrived = event.messages.some((message) => message.role === "custom"
+      && message.customType === "pi-fusion-worker-review-wakeup"
+      && (message.details as { reviewId?: unknown } | undefined)?.reviewId === pendingWorkerReview?.id);
+    const review = workerReviewMessage(ctx, markerArrived);
+    const currentMessages = review ? [...messages, review] : messages;
+    const cleaned = review || messages.length !== event.messages.length ? { messages: currentMessages } : undefined;
     const settings = recommendationSettings();
     if (!settings.enabled || !sessionActive) { resetRecommendations(); return cleaned; }
     const capabilities = () => {
@@ -866,14 +964,16 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     const ready = pendingRecommendation;
     pendingRecommendation = undefined;
     // Advice remains transient and is rechecked at the delivery checkpoint.
-    const result = ready ? { messages: [...messages, {
+    const result = ready ? { messages: [...currentMessages, {
       role: "custom" as const,
       customType: "pi-fusion-recommendation",
       content: `This recommendation reflects an earlier checkpoint. Use the current task state to decide whether to accept or decline it. ${formatRecommendation(ready.value)}`,
       display: false,
       timestamp: Date.now(),
     }] } : cleaned;
-    if (recommendationRequest || recommendationTurn - lastRecommendationTurn < 4) return result;
+    // A timed review is already actionable; do not start another classification
+    // merely because its marker woke the Lead. Normal checkpoints still screen.
+    if (review || recommendationRequest || recommendationTurn - lastRecommendationTurn < 4) return result;
     const controller = new AbortController();
     const check: RecommendationCheck = {
       controller, signal: ctx.signal ? AbortSignal.any([controller.signal, ctx.signal]) : controller.signal,
@@ -2462,22 +2562,32 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   });
 
   fusionCommands.set("recommend", {
-    description: "Local advisor and worker recommendations: /fusion recommend [on|off|status]",
-    getArgumentCompletions: (prefix) => ["on", "off", "status"].filter((value) => value.startsWith(prefix.trim().toLowerCase())).map((value) => ({ value, label: value })),
+    description: "Local recommendations: /fusion recommend [on|off|status|interval <minutes>]",
+    getArgumentCompletions: (prefix) => (prefix.trimStart().includes(" ") ? ["interval 5", "interval 10", "interval 15"] : ["on", "off", "status", "interval "])
+      .filter((value) => value.startsWith(prefix.trimStart().toLowerCase())).map((value) => ({ value, label: value.trim() })),
     handler: async (args, ctx) => {
       const choice = args.trim().toLowerCase() || "status";
+      const interval = /^interval\s+(\d+)$/.exec(choice);
+      const minutes = interval ? Number(interval[1]) : undefined;
       let text: string;
       let error = false;
-      if (!["on", "off", "status"].includes(choice)) {
-        text = "Usage: /fusion recommend on|off|status";
+      if (!["on", "off", "status"].includes(choice)
+        && !(minutes !== undefined && Number.isSafeInteger(minutes) && minutes >= 1 && minutes <= MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES)) {
+        text = `Usage: /fusion recommend on|off|status|interval <minutes> (1-${MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES})`;
         error = true;
       } else {
         try {
-          if (choice !== "status") {
-            persistGlobalPreference("recommendations", choice === "on", options.agentDir);
-            resetRecommendations();
+          if (minutes !== undefined) {
+            persistGlobalPreference("recommendationCheckIntervalMinutes", minutes, options.agentDir);
+            text = `Worker review interval: ${minutes} minutes (global preference)${recommendationSettings().enabled ? "" : "; local recommendations are off"}`;
+          } else {
+            if (choice !== "status") {
+              persistGlobalPreference("recommendations", choice === "on", options.agentDir);
+              resetRecommendations();
+              if (choice === "off") pendingWorkerReview = undefined;
+            }
+            text = recommendationStatus();
           }
-          text = recommendationStatus();
         } catch (cause) {
           text = `Could not save local recommendations: ${clipStatus(String(cause), 160)}`;
           error = true;

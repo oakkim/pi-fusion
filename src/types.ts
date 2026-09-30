@@ -20,6 +20,8 @@ export interface FusionConfig {
   recommendations?: boolean;
   /** Loopback inference server base URL. No conversation is sent to a remote endpoint. */
   recommendationEndpoint?: string;
+  /** Global review reminder interval for running worker turns. Default 5 minutes; integer 1-1440. */
+  recommendationCheckIntervalMinutes?: number;
   /** Explicit Lead advisor model; false/unset disables advice. */
   advisorModel?: string | false;
   /** Advisor reasoning effort. Unset follows the Lead, clamped to the advisor model. */

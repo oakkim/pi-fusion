@@ -20,6 +20,8 @@ export const DEFAULT_MAX_ESCALATIONS = 2;
 export const MIN_ESCALATIONS = 0;
 export const MAX_ESCALATIONS = 5;
 export const TOOL_OUTPUT_MAX_BYTES = 12_000;
+export const DEFAULT_RECOMMENDATION_CHECK_INTERVAL_MINUTES = 5;
+export const MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES = 1440;
 
 const TOOL_MODES = ["none", "readonly", "all"] as const;
 export const FUSION_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const satisfies readonly ModelThinkingLevel[];
@@ -60,7 +62,7 @@ export function persistGlobalFastMode(fastMode: boolean | undefined, agentDir = 
 }
 
 /** Persist last-used preferences atomically, preserving unrelated config. */
-export function persistGlobalPreference<K extends "fastMode" | "advisorFastMode" | "advisorModel" | "advisorThinkingLevel" | "recommendations">(key: K, value: FusionConfig[K], agentDir = getAgentDir()): void {
+export function persistGlobalPreference<K extends "fastMode" | "advisorFastMode" | "advisorModel" | "advisorThinkingLevel" | "recommendations" | "recommendationCheckIntervalMinutes">(key: K, value: FusionConfig[K], agentDir = getAgentDir()): void {
   const configPath = globalFusionConfigPath(agentDir);
   let raw: Record<string, unknown> = {};
   if (existsSync(configPath)) {
@@ -90,6 +92,10 @@ function normalizeConfig(raw: unknown): FusionConfig {
   const out: FusionConfig = {};
   if (typeof input.recommendations === "boolean") out.recommendations = input.recommendations;
   if (typeof input.recommendationEndpoint === "string") out.recommendationEndpoint = input.recommendationEndpoint.trim();
+  if (typeof input.recommendationCheckIntervalMinutes === "number" && Number.isInteger(input.recommendationCheckIntervalMinutes)
+    && input.recommendationCheckIntervalMinutes >= 1 && input.recommendationCheckIntervalMinutes <= MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES) {
+    out.recommendationCheckIntervalMinutes = input.recommendationCheckIntervalMinutes;
+  }
   if (input.advisorModel === false) out.advisorModel = false;
   else if (typeof input.advisorModel === "string" && input.advisorModel.trim()) out.advisorModel = input.advisorModel.trim();
   if (isFusionThinkingLevel(input.advisorThinkingLevel)) out.advisorThinkingLevel = input.advisorThinkingLevel;

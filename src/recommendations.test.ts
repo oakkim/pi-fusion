@@ -1,7 +1,37 @@
 /** No model calls: schema, public evidence, and loopback transport checks. */
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DEFAULT_RECOMMENDATION_CHECK_INTERVAL_MINUTES, MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES, loadGlobalConfig, persistGlobalPreference } from "./config.ts";
 import { formatRecommendation, formatRecommendationStatus, RecommendationHistory, RECOMMENDATION_LEAD_GUIDANCE, recommendationEvidence, requestRecommendation, type RecommendationInput } from "./recommendations.ts";
+
+const configDirectory = mkdtempSync(join(tmpdir(), "fusion-recommendation-config-"));
+try {
+  const configPath = join(configDirectory, "fusion.json");
+  const interval = () => loadGlobalConfig(configDirectory).recommendationCheckIntervalMinutes ?? DEFAULT_RECOMMENDATION_CHECK_INTERVAL_MINUTES;
+  assert.equal(interval(), 5, "a missing interval uses the five-minute default");
+  for (const value of [1, 5, 10, MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES]) {
+    writeFileSync(configPath, JSON.stringify({ recommendationCheckIntervalMinutes: value }));
+    assert.equal(interval(), value);
+  }
+  for (const value of [0, -1, 1.5, MAX_RECOMMENDATION_CHECK_INTERVAL_MINUTES + 1, "10", null, true, [], {}]) {
+    writeFileSync(configPath, JSON.stringify({ recommendationCheckIntervalMinutes: value }));
+    assert.equal(loadGlobalConfig(configDirectory).recommendationCheckIntervalMinutes, undefined, "invalid intervals are ignored rather than rounded or clamped");
+    assert.equal(interval(), 5);
+  }
+  const preserved = { recommendations: true, advisorModel: "test/advisor", recommendationEndpoint: "http://127.0.0.1:8788", unrelated: { retain: true } };
+  writeFileSync(configPath, JSON.stringify(preserved));
+  persistGlobalPreference("recommendationCheckIntervalMinutes", 10, configDirectory);
+  assert.equal(interval(), 10, "the interval survives a fresh global config read");
+  assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), { ...preserved, recommendationCheckIntervalMinutes: 10 });
+  persistGlobalPreference("recommendations", false, configDirectory);
+  assert.equal(interval(), 10, "disabling recommendations preserves the chosen interval");
+  persistGlobalPreference("recommendationCheckIntervalMinutes", undefined, configDirectory);
+  assert.equal(interval(), 5);
+  assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), { ...preserved, recommendations: false });
+} finally { rmSync(configDirectory, { recursive: true, force: true }); }
 
 const input: RecommendationInput = { prompt: "Implement the scoped task", recentContext: "Tests fail", advisorAvailable: true, fusionAvailable: true, advisor: { running: [] }, workers: [] };
 const options = { endpoint: "http://127.0.0.1:8788", timeoutMs: 1_000 };

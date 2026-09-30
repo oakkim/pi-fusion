@@ -1679,19 +1679,21 @@ try {
     : responseWithUsage([{ type: "text", text: "provider partial failure" }], "error");
   const recovery = await spawn.execute("recovery", { task: "write then recover" }, undefined, undefined, context);
   await waitForStatus(recovery.details.turn_id, "failed");
-  const failedSnapshot = durableEntries.filter((entry) => entry.customType === "fusion-worker" && entry.data.worker.id === recovery.details.worker_id).at(-1)!;
-  const savedResult = failedSnapshot.data.worker.history.find((message: any) => message.role === "toolResult" && message.toolCallId === "persist-write");
+  const failedRestore = new WorkerRuntime();
+  failedRestore.restore(durableEntries);
+  const savedResult = failedRestore.getWorker(recovery.details.worker_id)!.history.find((message: any) => message.role === "toolResult" && message.toolCallId === "persist-write");
   let followupInput = "";
   completeImpl = async (_model, completeContext) => { followupInput = JSON.stringify(completeContext); return responseWithUsage([{ type: "text", text: "recovered without repeating write" }]); };
   const recoveryFollowup = await followup.execute("recover-followup", { worker_id: recovery.details.worker_id, message: "continue from saved state" }, undefined, undefined, context);
   await waitForStatus(recoveryFollowup.details.turn_id, "completed");
   const recoveryCosts = durableEntries.filter((entry) => entry.customType === "fusion-cost" && entry.data.worker_id === recovery.details.worker_id);
-  const recoveredSnapshot = durableEntries.filter((entry) => entry.customType === "fusion-worker" && entry.data.worker.id === recovery.details.worker_id).at(-1)!;
+  const recoveredRestore = new WorkerRuntime();
+  recoveredRestore.restore(durableEntries);
   eq("registered worker persists real write through provider error and followup", [
-    readFileSync(_join(fusionDir, "recover.txt"), "utf8"), savedResult?.isError,
+    readFileSync(_join(fusionDir, "recover.txt"), "utf8"), savedResult?.role === "toolResult" ? savedResult.isError : undefined,
     followupInput.includes("persist-write"), followupInput.includes("Successfully wrote"),
     recoveryCosts.length, recoveryCosts.map((entry) => entry.data.usage.cost),
-    recoveredSnapshot.data.worker.telemetry.cumulative.cost,
+    recoveredRestore.getWorker(recovery.details.worker_id)?.telemetry?.cumulative.cost,
   ], ["durable edit", false, true, true, 2, [0.5, 0.25], 0.75]);
   writeFileSync(_join(fusionDir, ".pi", "fusion.json"), JSON.stringify({ executorTools: "none" }));
 
@@ -2938,6 +2940,7 @@ eq("monitor leaves no temporary snapshots", readdirSync(monitorFixture).filter((
 rmSync(monitorFixture, { recursive: true, force: true });
 
 await import("./recommendations.test.ts");
+await import("./journal.test.ts");
 await import("./recommendation-integration.test.ts");
 await import("./worker-review.test.ts");
 await import("./worker-tools.test.ts");

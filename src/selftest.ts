@@ -2939,6 +2939,7 @@ rmSync(monitorFixture, { recursive: true, force: true });
 
 await import("./recommendations.test.ts");
 await import("./recommendation-integration.test.ts");
+await import("./worker-review.test.ts");
 await import("./worker-tools.test.ts");
 await import("./worker-tool-integration.test.ts");
 

@@ -8,6 +8,7 @@
 import type { Message } from "@earendil-works/pi-ai/compat";
 import { addUsage, usageSummary, zeroUsage, type UsageLike, type UsageSummary } from "./cost.ts";
 import type { WorkerStatus, TurnRecord, WorktreeInfo } from "./types.ts";
+import { JournalWriter, journalGeneration, journalHistory, journalId, journalObject, replayJournal, type AppendJournalEntry } from "./journal.ts";
 
 export interface WorkerContextTelemetry {
   /** Context tokens are absent/unknown until a successful provider response. */
@@ -53,6 +54,18 @@ export interface WorkerRecord {
   telemetry?: WorkerTelemetry;
 }
 
+function validWorker(value: unknown): value is WorkerRecord {
+  return journalObject(value) && journalId(value.id) && journalHistory(value.history)
+    && journalGeneration(value.generation) && ["running", "idle", "closed"].includes(String(value.status))
+    && (value.activeTurnId === null || journalId(value.activeTurnId))
+    && typeof value.executorModelId === "string" && typeof value.createdAt === "number" && journalGeneration(value.failures);
+}
+
+function validWorkerTurn(value: unknown, worker: WorkerRecord): value is TurnRecord {
+  return journalObject(value) && journalId(value.id) && value.workerId === worker.id && journalGeneration(value.generation)
+    && ["running", "completed", "failed", "interrupted"].includes(String(value.status));
+}
+
 /** Repair a persisted interrupted batch without claiming that side effects did not occur. */
 export function repairIncompleteToolCalls(history: Message[]): Message[] {
   const repaired: Message[] = [];
@@ -82,6 +95,7 @@ export class WorkerRuntime {
   readonly #workers = new Map<string, WorkerRecord>();
   readonly #turns = new Map<string, TurnRecord>();
   readonly #controllers = new Map<string, AbortController>(); // turnId -> controller
+  readonly #journal = new JournalWriter<WorkerRecord, TurnRecord>("fusion-worker", "worker");
 
   list(): WorkerRecord[] {
     return [...this.#workers.values()];
@@ -258,10 +272,17 @@ export class WorkerRuntime {
   // ---- session journal (durable across /resume) ----
 
   snapshot(): Array<{ worker: WorkerRecord; turns: TurnRecord[] }> {
-    return [...this.#workers.values()].map((w) => ({
-      worker: { ...w, history: [...w.history] },
-      turns: [...this.#turns.values()].filter((t) => t.workerId === w.id).map((t) => ({ ...t })),
-    }));
+    return [...this.#workers.keys()].map((id) => this.snapshotWorker(id)!);
+  }
+
+  snapshotWorker(workerId: string): { worker: WorkerRecord; turns: TurnRecord[] } | undefined {
+    const worker = this.#workers.get(workerId);
+    return worker ? structuredClone({ worker, turns: [...this.#turns.values()].filter((turn) => turn.workerId === workerId) }) : undefined;
+  }
+
+  persist(workerId: string, appendEntry: AppendJournalEntry): boolean {
+    const worker = this.#workers.get(workerId);
+    return worker ? this.#journal.write(worker, [...this.#turns.values()].filter((turn) => turn.workerId === workerId), appendEntry) : false;
   }
 
   restore(entries: unknown[]): void {
@@ -269,6 +290,7 @@ export class WorkerRuntime {
     this.#workers.clear();
     this.#turns.clear();
     this.#controllers.clear();
+    this.#journal.reset();
 
     // Older journals have no worker telemetry. Keep cumulative fusion-cost
     // usage by worker; latest CH comes only from restored assistant history.
@@ -284,13 +306,10 @@ export class WorkerRuntime {
       legacyUsage.set(data.worker_id, previous);
     }
 
-    // Scan session branch for fusion-worker snapshots, last wins per worker id.
-    for (const entry of entries) {
-      const e = entry as { type?: unknown; customType?: unknown; data?: unknown };
-      if (e?.type !== "custom" || e?.customType !== "fusion-worker" || !("data" in (e as object))) continue;
-      const data = (e as { data: { worker?: WorkerRecord; turns?: TurnRecord[] } }).data;
-      if (!data?.worker?.id) continue;
-      const restored = { ...data.worker, history: repairIncompleteToolCalls(data.worker.history) };
+    // A tool result may be in a later delta. Repair only the fully replayed
+    // branch, otherwise a checkpoint mid-batch invents permanent error results.
+    for (const data of replayJournal(entries, "fusion-worker", "worker", validWorker, validWorkerTurn).values()) {
+      const restored = { ...data.record, history: repairIncompleteToolCalls(data.record.history) };
       if (!restored.telemetry) {
         const legacy = legacyUsage.get(restored.id);
         restored.telemetry = {
@@ -313,12 +332,7 @@ export class WorkerRuntime {
         activeTurnId: null,
         status: restored.status === "closed" ? "closed" : "idle",
       });
-      for (const t of data.turns ?? []) {
-        const existing = this.#turns.get(t.id);
-        if (!existing || t.generation >= existing.generation) {
-          this.#turns.set(t.id, { ...t, status: t.status === "running" ? "interrupted" : t.status });
-        }
-      }
+      for (const t of data.turns) this.#turns.set(t.id, { ...t, status: t.status === "running" ? "interrupted" : t.status });
     }
   }
 }

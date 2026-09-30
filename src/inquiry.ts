@@ -1,4 +1,5 @@
 import type { Message } from "@earendil-works/pi-ai/compat";
+import { JournalWriter, journalGeneration, journalHistory, journalId, journalObject, replayJournal, type AppendJournalEntry } from "./journal.ts";
 
 export type InquiryTurnStatus = "running" | "completed" | "failed" | "interrupted";
 
@@ -31,10 +32,24 @@ export interface InquirySnapshot {
   turns: InquiryTurn[];
 }
 
+function validThread(value: unknown): value is InquiryThread {
+  return journalObject(value) && journalId(value.id) && journalId(value.workerId) && journalHistory(value.history)
+    && journalGeneration(value.generation) && (value.activeTurnId === null || journalId(value.activeTurnId))
+    && typeof value.createdAt === "number" && typeof value.updatedAt === "number";
+}
+
+function validInquiryTurn(value: unknown, thread: InquiryThread): value is InquiryTurn {
+  return journalObject(value) && journalId(value.id) && value.inquiryId === thread.id && value.workerId === thread.workerId
+    && journalGeneration(value.generation) && journalGeneration(value.workerGeneration) && typeof value.capturedAt === "number"
+    && (value.workerTurnId === null || journalId(value.workerTurnId)) && journalHistory([value.question])
+    && ["running", "completed", "failed", "interrupted"].includes(String(value.status));
+}
+
 export class InquiryRuntime {
   readonly #threads = new Map<string, InquiryThread>();
   readonly #turns = new Map<string, InquiryTurn>();
   readonly #controllers = new Map<string, AbortController>();
+  readonly #journal = new JournalWriter<InquiryThread, InquiryTurn>("fusion-inquiry", "thread");
 
   list(): InquiryThread[] {
     return [...this.#threads.values()];
@@ -153,10 +168,14 @@ export class InquiryRuntime {
     const threads = inquiryId
       ? [this.#threads.get(inquiryId)].filter((thread): thread is InquiryThread => thread !== undefined)
       : [...this.#threads.values()];
-    return threads.map((thread) => ({
-      thread: { ...thread, history: [...thread.history] },
-      turns: [...this.#turns.values()].filter((turn) => turn.inquiryId === thread.id).map((turn) => ({ ...turn })),
+    return threads.map((thread) => structuredClone({
+      thread, turns: [...this.#turns.values()].filter((turn) => turn.inquiryId === thread.id),
     }));
+  }
+
+  persist(inquiryId: string, appendEntry: AppendJournalEntry): boolean {
+    const thread = this.#threads.get(inquiryId);
+    return thread ? this.#journal.write(thread, [...this.#turns.values()].filter((turn) => turn.inquiryId === inquiryId), appendEntry) : false;
   }
 
   restore(entries: unknown[]): void {
@@ -164,20 +183,11 @@ export class InquiryRuntime {
     this.#threads.clear();
     this.#turns.clear();
     this.#controllers.clear();
+    this.#journal.reset();
 
-    for (const entry of entries) {
-      const value = entry as { type?: unknown; customType?: unknown; data?: unknown };
-      if (value?.type !== "custom" || value.customType !== "fusion-inquiry" || !value.data || typeof value.data !== "object") continue;
-      const data = value.data as { thread?: InquiryThread; turns?: InquiryTurn[] };
-      if (!data.thread?.id || !data.thread.workerId || !Array.isArray(data.thread.history)) continue;
-      this.#threads.set(data.thread.id, { ...data.thread, activeTurnId: null, history: [...data.thread.history] });
-      for (const turn of data.turns ?? []) {
-        if (!turn?.id || turn.inquiryId !== data.thread.id) continue;
-        const existing = this.#turns.get(turn.id);
-        if (!existing || turn.generation >= existing.generation) {
-          this.#turns.set(turn.id, { ...turn, status: turn.status === "running" ? "interrupted" : turn.status });
-        }
-      }
+    for (const data of replayJournal(entries, "fusion-inquiry", "thread", validThread, validInquiryTurn).values()) {
+      this.#threads.set(data.record.id, { ...data.record, activeTurnId: null });
+      for (const turn of data.turns) this.#turns.set(turn.id, { ...turn, status: turn.status === "running" ? "interrupted" : turn.status });
     }
   }
 }

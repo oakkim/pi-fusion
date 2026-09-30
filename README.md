@@ -115,7 +115,7 @@ Workers sharing a checkout serialize mutating turns. Workers in separate worktre
 
 ### History and recovery
 
-Completed model responses, tool results, and received usage are checkpointed, including progress from failed or interrupted turns. Unknown tool outcomes are marked so the worker can inspect side effects before retrying. Worker and inquiry snapshots are restored from the session journal when resuming.
+Completed model responses, tool results, and received usage are checkpointed, including progress from failed or interrupted turns. Unknown tool outcomes are marked so the worker can inspect side effects before retrying. Workers and inquiries write a full checkpoint first, then only new history, changed turns, and current metadata. Unchanged checkpoints are skipped; history compaction replaces the saved history without repeating past turns. Resuming and changing branches restore both legacy snapshots and incremental entries. Existing large session files are not rewritten during normal operation; incremental entries require the updated Fusion extension to restore their latest state.
 
 Before each worker request, token limits or `maxHistoryMessages` can trigger semantic summarization. It preserves the first handoff, latest instruction, and recent complete tool batches. Summary usage counts toward worker cost. If summarization fails or the context still does not fit, the turn stops and retains the original history.
 

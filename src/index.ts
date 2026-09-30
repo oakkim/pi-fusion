@@ -1041,10 +1041,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   });
 
   function persist(ctx: ExtensionContext, workerId: string): void {
-    const snapshot = runtime.snapshot().find(({ worker }) => worker.id === workerId);
-    if (!snapshot) return;
     try {
-      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-worker", snapshot);
+      if (pi.appendEntry) runtime.persist(workerId, (type, data) => pi.appendEntry(type, data));
     } catch {
       // journal is best-effort
     }
@@ -1052,10 +1050,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
   }
 
   function persistInquiry(ctx: ExtensionContext, inquiryId: string): void {
-    const snapshot = inquiries.snapshot(inquiryId)[0];
-    if (!snapshot) return;
     try {
-      (pi as unknown as { appendEntry?: (t: string, d: unknown) => void }).appendEntry?.("fusion-inquiry", snapshot);
+      if (pi.appendEntry) inquiries.persist(inquiryId, (type, data) => pi.appendEntry(type, data));
     } catch {
       // journal is best-effort
     }

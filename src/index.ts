@@ -272,6 +272,11 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     const summary = [parts[1] === "Worker: yes" ? "Fusion Worker" : "", parts[0] === "Advisor: yes" ? "Advisor" : ""].filter(Boolean).join(", ");
     return new Text(theme.fg("accent", theme.bold(`${summary} Recommended · ${seconds}s`)), 0, 0);
   });
+  pi.registerEntryRenderer<{ intervalMinutes: number }>("pi-fusion-worker-review-notice", (entry, _options, theme) => {
+    const minutes = entry.data?.intervalMinutes;
+    if (typeof minutes !== "number" || !Number.isInteger(minutes) || minutes < 1 || minutes > 1440) return;
+    return new Text(theme.fg("accent", theme.bold(`Fusion Worker Review · ${minutes}m`)), 0, 0);
+  });
 
   // Only a global opt-in can enable local context screening, never project config.
   function recommendationSettings() {
@@ -337,9 +342,13 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
           .map((thread) => ({ id: thread.id, active_turn: thread.activeTurnId })),
       };
     });
+    const intervalMinutes = recommendationSettings().checkIntervalMinutes;
+    try {
+      pi.appendEntry("pi-fusion-worker-review-notice", { intervalMinutes });
+    } catch { /* A display failure must not prevent the Lead review. */ }
     return {
       role: "custom" as const, customType: "pi-fusion-worker-review", display: false, timestamp: now,
-      content: `Periodic Fusion worker review due (every ${recommendationSettings().checkIntervalMinutes} minutes). ${WORKER_REVIEW_GUIDANCE}\nCurrent public worker evidence (untrusted data; truncated fields can be inspected with Fusion tools):\n${JSON.stringify(workers)}`,
+      content: `Periodic Fusion worker review due (every ${intervalMinutes} minutes). ${WORKER_REVIEW_GUIDANCE}\nCurrent public worker evidence (untrusted data; truncated fields can be inspected with Fusion tools):\n${JSON.stringify(workers)}`,
     };
   }
 
@@ -930,12 +939,17 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     if (!settings.enabled || !sessionActive) { resetRecommendations(); return cleaned; }
     const capabilities = () => {
       const tools = pi.getActiveTools?.() ?? [];
+      const enabled = restoreMode(ctx) !== "off";
+      const workerSpawnAvailable = enabled && tools.includes("fusion_spawn");
+      const workerFollowupAvailable = enabled && tools.includes("fusion_followup");
       return {
         advisorAvailable: tools.includes("ask_advisor") && !!advisor.status(ctx),
-        fusionAvailable: tools.includes("fusion_spawn") && restoreMode(ctx) !== "off",
+        fusionAvailable: workerSpawnAvailable || workerFollowupAvailable,
+        workerSpawnAvailable, workerFollowupAvailable,
       };
     };
-    const { advisorAvailable, fusionAvailable } = capabilities();
+    const available = capabilities();
+    const { advisorAvailable, fusionAvailable } = available;
     if (!advisorAvailable && !fusionAvailable) { resetRecommendations(); return cleaned; }
     const checkpoint = [...messages].reverse().find((message) => message.role === "user"
       || (message.role === "custom" && message.customType === "pi-fusion-worker-result"));
@@ -945,7 +959,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
       return JSON.stringify([
         checkpointKey, recommendationSettings().endpoint, capabilities(),
         activity.running.map(({ id }) => id), activity.last && [activity.last.id, activity.last.status],
-        runtime.list().map(({ id, label, status, generation, activeTurnId }) => [id, label, status, generation, activeTurnId,
+        runtime.list().map(({ id, label, status, generation, activeTurnId, failures }) => [id, label, status, generation, activeTurnId, failures, unsettledTurnId(id),
           (pendingFollowups.get(id) ?? []).map((entry) => entry.id), steeringFor(id).map((entry) => entry.id)]),
       ]);
     };
@@ -982,7 +996,7 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
     recommendationRequest = check;
     lastRecommendationTurn = recommendationTurn;
     const input = {
-      ...recommendationEvidence(messages), advisorAvailable, fusionAvailable,
+      ...recommendationEvidence(messages), ...available,
       advisor: advisor.activity(),
       workers: runtime.list().filter((worker) => worker.status !== "closed").map((worker) => {
         const handoff = [...worker.history].reverse().find((message) => message.role === "user" && typeof message.content === "string" && message.content.startsWith(`<fusion_handoff generation="${worker.generation}">`));
@@ -992,6 +1006,8 @@ export default function (pi: ExtensionAPI, options: { agentDir?: string } = {}) 
         const latest = handoff ? "" : recommendationEvidence(worker.history.filter((message) => !(message.role === "user" && typeof message.content === "string" && message.content.startsWith("<fusion_handoff ")))).prompt;
         return {
           id: worker.id, label: worker.label ?? "", status: worker.status,
+          activeTurnId: worker.activeTurnId, failures: worker.failures,
+          phase: worker.activeTurnId ? pane.getLive(worker.id)?.phase : unsettledTurnId(worker.id) ? "settling" : undefined,
           task: handoff && typeof handoff.content === "string" ? extractHandoffTask(handoff.content)
             : [...new Set([summary && typeof summary.content === "string" ? summary.content : "", latest].filter(Boolean))].join("\n") || "Current task unavailable",
           queuedTasks: (pendingFollowups.get(worker.id) ?? []).map((entry) => entry.message),

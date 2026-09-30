@@ -35,7 +35,7 @@ try {
 
 const input: RecommendationInput = { prompt: "Implement the scoped task", recentContext: "Tests fail", advisorAvailable: true, fusionAvailable: true, advisor: { running: [] }, workers: [] };
 const options = { endpoint: "http://127.0.0.1:8788", timeoutMs: 1_000 };
-const response = (content: unknown = { reason: "Unresolved design and independent implementation both need attention.", advisor: "yes", worker: "yes" }) => ({
+const response = (content: unknown = { reason: "Unresolved design and independent implementation both need attention.", advisor: "yes", worker: "yes", worker_target: "new" }) => ({
   model: "openjev", usage: { prompt_tokens: 120, completion_tokens: 40 },
   choices: [{ finish_reason: "stop", message: { content: JSON.stringify(content) } }],
 });
@@ -55,6 +55,7 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
   const result = await requestRecommendation(input, options);
   assert.equal(result.choice, "both");
   assert.deepEqual(result.decisions, { advisor: "yes", worker: "yes" });
+  assert.equal(result.workerTarget, "new");
   assert.deepEqual(result.usage, { inputTokens: 120, outputTokens: 40, totalTokens: 160 });
   assert.ok(result.elapsedMs >= 0);
   assert.match(formatRecommendation(result), /Model rationale \(untrusted\): "/);
@@ -68,6 +69,9 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
   assert.match(formatRecommendation(result), /user and project instructions, Fusion mode, and tool permissions take precedence/);
   assert.match(formatRecommendation(result), /Prefer reusing a related worker; do not duplicate active work or reopen completed work/);
   assert.match(formatRecommendationStatus(result), /160 local tokens/);
+  assert.match(formatRecommendation(result), /worker_target="new"/);
+  assert.match(formatRecommendation(result), /Review the suggested worker target and specific work against current ownership/);
+  assert.match(formatRecommendationStatus(result), /Target: new$/);
   assert.doesNotMatch(formatRecommendationStatus({ ...result, reason: "한국어로 반환된 근거" }), /한국어/, "status keeps fixed English labels instead of model-authored prose");
   assert.equal(calls.length, 1);
   const { body, init, url } = calls[0]!;
@@ -75,7 +79,7 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
   assert.equal(init.redirect, "error");
   assert.ok(init.signal);
   assert.equal(body.model, undefined, "use the configured local model instead of requesting a new download");
-  assert.equal(body.max_tokens, 160);
+  assert.equal(body.max_tokens, 192);
   assert.equal(body.temperature, 0);
   assert.equal(body.cache_prompt, true);
   assert.equal(body.stream, true);
@@ -84,20 +88,23 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
   assert.equal(body.response_format.json_schema.strict, true);
   assert.equal(body.response_format.json_schema.schema.properties.reason.maxLength, 240);
   assert.equal(body.response_format.json_schema.schema.additionalProperties, false);
+  assert.deepEqual(body.response_format.json_schema.schema.required, ["reason", "advisor", "worker", "worker_target"]);
+  assert.deepEqual(body.response_format.json_schema.schema.properties.worker_target.enum, [null, "new"]);
   assert.match(body.messages[0].content, /in English/);
   assert.match(body.messages[0].content, /Return exactly one JSON object/);
   assert.equal(body.logprobs, undefined);
-  assert.deepEqual(JSON.parse(body.messages[1].content), input);
+  assert.deepEqual(JSON.parse(body.messages[1].content), { ...input, workerSpawnAvailable: true, workerFollowupAvailable: true });
 });
 
 for (const [advisor, worker, expected] of [
   ["yes", "no", "advisor"], ["no", "yes", "worker"], ["no", "no", "neither"],
   ["yes", "uncertain", "advisor"], ["uncertain", "yes", "worker"], ["no", "uncertain", "uncertain"],
 ] as const) {
-  await fakeLocal(() => Response.json(response({ reason: "Brief evidence-based recommendation.", advisor, worker })), async () => {
+  await fakeLocal(() => Response.json(response({ reason: "Brief evidence-based recommendation.", advisor, worker, worker_target: worker === "yes" ? "new" : null })), async () => {
     const result = await requestRecommendation(input, options);
     assert.equal(result.choice, expected);
     assert.deepEqual(result.decisions, { advisor, worker });
+    assert.equal(result.workerTarget, worker === "yes" ? "new" : null);
     assert.ok(formatRecommendation(result).includes(`advisor=${advisor}, worker=${worker}`));
     assert.ok(formatRecommendationStatus(result).includes(`Advisor: ${advisor} · Worker: ${worker}`));
   });
@@ -109,9 +116,10 @@ for (const [advisorAvailable, fusionAvailable, expected] of [
     const result = await requestRecommendation({ ...input, advisorAvailable, fusionAvailable }, options);
     assert.equal(result.choice, expected);
     assert.deepEqual(result.decisions, { advisor: advisorAvailable ? "yes" : "no", worker: fusionAvailable ? "yes" : "no" });
+    assert.equal(result.workerTarget, fusionAvailable ? "new" : null);
     assert.equal(calls.length, advisorAvailable || fusionAvailable ? 1 : 0);
     assert.match(result.reason, /unavailable|Neither capability is available/);
-    assert.ok(!result.reason.includes("both need attention"), "clamping must not keep a contradictory model reason");
+    assert.equal(result.reason.includes("both need attention"), expected !== "neither", "a surviving positive retains its task rationale alongside the capability correction");
   });
 }
 await fakeLocal(() => Response.json({ ...response(), usage: undefined }), async () => {
@@ -119,12 +127,122 @@ await fakeLocal(() => Response.json({ ...response(), usage: undefined }), async 
 });
 for (const bad of [
   null, {}, { advisor: "yes", worker: "no" },
-  { reason: "Valid reason", advisor: "maybe", worker: "no" },
-  { reason: "Valid reason", advisor: "yes", worker: "no", extra: true },
-  ...["", "   ", "x".repeat(241), "line\nbreak", "escape\u001b[31m", "null\u0000byte"].map((reason) => ({ reason, advisor: "yes", worker: "no" })),
+  { reason: "Missing required target", advisor: "yes", worker: "no" },
+  { reason: "Valid reason", advisor: "maybe", worker: "no", worker_target: null },
+  { reason: "Valid reason", advisor: "yes", worker: "no", worker_target: null, extra: true },
+  ...["", "   ", "x".repeat(241), "line\nbreak", "escape\u001b[31m", "null\u0000byte"].map((reason) => ({ reason, advisor: "yes", worker: "no", worker_target: null })),
 ]) {
   await fakeLocal(() => Response.json(response(bad)), async () => { await assert.rejects(requestRecommendation(input, options), /recommendation/); });
 }
+
+const reusableWorker = { id: "wrk_reusable", label: "API", status: "idle", task: "Implement the API retry fix", queuedTasks: [] as string[], steering: [] as string[] };
+await fakeLocal(() => Response.json(response({ reason: "Delegate API regression tests to the existing API worker.", advisor: "yes", worker: "yes", worker_target: reusableWorker.id })), async () => {
+  const result = await requestRecommendation({ ...input, advisorAvailable: false, workers: [reusableWorker] }, options);
+  assert.deepEqual(result.decisions, { advisor: "no", worker: "yes" });
+  assert.equal(result.workerTarget, reusableWorker.id);
+  assert.match(result.reason, /Advisor is unavailable/);
+  assert.match(formatRecommendation(result), /Delegate API regression tests to the existing API worker/);
+});
+for (const status of ["idle", "running"]) {
+  await fakeLocal(() => Response.json(response({ reason: "Assign API retry regression tests to the existing API worker.", advisor: "no", worker: "yes", worker_target: reusableWorker.id })), async (calls) => {
+    const worker = { ...reusableWorker, status, activeTurnId: status === "running" ? "trn_active" : null, phase: status === "running" ? "testing" : "settling", failures: 2 };
+    const result = await requestRecommendation({ ...input, workers: [worker] }, options);
+    assert.equal(result.workerTarget, worker.id);
+    assert.deepEqual(JSON.parse(calls[0]!.body.messages[1].content).workers, [worker], "ownership, actual turn, phase, and failures reach the classifier");
+    assert.deepEqual(calls[0]!.body.response_format.json_schema.schema.properties.worker_target.enum, [null, "new", worker.id]);
+    assert.match(formatRecommendation(result), /worker_target="wrk_reusable"/);
+    assert.match(formatRecommendationStatus(result), /^Advisor: no · Worker: yes · openjev · \d+ms/);
+    assert.match(formatRecommendationStatus(result), /Target: wrk_reusable$/);
+    assert.match(calls[0]!.body.messages[0].content, /phase="settling" is still cleaning up/);
+    assert.match(calls[0]!.body.messages[0].content, /name the current Lead work to delegate/);
+  });
+}
+for (const [worker, worker_target] of [
+  ["yes", null], ["yes", ""], ["yes", "unknown-worker"], ["yes", " wrk_reusable "], ["yes", 5],
+  ["no", "new"], ["no", reusableWorker.id], ["uncertain", reusableWorker.id], ["uncertain", false],
+]) {
+  await fakeLocal(() => Response.json(response({ reason: "Assign the next API tests.", advisor: "no", worker, worker_target })), async () => {
+    await assert.rejects(requestRecommendation({ ...input, workers: [reusableWorker] }, options), /invalid worker target/);
+  });
+}
+for (const [workerSpawnAvailable, workerFollowupAvailable, worker_target, expected] of [
+  [true, false, "new", "yes"], [false, true, "new", "no"],
+  [true, false, reusableWorker.id, "no"], [false, true, reusableWorker.id, "yes"],
+  [false, false, "new", "no"],
+] as const) {
+  await fakeLocal(() => Response.json(response({ reason: "Delegate API regression testing.", advisor: "no", worker: "yes", worker_target })), async (calls) => {
+    const result = await requestRecommendation({ ...input, workerSpawnAvailable, workerFollowupAvailable, workers: [reusableWorker] }, options);
+    assert.equal(result.decisions.worker, expected);
+    assert.equal(result.workerTarget, expected === "yes" ? worker_target : null);
+    assert.deepEqual(calls[0]!.body.response_format.json_schema.schema.properties.worker_target.enum,
+      [null, ...(workerSpawnAvailable ? ["new"] : []), ...(workerFollowupAvailable ? [reusableWorker.id] : [])]);
+    if (expected === "no") assert.match(result.reason, /Worker is unavailable/);
+  });
+}
+await fakeLocal(() => Response.json(response({ reason: "Ownership is unclear.", advisor: "no", worker: "uncertain", worker_target: null })), async () => {
+  const result = await requestRecommendation({ ...input, workerSpawnAvailable: true, workerFollowupAvailable: false }, options);
+  assert.equal(result.decisions.worker, "uncertain", "a spawn-only capability can still have an uncertain verdict");
+  assert.equal(result.workerTarget, null);
+});
+await fakeLocal(() => Response.json(response()), async (calls) => {
+  const result = await requestRecommendation({ ...input, advisorAvailable: false, workerSpawnAvailable: false, workerFollowupAvailable: false }, options);
+  assert.equal(calls.length, 0);
+  assert.equal(result.workerTarget, null);
+  assert.equal(result.choice, "neither");
+});
+
+const validId = "w".repeat(120);
+const invalidIds = ["", "new", "leading space", "bad\nline", "bad\u001bescape", "w".repeat(121)];
+await fakeLocal(() => Response.json(response({ reason: "Assign API test coverage to the existing worker.", advisor: "no", worker: "yes", worker_target: validId })), async (calls) => {
+  const workers = [{ ...reusableWorker, id: validId }, ...invalidIds.map((id) => ({ ...reusableWorker, id })), { ...reusableWorker, id: "closed-worker", status: "closed" }];
+  const result = await requestRecommendation({ ...input, workers }, options);
+  const evidence = JSON.parse(calls[0]!.body.messages[1].content);
+  assert.deepEqual(evidence.workers.map((worker: any) => worker.id), [validId], "ids are preserved exactly, never truncated into another target");
+  assert.equal(evidence.omittedWorkers, workers.length - 1);
+  assert.equal(result.workerTarget, validId);
+  assert.equal(result.inputTruncated, true);
+  assert.deepEqual(calls[0]!.body.response_format.json_schema.schema.properties.worker_target.enum, [null, "new", validId]);
+});
+for (const worker of [{ ...reusableWorker, status: "closed" }, { ...reusableWorker, status: "unknown" }, { ...reusableWorker, id: "x".repeat(121) }]) {
+  await fakeLocal(() => Response.json(response({ reason: "Assign the next API test.", advisor: "no", worker: "yes", worker_target: worker.id })), async () => {
+    await assert.rejects(requestRecommendation({ ...input, workers: [worker] }, options), /invalid worker target/);
+  });
+}
+
+const crowdedWorkers = Array.from({ length: 11 }, (_, i) => ({ ...reusableWorker, id: `crowded-${i}`, status: i < 8 ? "running" : "idle",
+  label: "Long worker label ".repeat(10), task: "Long owned implementation scope ".repeat(25), queuedTasks: Array(4).fill("Queued regression test scope ".repeat(15)), steering: Array(4).fill("Latest compatibility constraint ".repeat(15)) }));
+const crowdedInput: RecommendationInput = { ...input, workers: crowdedWorkers,
+  advisor: { running: Array.from({ length: 8 }, (_, i) => ({ id: `r${i}`, question: "Running advisor question ".repeat(20) })) } };
+await fakeLocal(({ body }) => {
+  const evidence = JSON.parse(body.messages[1].content);
+  return Response.json(response({ reason: "Delegate API regression tests to the related idle worker.", advisor: "no", worker: "yes", worker_target: evidence.workers.find((worker: any) => worker.status === "idle")?.id }));
+}, async (calls) => {
+  const result = await requestRecommendation(crowdedInput, options);
+  const evidence = JSON.parse(calls[0]!.body.messages[1].content);
+  assert.deepEqual(evidence.workers.slice(0, 2).map((worker: any) => worker.id), ["crowded-7", "crowded-10"], "a normal full activity budget preserves current work and an idle reuse candidate");
+  assert.equal(result.workerTarget, "crowded-10");
+  assert.ok(evidence.omittedWorkers > 0);
+  assert.ok(JSON.stringify({ advisor: evidence.advisor, workers: evidence.workers, omittedWorkers: evidence.omittedWorkers }).length <= 6_000);
+});
+await fakeLocal(({ body }) => {
+  const evidence = JSON.parse(body.messages[1].content);
+  const omitted = crowdedWorkers.find((worker) => !evidence.workers.some((candidate: any) => candidate.id === worker.id))!;
+  assert.ok(omitted, "this fixture omits a worker because of the activity budget, not the twenty-worker cap");
+  assert.ok(!body.response_format.json_schema.schema.properties.worker_target.enum.includes(omitted.id));
+  return Response.json(response({ reason: "Delegate API regression tests.", advisor: "no", worker: "yes", worker_target: omitted.id }));
+}, async () => {
+  await assert.rejects(requestRecommendation(crowdedInput, options), /invalid worker target/);
+});
+await fakeLocal(() => Response.json(response({ reason: "Assign the API regression test to the existing worker.", advisor: "no", worker: "yes", worker_target: reusableWorker.id })), async (calls) => {
+  const history = new RecommendationHistory();
+  const sourceMessages = [{ role: "user", content: "Implement the API regression test." }];
+  await requestRecommendation({ ...input, workers: [reusableWorker] }, { ...options, history, sourceMessages });
+  await assert.rejects(requestRecommendation({ ...input, workers: [{ ...reusableWorker, status: "closed" }] }, { ...options, history, sourceMessages }), /invalid worker target/);
+  const second = calls[1]!.body;
+  assert.ok(second.messages.some((message: any) => message.content.includes(reusableWorker.id)), "the older cached input still mentions this worker");
+  assert.deepEqual(JSON.parse(second.messages.at(-1).content).state.workers, []);
+  assert.deepEqual(second.response_format.json_schema.schema.properties.worker_target.enum, [null, "new"], "only the latest transmitted snapshot defines valid targets");
+});
 for (const bad of [
   {}, { choices: [] }, { choices: [...response().choices, ...response().choices] },
   { choices: [{ finish_reason: "length", message: response().choices[0]!.message }] },
@@ -197,7 +315,7 @@ await fakeLocal(() => Response.json(response()), async (calls) => {
     workers: [{ id: "api-worker", label: "API", status: "running", task: "Implement the migration", queuedTasks: ["Verify rollback"], steering: ["Preserve old clients"] }],
   };
   await requestRecommendation(activity, options);
-  assert.deepEqual(JSON.parse(calls[0]!.body.messages[1].content), activity, "the local model receives task ownership and consultation state, not just availability flags");
+  assert.deepEqual(JSON.parse(calls[0]!.body.messages[1].content), { ...activity, workerSpawnAvailable: true, workerFollowupAvailable: true }, "the local model receives task ownership and consultation state, not just availability flags");
   assert.match(calls[0]!.body.messages[0].content, /do not repeat a question already being consulted or answered/);
   assert.match(calls[0]!.body.messages[0].content, /Do not duplicate running or queued work/);
   assert.match(calls[0]!.body.messages[0].content, /different independent task/);
@@ -234,7 +352,7 @@ assert.match(longPrompt, /^BEGIN/);
 assert.match(longPrompt, /END$/);
 assert.ok(longPrompt.length <= 6_000);
 
-await fakeLocal(() => Response.json(response({ reason: "MODEL_OUTPUT_MUST_NOT_ENTER_HISTORY", advisor: "no", worker: "no" })), async (calls) => {
+await fakeLocal(() => Response.json(response({ reason: "MODEL_OUTPUT_MUST_NOT_ENTER_HISTORY", advisor: "no", worker: "no", worker_target: null })), async (calls) => {
   const history = new RecommendationHistory();
   const source: any[] = [
     { role: "user", content: "Keep the original API contract; finish the requested fix." },
@@ -318,7 +436,7 @@ await fakeLocal(() => new Response("x".repeat(70_000)), async () => { await asse
 await fakeLocal(() => new Response("private response content", { status: 500 }), async () => {
   await assert.rejects(requestRecommendation(input, options), (error: Error) => /500/.test(error.message) && !error.message.includes("private"));
 });
-const streamResult = response({ reason: "Review the 새 constraint.", advisor: "yes", worker: "no" });
+const streamResult = response({ reason: "Review the 새 constraint.", advisor: "yes", worker: "no", worker_target: null });
 const streamContent = streamResult.choices[0]!.message.content;
 const event = (data: unknown) => `data: ${JSON.stringify(data)}\r\n\r\n`;
 const streamBody = ": keepalive 512/1024\r\n\r\n"

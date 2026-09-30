@@ -58,9 +58,9 @@ const messages: any[] = [
   { role: "user", content: "Investigate the lock contention and implement the independent API and UI fixes.", timestamp: 1 },
   { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "Second attempt failed: deadlock" }], isError: true, timestamp: 2 },
 ];
-const answer = (advisor = "yes", worker = "yes") => Response.json({
+const answer = (advisor = "yes", worker = "yes", workerTarget: string | null = worker === "yes" ? "new" : null) => Response.json({
   model: "local", usage: { prompt_tokens: 120, completion_tokens: 40 },
-  choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ reason: "Both unresolved diagnosis and scoped implementation remain.", advisor, worker }) } }],
+  choices: [{ finish_reason: "stop", message: { content: JSON.stringify({ reason: "Both unresolved diagnosis and scoped implementation remain.", advisor, worker, worker_target: workerTarget }) } }],
 });
 const assertWakeup = (call = emitted.at(-1)!) => {
   assert.deepEqual(call, [{ customType: "pi-fusion-recommendation-wakeup", content: "", display: false }, { deliverAs: "followUp" }]);
@@ -233,6 +233,7 @@ try {
   assert.equal(delivered.messages.at(-1).customType, "pi-fusion-recommendation");
   assert.equal(delivered.messages.at(-1).display, false);
   assert.match(delivered.messages.at(-1).content, /earlier checkpoint/);
+  assert.match(delivered.messages.at(-1).content, /worker_target="new"/);
   assert.match(delivered.messages.at(-1).content, /Use the current task state to decide whether to accept or decline it/);
   assert.ok(delivered.messages.at(-1).content.includes(RECOMMENDATION_LEAD_GUIDANCE));
   assert.doesNotMatch(delivered.messages.at(-1).content, /Ignore it if|not approval or a requirement/, "freshness and tool autonomy cannot silently waive acknowledgment");
@@ -332,6 +333,46 @@ try {
 
   // Recheck stale completed hints at delivery, not just when the response arrives.
   const worker = (): WorkerRecord => ({ id: "wrk_test", label: "tests", status: "running", generation: 1, activeTurnId: "trn_first", history: [], failures: 0, executorModelId: "test/worker", createdAt: 0 });
+  for (const state of ["idle", "running"] as const) {
+    await reset();
+    activeTools = ["fusion_followup"];
+    workers = [{ ...worker(), status: state, activeTurnId: state === "idle" ? null : "trn_first", failures: 1 }];
+    const reuse = start();
+    assert.equal(reuse.evidence.workerSpawnAvailable, false);
+    assert.equal(reuse.evidence.workerFollowupAvailable, true);
+    assert.equal(reuse.evidence.workers[0].activeTurnId, workers[0]!.activeTurnId);
+    assert.equal(reuse.evidence.workers[0].failures, 1);
+    await finish(reuse, answer("no", "yes", "wrk_test"));
+    assert.match(notices.at(-1)!.data.text, /Target: wrk_test/);
+    assert.match(checkpoint().messages.at(-1).content, /worker_target="wrk_test"/);
+    assert.equal(emitted.length, 0, "a worker target never dispatches work automatically");
+  }
+  for (const [tools, target] of [[defaultTools, "wrk_invented"], [["fusion_spawn"], "wrk_test"], [["fusion_followup"], "new"]] as const) {
+    await reset();
+    activeTools = [...tools];
+    workers = [worker()];
+    const before = recommendationNotices();
+    await finish(start(), answer("no", "yes", target));
+    if (target === "wrk_invented") assert.equal(recommendationNotices(), before, "invented targets cannot reach the Lead");
+    else {
+      assert.match(notices.at(-1)!.data.text, /Worker: no/);
+      assert.doesNotMatch(notices.at(-1)!.data.text, /Target:/, "unavailable targets become a hidden negative result");
+    }
+    assert.equal(checkpoint(), undefined);
+    await commands.get("fusion").handler("recommend status", context);
+    assert.match(notifications.at(-1)!, target === "wrk_invented" ? /unavailable/ : /Worker: no/);
+  }
+  for (const atDelivery of [false, true]) {
+    await reset();
+    workers = [{ ...worker(), status: "idle", activeTurnId: null }];
+    const targeted = start();
+    if (atDelivery) await finish(targeted, answer("no", "yes", "wrk_test"));
+    workers[0]!.status = "closed";
+    const before = recommendationNotices();
+    if (!atDelivery) await finish(targeted, answer("no", "yes", "wrk_test"));
+    assert.equal(recommendationNotices(), before);
+    assert.equal(checkpoint(), undefined, "closing the chosen worker discards the stale target at completion or delivery");
+  }
   for (const change of ["steer", "worker-result", "capability", "worker-state", "age", "turn-limit"] as const) {
     await reset();
     if (change === "worker-state") workers = [worker()];
@@ -563,6 +604,8 @@ try {
   assert.equal(workerEvidence.id, spawned.worker.id);
   assert.equal(workerEvidence.label, "Retry worker");
   assert.equal(workerEvidence.task, currentTask);
+  assert.equal(workerEvidence.activeTurnId, spawned.worker.activeTurnId);
+  assert.equal(workerEvidence.failures, spawned.worker.failures);
   assert.doesNotMatch(workerEvidence.task, /Previous task|fusion_handoff/);
   assert.deepEqual(workerEvidence.queuedTasks, []);
   assert.deepEqual(workerEvidence.steering, []);

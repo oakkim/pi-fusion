@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mock } from "node:test";
-import { convertToLlm } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, convertToLlm } from "@earendil-works/pi-coding-agent";
 import fusionExtension from "./index.ts";
 import { InquiryRuntime } from "./inquiry.ts";
 import { FusionPaneController } from "./pane.ts";
@@ -24,16 +24,19 @@ let fixtureCount = 0;
 const cleanups: Array<() => Promise<void>> = [];
 const source = [{ role: "user", content: "Finish the API work and report progress.", timestamp: 1 }];
 const tick = (ms: number) => { mock.timers.tick(ms); mock.timers.tick(60); };
+const reviewNoticeType = "pi-fusion-worker-review-notice";
+const plainTheme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
 
 async function fixture(agentDir = join(directory, String(fixtureCount++))) {
   mkdirSync(agentDir, { recursive: true });
   if (!existsSync(join(agentDir, "fusion.json"))) writeFileSync(join(agentDir, "fusion.json"), JSON.stringify({ recommendations: true, preserved: "keep" }));
   const handlers = new Map<string, (...args: any[]) => any>();
   const commands = new Map<string, any>();
+  const renderers = new Map<string, (...args: any[]) => any>();
   const journal: any[] = [];
   const sent: Array<{ message: any; options: any }> = [];
   const notices: string[] = [];
-  const state = { idle: false, tools: ["fusion_status"] };
+  const state = { idle: false, tools: ["fusion_status"], failReviewNotice: false };
   const context: any = {
     cwd: agentDir, hasUI: false, mode: "tui", signal: new AbortController().signal,
     isIdle: () => state.idle, isProjectTrusted: () => false,
@@ -44,9 +47,13 @@ async function fixture(agentDir = join(directory, String(fixtureCount++))) {
   fusionExtension({
     on: (name: string, handler: (...args: any[]) => any) => handlers.set(name, handler),
     registerCommand: (name: string, command: any) => commands.set(name, command),
-    registerTool() {}, registerEntryRenderer() {},
+    registerTool() {},
+    registerEntryRenderer: (name: string, renderer: (...args: any[]) => any) => renderers.set(name, renderer),
     getActiveTools: () => state.tools,
-    appendEntry: (customType: string, data: unknown) => journal.push({ type: "custom", customType, data }),
+    appendEntry: (customType: string, data: unknown) => {
+      if (customType === reviewNoticeType && state.failReviewNotice) throw new Error("Fixture display storage failure");
+      journal.push({ type: "custom", customType, data });
+    },
     sendMessage: (message: any, options: any) => {
       sent.push({ message, options });
       journal.push({ type: "message", message: { role: "custom", ...message } });
@@ -78,7 +85,8 @@ async function fixture(agentDir = join(directory, String(fixtureCount++))) {
   const checkpoint = (messages: any[] = source) => handlers.get("context")!({ messages }, context);
   const review = (messages: any[]) => checkpoint(messages)?.messages.find((message: any) => message.customType === "pi-fusion-worker-review");
   const command = (args: string) => commands.get("fusion").handler(`recommend ${args}`, context);
-  return { agentDir, handlers, commands, journal, sent, notices, state, context, runtime, pane, inquiries, start, marker, checkpoint, review, command, close };
+  const reviewNotices = () => journal.filter((entry) => entry.type === "custom" && entry.customType === reviewNoticeType);
+  return { agentDir, handlers, commands, renderers, journal, sent, notices, reviewNotices, state, context, runtime, pane, inquiries, start, marker, checkpoint, review, command, close };
 }
 
 try {
@@ -92,6 +100,7 @@ try {
   active.start();
   tick(299_000);
   assert.equal(active.sent.length, 0, "a running worker is not due before five minutes");
+  assert.equal(active.reviewNotices().length, 0, "no review notice appears before review delivery");
   tick(1_000);
   assert.equal(active.sent.length, 1);
   assert.deepEqual(active.sent[0]!.options, { deliverAs: "steer", triggerTurn: true });
@@ -104,8 +113,26 @@ try {
   assert.equal(active.checkpoint(), undefined, "natural checkpoints do not consume a queued review before its marker arrives");
   const oldMarker = { ...firstMarker, details: { reviewId: "old-review" } };
   assert.deepEqual(active.checkpoint([...source, oldMarker])?.messages, source, "an unrelated old marker is filtered without taking the pending review");
+  assert.equal(active.reviewNotices().length, 0, "queued or unrelated markers do not announce delivery");
   const delivered = active.review([...source, firstMarker]);
   assert.ok(delivered);
+  assert.equal(active.reviewNotices().length, 1, "a fresh review creates exactly one chat entry when the Lead receives it");
+  const notice = active.reviewNotices()[0]!;
+  assert.deepEqual(notice.data, { intervalMinutes: 5 });
+  const renderNotice = active.renderers.get(reviewNoticeType)!;
+  assert.equal(typeof renderNotice, "function");
+  for (const width of [40, 80]) {
+    assert.equal(renderNotice(notice, { expanded: false }, plainTheme).render(width).join("\n").trim(), "Fusion Worker Review · 5m");
+  }
+  for (const data of [undefined, null, {}, { intervalMinutes: "5" }, { intervalMinutes: 0 }, { intervalMinutes: -1 }, { intervalMinutes: 1.5 }, { intervalMinutes: NaN }, { intervalMinutes: Infinity }]) {
+    assert.equal(renderNotice({ data }, { expanded: false }, plainTheme), undefined, "malformed saved review notices are skipped");
+  }
+  const nativeEntries = [{ type: "message", message: source[0] }, ...active.journal].map((entry, index) => ({
+    ...entry, id: `entry-${index}`, parentId: index ? `entry-${index - 1}` : null, timestamp: new Date().toISOString(),
+  }));
+  const replayed = buildSessionContext(JSON.parse(JSON.stringify(nativeEntries))).messages;
+  assert.ok(JSON.stringify(replayed).includes(source[0]!.content), "native replay retains the actual conversation");
+  assert.doesNotMatch(JSON.stringify(replayed), /pi-fusion-worker-review-notice|intervalMinutes|Fusion Worker Review/, "the saved notice is UI-only and absent from native model context");
   assert.equal(delivered.display, false);
   assert.ok(delivered.content.includes(WORKER_REVIEW_GUIDANCE));
   assert.ok(JSON.stringify(convertToLlm([delivered])).includes(WORKER_REVIEW_GUIDANCE), "Pi's actual message converter preserves the review instructions for the Lead");
@@ -117,6 +144,7 @@ try {
   assert.doesNotMatch(delivered.content, /PRIVATE_THOUGHT|PRIVATE_SIGNATURE/);
   assert.doesNotMatch(JSON.stringify(active.journal), /Periodic Fusion worker review due|Public live failure/, "only an empty marker, not the gathered snapshot, is journaled");
   assert.deepEqual(active.checkpoint([...source, firstMarker, delivered])?.messages, source, "delivered reviews and duplicate markers cannot become persistent input");
+  assert.equal(active.reviewNotices().length, 1, "replaying the same marker does not duplicate its chat notice");
   tick(299_000);
   assert.equal(active.sent.length, 1);
   tick(1_000);
@@ -145,6 +173,14 @@ try {
   assert.ok(normalTools.review([...source, normalTools.marker()]));
   assert.equal(fetches, 0, "a timed review does not also trigger normal inference when Fusion spawning is available");
   await normalTools.close();
+
+  const failedDisplay = await fixture();
+  failedDisplay.state.failReviewNotice = true;
+  failedDisplay.start();
+  tick(300_000);
+  assert.ok(failedDisplay.review([...source, failedDisplay.marker()]), "a failed notice append does not block the Lead's review");
+  assert.equal(failedDisplay.reviewNotices().length, 0);
+  await failedDisplay.close();
 
   const inquiryReview = await fixture();
   const { worker: inquiryWorker, turn: workerTurn } = inquiryReview.start();
@@ -197,6 +233,11 @@ try {
   await settings.command("interval 1");
   tick(1_000);
   assert.equal(settings.sent.length, 1, "interval changes apply to actual elapsed work");
+  assert.equal(settings.reviewNotices().length, 0);
+  assert.ok(settings.review([...source, settings.marker()]));
+  const customNotice = settings.reviewNotices()[0]!;
+  assert.deepEqual(customNotice.data, { intervalMinutes: 1 });
+  assert.equal(settings.renderers.get(reviewNoticeType)!(customNotice, { expanded: false }, plainTheme).render(80).join("\n").trim(), "Fusion Worker Review · 1m", "the notice uses the configured interval");
   await settings.close();
   const registeredAgain = await fixture(settings.agentDir);
   await registeredAgain.command("status");
@@ -224,6 +265,7 @@ try {
     if (change === "fusion-off") f.journal.push({ type: "custom", customType: "fusion-mode", data: { mode: "off" } });
     if (change === "capability") f.state.tools = [];
     assert.deepEqual(f.checkpoint([...source, queued])?.messages, source, `${change} cannot deliver the old review snapshot`);
+    assert.equal(f.reviewNotices().length, 0, `${change} cannot leave a misleading delivery notice`);
     tick(1_000);
     assert.equal(f.sent.length, 1, `${change} does not immediately wake the Lead again`);
     await f.close();
@@ -237,6 +279,7 @@ try {
     await f.handlers.get(lifecycle)!({}, f.context);
     assert.equal(f.pane.liveTimerActive, false, `${lifecycle} cleans up elapsed timers`);
     assert.deepEqual(f.checkpoint([...source, queued])?.messages, source, `${lifecycle} removes pending review delivery`);
+    assert.equal(f.reviewNotices().length, 0, `${lifecycle} cannot announce a stale review`);
     tick(600_000);
     assert.equal(f.sent.length, 1);
     if (lifecycle !== "session_start") assert.notEqual(f.runtime.getWorker(worker.id)?.status, "running");
@@ -257,6 +300,7 @@ try {
   settled.handlers.get("agent_end")!({}, settled.context);
   settled.handlers.get("agent_settled")!({}, settled.context);
   assert.deepEqual(settled.checkpoint([...source, abandonedMarker])?.messages, source);
+  assert.equal(settled.reviewNotices().length, 0, "a settled run's abandoned marker is never announced");
   tick(299_000);
   assert.equal(settled.sent.length, 1, "a settled or aborted Lead does not immediately loop another wake-up");
   tick(1_000);
